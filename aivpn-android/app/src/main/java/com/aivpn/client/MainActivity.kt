@@ -556,14 +556,15 @@ class MainActivity : AppCompatActivity() {
         // Timer management
         if (connected && connectionStartTime == 0L) {
             connectionStartTime = System.currentTimeMillis()
+            binding.textUpload.text = "0 B"
+            binding.textDownload.text = "0 B"
             timerHandler.post(timerRunnable)
         } else if (!connected) {
             connectionStartTime = 0L
             timerHandler.removeCallbacks(timerRunnable)
             binding.textTimer.text = "00:00:00"
-            binding.textUpload.text = "0 B"
-            binding.textDownload.text = "0 B"
             binding.textDuration.text = "00:00"
+            // RX/TX counters intentionally kept — show last known values during reconnect
         }
     }
 

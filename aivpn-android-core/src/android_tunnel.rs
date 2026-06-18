@@ -549,6 +549,8 @@ pub async fn run_tunnel_android(
     let initial_mask = bootstrap_mask_for_psk(psk.as_ref());
     let mask_update_slot: Arc<Mutex<Option<MaskProfile>>> = Arc::new(Mutex::new(None));
     let mask_update_for_enc = Arc::clone(&mask_update_slot);
+    let key_rotate_slot: Arc<Mutex<Option<SessionKeys>>> = Arc::new(Mutex::new(None));
+    let key_rotate_for_enc = Arc::clone(&key_rotate_slot);
 
     let udp_tx = udp.clone();
     let keys_tx = keys.clone();
@@ -558,10 +560,25 @@ pub async fn run_tunnel_android(
             inner: MimicryEncryptor,
             session: Arc<SessionRuntime>,
             keepalive_sent_ms: Arc<AtomicU64>,
+            key_rotate_slot: Arc<Mutex<Option<SessionKeys>>>,
+        }
+
+        impl AndroidEncryptor {
+            fn check_key_rotation(&mut self) {
+                if let Some(new_keys) = self
+                    .key_rotate_slot
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .take()
+                {
+                    self.inner.update_keys(new_keys);
+                }
+            }
         }
 
         impl PacketEncryptor for AndroidEncryptor {
             fn encrypt_data(&mut self, payload: &[u8]) -> aivpn_common::error::Result<Vec<u8>> {
+                self.check_key_rotation();
                 self.inner.encrypt_data(payload)
             }
             fn encrypt_control(
@@ -595,6 +612,7 @@ pub async fn run_tunnel_android(
             ),
             session: session_for_upload,
             keepalive_sent_ms,
+            key_rotate_slot: key_rotate_for_enc,
         };
         enc.inner.set_fec_group(level.fec_n());
         let config = UploadConfig {
@@ -723,6 +741,10 @@ pub async fn run_tunnel_android(
                                             Some(Instant::now() + Duration::from_secs(2));
                                         transition_recv_win = std::mem::take(&mut recv_win);
                                         keys = new_keys;
+                                        *key_rotate_slot
+                                            .lock()
+                                            .unwrap_or_else(|e| e.into_inner()) =
+                                            Some(keys.clone());
                                         log::info!("aivpn: inline PFS rekey complete");
                                     }
                                 }
