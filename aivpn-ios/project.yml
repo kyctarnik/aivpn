@@ -48,6 +48,10 @@ targets:
           - "*.entitlements"
     info:
       path: Tunnel/Info.plist
+      properties:
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.networkextension.packet-tunnel
+          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).PacketTunnelProvider
     entitlements:
       path: Tunnel/AivpnTunnel.entitlements
     settings:
@@ -57,6 +61,7 @@ targets:
         CODE_SIGN_STYLE: Manual
         DEVELOPMENT_TEAM: ""
         SWIFT_OBJC_BRIDGING_HEADER: Tunnel/AivpnCoreBridge.h
+        GENERATE_INFOPLIST_FILE: NO
         # Static library linked by the tunnel extension (not the app)
         OTHER_LDFLAGS: $(inherited) -force_load $(SRCROOT)/../aivpn-ios-core/lib/libaivpn_core.a
         LIBRARY_SEARCH_PATHS: $(inherited) $(SRCROOT)/../aivpn-ios-core/lib
