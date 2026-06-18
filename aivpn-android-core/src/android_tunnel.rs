@@ -357,6 +357,9 @@ pub async fn run_tunnel_android(
             res = udp.recv(&mut recv_buf) => {
                 match res {
                     Ok(n) => break n,
+                    Err(_) if session.stop_requested.load(Ordering::SeqCst) => {
+                        return Ok(());
+                    }
                     Err(e) => return Err(Error::Io(e)),
                 }
             }
@@ -660,7 +663,15 @@ pub async fn run_tunnel_android(
 
             // ── UDP → TUN (inbound from server) ──
             r = udp.recv(&mut udp_buf) => {
-                let n = r?;
+                let n = match r {
+                    Ok(n) => n,
+                    Err(_) if session.stop_requested.load(Ordering::SeqCst) => {
+                        tun_reader_task.abort();
+                        upload_sender_task.abort();
+                        return Ok(());
+                    }
+                    Err(e) => return Err(Error::Io(e)),
+                };
                 log::debug!("aivpn: udp.recv() → {} bytes", n);
                 last_rx = Instant::now();
                 upload_at_last_rx = session.upload_bytes.load(Ordering::Relaxed);

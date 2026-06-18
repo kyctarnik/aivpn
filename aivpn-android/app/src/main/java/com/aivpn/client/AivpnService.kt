@@ -226,12 +226,9 @@ class AivpnService : VpnService() {
                         sessionEstablished = false
                         networkTrigger = false
                         runTunnel()
-                        // Only close TUN when this session is still the active one.
-                        // A superseded session must not close the vpnInterface that the
-                        // new serviceJob just created in ensureVpnInterface() — doing so
-                        // passes an invalid fd to Rust and causes 0 RX on the 2nd connect.
-                        if (mySessionId == sessionId) closeTunnel()
-                        // runTunnel() returns normally only on Rust rekey trigger — reconnect fast.
+                        // runTunnel() returns normally only on Rust rekey/network trigger — reconnect fast.
+                        // Do NOT close the TUN here: keeping vpnInterface open means the next runTunnel()
+                        // reuses the same fd and Android keeps VPN routes active with no routing gap.
                         retryDelayMs = INITIAL_RETRY_DELAY_MS
                     } catch (e: CancellationException) {
                         throw e
@@ -239,7 +236,8 @@ class AivpnService : VpnService() {
                         Log.e(TAG, "Tunnel error: ${e.message}", e)
                         isRunning = false
                         if (manualDisconnect) break
-                        if (mySessionId == sessionId) closeTunnel()
+                        // Do NOT close TUN on error: reusing vpnInterface avoids establish()
+                        // race on reconnect and keeps VPN routes active during retry.
 
                         // Network-triggered reconnects and reconnects after an established
                         // session use zero delay so the switch feels instant.
