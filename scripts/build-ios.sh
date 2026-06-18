@@ -15,8 +15,15 @@ set -euo pipefail
 # Ensure rustup-managed cargo takes precedence over conda/Homebrew/system cargo
 export PATH="$HOME/.cargo/bin:$PATH"
 
-# Auto-install required iOS Rust targets if missing
-rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
+# Install stable toolchain and iOS targets explicitly.
+# Using --toolchain stable avoids the mismatch where `rustup target add` (without
+# a qualifier) targets the user's *default* toolchain, while `cargo build` (driven
+# by rust-toolchain.toml) uses *stable* — resulting in "can't find crate for core".
+rustup toolchain install stable --profile minimal 2>/dev/null || true
+rustup target add --toolchain stable \
+    aarch64-apple-ios \
+    aarch64-apple-ios-sim \
+    x86_64-apple-ios
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 IOS_DIR="$REPO_ROOT/aivpn-ios"
