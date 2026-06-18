@@ -278,7 +278,7 @@ pub async fn run_tunnel_android(
     let dest: SocketAddr = tokio::select! {
         biased;
         _ = wait_for_stop_signal(&stop_signal) => {
-            return Err(Error::Session("Stop requested".into()));
+            return Ok(());
         }
         result = tokio::time::timeout(
             Duration::from_secs(5),
@@ -293,14 +293,14 @@ pub async fn run_tunnel_android(
     };
 
     if session.stop_requested.load(Ordering::SeqCst) {
-        return Err(Error::Session("Stop requested".into()));
+        return Ok(());
     }
 
     let raw_udp_fd = create_protected_udp_socket(&vm, &vpn_service, dest, &session)?;
 
     if session.stop_requested.load(Ordering::SeqCst) {
         unsafe { libc::close(raw_udp_fd) };
-        return Err(Error::Session("Stop requested".into()));
+        return Ok(());
     }
 
     // ── 3. Set TUN fd to non-blocking for AsyncFd ──
@@ -351,7 +351,7 @@ pub async fn run_tunnel_android(
 
         tokio::select! {
             _ = wait_for_stop_signal(&stop_signal) => {
-                return Err(Error::Session("Tunnel stop requested".into()));
+                return Ok(());
             }
 
             res = udp.recv(&mut recv_buf) => {
@@ -362,7 +362,7 @@ pub async fn run_tunnel_android(
             }
             _ = &mut retry => {
                 if session.stop_requested.load(Ordering::SeqCst) {
-                    return Err(Error::Session("Tunnel stop requested".into()));
+                    return Ok(());
                 }
                 retry_count += 1;
                 // Rotate keypair only once, on the 2nd retry (~1.5 s after first send).
@@ -448,7 +448,7 @@ pub async fn run_tunnel_android(
         tokio::select! {
             biased;
             _ = wait_for_stop_signal(&stop_signal) => {
-                return Err(Error::Session("Tunnel stop requested".into()));
+                return Ok(());
             }
             _ = tokio::time::sleep(Duration::from_millis(100)) => {
                 if let Ok(ka) = (ControlPayload::Keepalive { send_ts: 0 }).encode() {
@@ -655,7 +655,7 @@ pub async fn run_tunnel_android(
                 }
                 tun_reader_task.abort();
                 upload_sender_task.abort();
-                return Err(Error::Session("Tunnel stop requested".into()));
+                return Ok(());
             }
 
             // ── UDP → TUN (inbound from server) ──
