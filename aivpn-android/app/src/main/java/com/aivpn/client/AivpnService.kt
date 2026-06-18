@@ -117,7 +117,7 @@ class AivpnService : VpnService() {
                 val profileId = intent.getStringExtra("profile_id") ?: return START_NOT_STICKY
                 loadAndStartVpnFromProfile(profileId)
             }
-            ACTION_DISCONNECT -> stopVpn()
+            ACTION_DISCONNECT -> stopVpn(startId)
             else -> {
                 // START_STICKY restart with null intent — OS restarted us after a kill.
                 // If no active session was in progress (e.g. we were killed while idle),
@@ -523,7 +523,7 @@ class AivpnService : VpnService() {
 
     // ──────────── Stop ────────────
 
-    private fun stopVpn() {
+    private fun stopVpn(startId: Int? = null) {
         manualDisconnect = true
         isServiceActive = false
         restartJob?.cancel()
@@ -542,7 +542,11 @@ class AivpnService : VpnService() {
         val cb3 = statusCallback; cb3?.invoke(false, lastStatusText)
         val ticb1 = tileCallback; ticb1?.invoke()
         stopForeground(STOP_FOREGROUND_REMOVE)
-        stopSelf()
+        // Use stopSelf(startId) so Android does not destroy the service if a new
+        // ACTION_CONNECT intent arrived after this ACTION_DISCONNECT.  Without the
+        // startId guard, onDestroy() could fire and cancel a freshly-launched
+        // restartJob, leaving the UI stuck at "Connecting…" forever.
+        if (startId != null) stopSelf(startId) else stopSelf()
     }
 
     private fun closeTunnel() {
@@ -686,6 +690,7 @@ class AivpnService : VpnService() {
      */
     private suspend fun waitForConnectivity() {
         val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        var waitedMs = 0L
         while (currentCoroutineContext().isActive) {
             val active = findUsableUnderlyingNetwork(cm)
             val hasUsableActiveNetwork = active != null
@@ -701,7 +706,22 @@ class AivpnService : VpnService() {
             }
             if (hasAnyUsableNetwork) return
 
+            // Last resort: if any network (including our own VPN from a previous
+            // session) reports internet capability, proceed immediately.  As a
+            // VpnService we can replace any existing VPN interface, so blocking here
+            // when only the old VPN network is visible causes an infinite hang.
+            val hasAnyInternet = cm.allNetworks.any { net ->
+                cm.getNetworkCapabilities(net)
+                    ?.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) == true
+            }
+            if (hasAnyInternet) return
+
+            // Hard safety timeout: if absolutely no connectivity after 5 s, proceed
+            // anyway and let the DNS / handshake fail with a clear error message.
+            if (waitedMs >= 5_000L) return
+
             delay(300L)
+            waitedMs += 300L
         }
         throw CancellationException("Cancelled while waiting for network")
     }
