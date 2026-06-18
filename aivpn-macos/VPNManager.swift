@@ -132,8 +132,21 @@ class VPNManager: ObservableObject {
     }
 
     private func helperClientBinaryPath() -> String? {
-        let bundledBinary = Bundle.main.bundlePath + "/Contents/Resources/aivpn-client"
-        return FileManager.default.isExecutableFile(atPath: bundledBinary) ? bundledBinary : nil
+        // Only send paths from root-owned system locations (/Applications, /Library).
+        // User-writable locations (DerivedData, ~/Applications) are rejected by the
+        // privileged helper; fall back to nil so the helper uses DEFAULT_CLIENT_PATH.
+        let candidates = [
+            Bundle.main.bundlePath + "/Contents/Resources/aivpn-client",
+            Bundle.main.bundlePath + "/Contents/MacOS/aivpn-client",
+        ]
+        let trustedPrefixes = ["/Applications/", "/Library/"]
+        for path in candidates {
+            let trusted = trustedPrefixes.contains(where: { path.hasPrefix($0) })
+            if trusted, FileManager.default.isExecutableFile(atPath: path) {
+                return path
+            }
+        }
+        return nil
     }
 
     func loadDeviceKey() {
