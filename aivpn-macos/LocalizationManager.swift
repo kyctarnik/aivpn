@@ -224,8 +224,12 @@ class LocalizationManager: ObservableObject {
             "ru": "Спутник (15с)"
         ],
         "adaptive_mode_help": [
-            "en": "Automatically adjusts MTU and keepalive on unstable connections",
-            "ru": "Автоматически адаптирует MTU и keepalive при нестабильном соединении"
+            "en": "Controls traffic mimicry (HTTPS/QUIC/Zoom) and keepalive frequency. Higher level = better DPI evasion, higher bandwidth overhead",
+            "ru": "Управляет маскировкой трафика под HTTPS/QUIC/Zoom и частотой keepalive. Чем выше уровень — тем лучше обход DPI, но выше нагрузка на канал"
+        ],
+        "recording_desc": [
+            "en": "Records your network traffic profile to create a personal mask — a fingerprint used to train the DPI evasion engine",
+            "ru": "Записывает сетевой профиль трафика для создания персональной маски — образца, обучающего систему обхода DPI"
         ],
         "diagnostics": [
             "en": "Diagnostics",

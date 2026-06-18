@@ -98,4 +98,16 @@
     <string name="recording_stopped">Запись остановлена</string>
     <string name="recording_no_session">Нет активного сеанса</string>
     <string name="os_kill_switch">Настройки Kill Switch ОС</string>
+
+    <!-- Описания пунктов меню -->
+    <string name="desc_adaptive_mode">Управляет маскировкой трафика под легальные протоколы (HTTPS/QUIC/Zoom) и частотой keepalive. Чем выше уровень — тем лучше обход DPI, но выше нагрузка на канал</string>
+    <string name="desc_adaptive_off">Только шифрование. Без маскировки трафика.</string>
+    <string name="desc_adaptive_light">Базовая маскировка. Keepalive каждые 15 с.</string>
+    <string name="desc_adaptive_aggressive">Имитация HTTPS/QUIC. Keepalive каждые 8 с.</string>
+    <string name="desc_adaptive_satellite">Оптимизация для высокой задержки (>300 мс). Максимальная маскировка.</string>
+    <string name="desc_diagnostics">Измеряет задержку (p50/p95) и потерю пакетов до сервера. Требует активного соединения.</string>
+    <string name="desc_recording">Записывает сетевой профиль сессии. Используется для создания персональной маски — образца трафика, обучающего систему обхода DPI.</string>
+    <string name="desc_export_logs">Собирает технические логи для диагностики ошибок подключения.</string>
+    <string name="desc_kill_switch">Открывает настройки VPN Android. Включите «VPN всегда включён» + «Блокировать без VPN», чтобы трафик не утекал при обрыве соединения.</string>
+    <string name="split_tunnel_desc">Выбрать, какие приложения используют VPN. По умолчанию весь трафик защищён.</string>
 </resources>

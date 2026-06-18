@@ -378,7 +378,7 @@ class MainActivity : AppCompatActivity() {
                 getString(R.string.split_tunnel_hint_sites, siteCount))
             appCount > 0 -> getString(R.string.split_tunnel_vpn_count, appCount)
             siteCount > 0 -> getString(R.string.split_tunnel_hint_sites, siteCount) + " " + getString(R.string.split_tunnel_bypass_count, siteCount).substringAfter(" ")
-            else -> getString(R.string.split_tunnel_none)
+            else -> getString(R.string.split_tunnel_desc)
         }
     }
 
@@ -599,52 +599,98 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun showOptionsMenu(anchor: View) {
-        val popup = PopupMenu(this, anchor)
+    private fun showOptionsMenu(@Suppress("UNUSED_PARAMETER") anchor: View) {
+        val currentLevel = adaptiveLevel()
         val levelNames = arrayOf(
             getString(R.string.adaptive_off),
             getString(R.string.adaptive_light),
             getString(R.string.adaptive_aggressive),
             getString(R.string.adaptive_satellite)
         )
-        val currentLevel = adaptiveLevel()
-        val adaptiveLabel = getString(R.string.adaptive_mode) + ": " + levelNames[currentLevel]
-        popup.menu.add(0, MENU_ADAPTIVE, 0, adaptiveLabel)
-        popup.menu.add(0, MENU_DIAGNOSTICS, 1, getString(R.string.diagnostics))
-        popup.menu.add(0, MENU_RECORDING, 2, getString(R.string.recording))
-        popup.menu.add(0, MENU_EXPORT_LOGS, 3, getString(R.string.export_logs))
-        popup.menu.add(0, MENU_OS_KILL_SWITCH, 4, getString(R.string.os_kill_switch))
-        popup.setOnMenuItemClickListener { item ->
-            when (item.itemId) {
-                MENU_ADAPTIVE -> {
-                    val names = arrayOf(
-                        getString(R.string.adaptive_off),
-                        getString(R.string.adaptive_light),
-                        getString(R.string.adaptive_aggressive),
-                        getString(R.string.adaptive_satellite)
-                    )
-                    AlertDialog.Builder(this)
-                        .setTitle(getString(R.string.adaptive_mode))
-                        .setSingleChoiceItems(names, adaptiveLevel()) { dlg, which ->
-                            getSharedPreferences("aivpn_prefs", MODE_PRIVATE)
-                                .edit().putInt("adaptive_level", which).apply()
-                            dlg.dismiss()
-                        }
-                        .setNegativeButton(getString(R.string.btn_cancel), null)
-                        .show()
-                    true
-                }
-                MENU_DIAGNOSTICS -> { showDiagnosticsDialog(); true }
-                MENU_RECORDING -> { showRecordingDialog(); true }
-                MENU_EXPORT_LOGS -> { exportLogs(); true }
-                MENU_OS_KILL_SWITCH -> {
-                    startActivity(Intent(android.provider.Settings.ACTION_VPN_SETTINGS))
-                    true
-                }
-                else -> false
+
+        data class Item(val title: String, val desc: String, val id: Int)
+        val items = listOf(
+            Item(getString(R.string.adaptive_mode) + ": " + levelNames[currentLevel],
+                 getString(R.string.desc_adaptive_mode), MENU_ADAPTIVE),
+            Item(getString(R.string.diagnostics),    getString(R.string.desc_diagnostics),   MENU_DIAGNOSTICS),
+            Item(getString(R.string.recording),      getString(R.string.desc_recording),     MENU_RECORDING),
+            Item(getString(R.string.export_logs),    getString(R.string.desc_export_logs),   MENU_EXPORT_LOGS),
+            Item(getString(R.string.os_kill_switch), getString(R.string.desc_kill_switch),   MENU_OS_KILL_SWITCH),
+        )
+
+        val dialogCtx = android.view.ContextThemeWrapper(this, R.style.Theme_AIVPN_Dialog)
+        val container = LinearLayout(dialogCtx).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(0, 8.dp, 0, 8.dp)
+        }
+        val scrollView = android.widget.ScrollView(dialogCtx).also { it.addView(container) }
+        val dialog = AlertDialog.Builder(this).setView(scrollView).create()
+
+        val primaryColor   = getColor(R.color.text_primary)
+        val secondaryColor = getColor(R.color.text_secondary)
+        val greyColor      = getColor(R.color.grey)
+
+        items.forEachIndexed { index, item ->
+            val row = LinearLayout(dialogCtx).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(24.dp, 14.dp, 24.dp, 14.dp)
+                isClickable = true
+                isFocusable = true
+                val ta = dialogCtx.obtainStyledAttributes(intArrayOf(android.R.attr.selectableItemBackground))
+                background = ta.getDrawable(0)
+                ta.recycle()
+            }
+            row.addView(TextView(dialogCtx).apply {
+                text = item.title
+                textSize = 15f
+                setTextColor(primaryColor)
+                setTypeface(null, android.graphics.Typeface.BOLD)
+            })
+            row.addView(TextView(dialogCtx).apply {
+                text = item.desc
+                textSize = 12f
+                setTextColor(secondaryColor)
+                setPadding(0, 4.dp, 0, 0)
+            })
+            row.setOnClickListener { dialog.dismiss(); onOptionsMenuItemSelected(item.id) }
+            container.addView(row)
+            if (index < items.size - 1) {
+                container.addView(View(dialogCtx).apply {
+                    layoutParams = LinearLayout.LayoutParams(
+                        LinearLayout.LayoutParams.MATCH_PARENT, 1
+                    ).apply { setMargins(24.dp, 0, 24.dp, 0) }
+                    setBackgroundColor(greyColor)
+                })
             }
         }
-        popup.show()
+        dialog.show()
+    }
+
+    private fun onOptionsMenuItemSelected(itemId: Int) {
+        when (itemId) {
+            MENU_ADAPTIVE -> {
+                val names = arrayOf(
+                    getString(R.string.adaptive_off),
+                    getString(R.string.adaptive_light),
+                    getString(R.string.adaptive_aggressive),
+                    getString(R.string.adaptive_satellite)
+                )
+                AlertDialog.Builder(this)
+                    .setTitle(getString(R.string.adaptive_mode))
+                    .setMessage(getString(R.string.desc_adaptive_mode))
+                    .setSingleChoiceItems(names, adaptiveLevel()) { dlg, which ->
+                        getSharedPreferences("aivpn_prefs", MODE_PRIVATE)
+                            .edit().putInt("adaptive_level", which).apply()
+                        dlg.dismiss()
+                    }
+                    .setNegativeButton(getString(R.string.btn_cancel), null)
+                    .show()
+            }
+            MENU_DIAGNOSTICS   -> showDiagnosticsDialog()
+            MENU_RECORDING     -> showRecordingDialog()
+            MENU_EXPORT_LOGS   -> exportLogs()
+            MENU_OS_KILL_SWITCH -> startActivity(Intent(android.provider.Settings.ACTION_VPN_SETTINGS))
+        }
     }
 
     private fun adaptiveLevel(): Int =

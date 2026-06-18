@@ -443,6 +443,11 @@ struct ContentView: View {
                         Spacer()
                     }
 
+                    Text(loc.t("recording_desc"))
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+
                     TextField(loc.t("record_service_name"), text: $recordingServiceName)
                         .textFieldStyle(.roundedBorder)
                         .font(.system(size: 11))
