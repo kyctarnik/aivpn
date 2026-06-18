@@ -155,7 +155,9 @@ class AivpnService : VpnService() {
              savedMtlsCert != null && mtlsCert != null && savedMtlsCert.contentEquals(mtlsCert))
         val startupInFlight = restartJob?.isActive == true
         val tunnelLoopActive = serviceJob?.isActive == true
-        if (sameTarget && (startupInFlight || tunnelLoopActive)) {
+        // Allow reconnect after manual disconnect even if the old Rust call is still unwinding.
+        // The restartJob uses withTimeoutOrNull(3s)+cancelAndJoin to wait for the old session.
+        if (sameTarget && (startupInFlight || tunnelLoopActive) && !manualDisconnect) {
             Log.d(TAG, "Ignoring duplicate CONNECT while startup/session is already in progress")
             return
         }
