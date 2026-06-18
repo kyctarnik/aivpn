@@ -12,6 +12,12 @@
 
 set -euo pipefail
 
+# Ensure rustup-managed cargo takes precedence over conda/Homebrew/system cargo
+export PATH="$HOME/.cargo/bin:$PATH"
+
+# Auto-install required iOS Rust targets if missing
+rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
+
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 IOS_DIR="$REPO_ROOT/aivpn-ios"
 CORE_DIR="$REPO_ROOT/aivpn-ios-core"
