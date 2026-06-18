@@ -576,17 +576,19 @@ class MainActivity : AppCompatActivity() {
 
         val localeList = LocaleListCompat.forLanguageTags(newLang)
         AppCompatDelegate.setApplicationLocales(localeList)
+        // Force immediate recreation on all API levels so descriptions update
+        recreate()
     }
 
     private fun updateLanguageButton() {
         // Apply saved language on startup
         val savedLang = SecureStorage.loadLanguage(this)
-        if (savedLang != "en") {
+        if (savedLang != null && savedLang != "en") {
             val localeList = LocaleListCompat.forLanguageTags(savedLang)
             AppCompatDelegate.setApplicationLocales(localeList)
         }
 
-        val currentLang = savedLang.uppercase()
+        val currentLang = (savedLang ?: "en").uppercase()
         binding.btnLanguage.text = if (currentLang == "EN") "EN → RU" else "RU → EN"
     }
 

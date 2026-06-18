@@ -164,17 +164,19 @@ func startClient(key: String, fullTunnel: Bool, binaryPath: String?, mtlsCertPat
     let requestedPath = binaryPath ?? DEFAULT_CLIENT_PATH
 
     // Canonicalize to prevent symlink/traversal tricks
-    let clientPath: String
-    if let resolved = URL(fileURLWithPath: requestedPath).standardized.path as String?,
-       ALLOWED_CLIENT_PATHS.contains(resolved) {
-        clientPath = resolved
-    } else if ALLOWED_CLIENT_PATHS.contains(requestedPath) {
-        clientPath = requestedPath
-    } else {
+    let resolvedPath = URL(fileURLWithPath: requestedPath).standardized.path
+    // Accept exact paths OR any AIVPN.app bundle at any install location
+    let allowedSuffixes = ["/AIVPN.app/Contents/MacOS/aivpn-client",
+                           "/AIVPN.app/Contents/Resources/aivpn-client"]
+    let isAllowed = ALLOWED_CLIENT_PATHS.contains(resolvedPath) ||
+                    ALLOWED_CLIENT_PATHS.contains(requestedPath) ||
+                    allowedSuffixes.contains(where: { resolvedPath.hasSuffix($0) })
+    guard isAllowed else {
         log("ERROR: binaryPath '\(requestedPath)' not in allowlist — rejected")
         return HelperResponse(status: "error",
                               message: "Rejected: binary path is not permitted")
     }
+    let clientPath = resolvedPath
 
     guard FileManager.default.isExecutableFile(atPath: clientPath) else {
         log("ERROR: aivpn-client not found at \(clientPath)")
