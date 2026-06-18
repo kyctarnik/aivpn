@@ -12,18 +12,27 @@
 
 set -euo pipefail
 
-# Ensure rustup-managed cargo takes precedence over conda/Homebrew/system cargo
-export PATH="$HOME/.cargo/bin:$PATH"
+# Resolve rustup (may live in ~/.cargo/bin or be installed via Homebrew/other)
+if command -v rustup &>/dev/null; then
+    RUSTUP="$(command -v rustup)"
+elif [ -x "$HOME/.cargo/bin/rustup" ]; then
+    RUSTUP="$HOME/.cargo/bin/rustup"
+else
+    echo "ERROR: rustup not found. Install from https://rustup.rs" >&2
+    exit 1
+fi
 
-# Install stable toolchain and iOS targets explicitly.
-# Using --toolchain stable avoids the mismatch where `rustup target add` (without
-# a qualifier) targets the user's *default* toolchain, while `cargo build` (driven
-# by rust-toolchain.toml) uses *stable* — resulting in "can't find crate for core".
-rustup toolchain install stable --profile minimal 2>/dev/null || true
-rustup target add --toolchain stable \
+# Install stable toolchain and iOS targets.
+"$RUSTUP" toolchain install stable --profile minimal 2>/dev/null || true
+"$RUSTUP" target add --toolchain stable \
     aarch64-apple-ios \
     aarch64-apple-ios-sim \
     x86_64-apple-ios
+
+# Use the rustup-managed cargo directly (bypasses Homebrew/conda cargo in PATH,
+# which lacks iOS sysroot even if rustup has the rust-std component installed).
+CARGO="$("$RUSTUP" which --toolchain stable cargo)"
+echo "==> Using cargo: $CARGO"
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 IOS_DIR="$REPO_ROOT/aivpn-ios"
@@ -38,13 +47,13 @@ TARGET_DIR="$REPO_ROOT/target"
 # ── 1. Rust: device + both simulator slices ───────────────────────────────────
 
 echo "==> Building Rust core for aarch64-apple-ios (device) …"
-cargo build --release -p aivpn-ios-core --target aarch64-apple-ios
+"$CARGO" build --release -p aivpn-ios-core --target aarch64-apple-ios
 
 echo "==> Building Rust core for aarch64-apple-ios-sim (Apple Silicon simulator) …"
-cargo build --release -p aivpn-ios-core --target aarch64-apple-ios-sim
+"$CARGO" build --release -p aivpn-ios-core --target aarch64-apple-ios-sim
 
 echo "==> Building Rust core for x86_64-apple-ios (Intel simulator) …"
-cargo build --release -p aivpn-ios-core --target x86_64-apple-ios
+"$CARGO" build --release -p aivpn-ios-core --target x86_64-apple-ios
 
 # ── 2. Combine simulator slices into a fat lib, then XCFramework ──────────────
 
