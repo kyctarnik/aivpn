@@ -6,7 +6,10 @@
   "network_config": {
     "server_vpn_ip": "10.0.0.1",
     "prefix_len": 24,
-    "mtu": "auto"
+    "mtu": "auto",
+    "keepalive_secs": null,
+    "ipv6_enabled": false,
+    "ipv6_prefix": "fd10:cafe::/48"
   },
 
   "mask_dir": "/var/lib/aivpn/masks",
@@ -18,12 +21,15 @@
 
   "pool": {
     "peers": [],
-    "sync_key": ""
+    "sync_key": "",
+    "exit_node": null,
+    "exit_node_enabled": false
   },
 
   "site_to_site": {
     "local_subnets": [],
-    "peers": []
+    "peers": [
+    ]
   },
 
   "mtls": {
