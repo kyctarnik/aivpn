@@ -266,7 +266,7 @@ windows: releases/
 z=zipfile.ZipFile('$$ZIP_NAME','w',zipfile.ZIP_DEFLATED); \
 [z.write(f,f.name) for f in pkg.iterdir()]; z.close()"; \
 	fi; \
-	NSI=windows-installer/aivpn-installer.nsi; \
+	NSI=aivpn-windows/installer/aivpn-installer.nsi; \
 	INSTALLER_EXE=releases/aivpn-windows-installer.exe; \
 	if command -v makensis >/dev/null 2>&1 && [ -f "$$NSI" ]; then \
 	    echo "Building NSIS installer..."; \
