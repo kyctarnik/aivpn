@@ -23,8 +23,7 @@ COPY aivpn-linux aivpn-linux/
 COPY aivpn-common/mask-assets mask-assets/
 
 RUN cargo build --release --target "${TARGET_TRIPLE}" -p aivpn-client --bin aivpn-client \
-    && cp "target/${TARGET_TRIPLE}/release/aivpn-client" /aivpn-client \
-    && strip /aivpn-client
+    && cp "target/${TARGET_TRIPLE}/release/aivpn-client" /aivpn-client
 
 # Stage 2: minimal runtime image with iproute2 for ip commands
 FROM alpine:3.19
