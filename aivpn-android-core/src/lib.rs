@@ -286,5 +286,7 @@ fn make_str(env: &mut JNIEnv, s: &str) -> jstring {
     // JVM may have a pending exception — clear it and retry rather than
     // calling .expect() which would panic-abort the process.
     let _ = env.exception_clear();
-    env.new_string("").map(|js| js.into_raw()).unwrap_or(std::ptr::null_mut())
+    env.new_string("")
+        .map(|js| js.into_raw())
+        .unwrap_or(std::ptr::null_mut())
 }

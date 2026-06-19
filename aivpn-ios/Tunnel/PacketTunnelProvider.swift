@@ -293,13 +293,8 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
 
         if fullTunnel {
             let dns = NEDNSSettings(servers: ["10.8.0.1", "1.1.1.1"])
-            // matchDomains routes DNS queries for listed domains *outside* the VPN
-            // DNS servers, letting those domains resolve via the default resolver.
-            // Note: this controls only DNS resolution path, not the traffic path.
-            // For traffic exclusion of specific IPs, use excludedRoutes above.
-            if !excludedDomains.isEmpty {
-                dns.matchDomains = excludedDomains
-            }
+            // matchDomains = nil routes ALL domains through VPN DNS (correct for full-tunnel).
+            // excludedRoutes controls traffic bypass; DNS always goes through VPN to avoid leaks.
             settings.dnsSettings = dns
         }
         return settings

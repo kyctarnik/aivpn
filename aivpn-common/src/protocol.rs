@@ -590,7 +590,9 @@ impl ControlPayload {
                 }
                 let new_eph_pub_len = u16::from_le_bytes([data[2], data[3]]) as usize;
                 if new_eph_pub_len != 32 {
-                    return Err(Error::InvalidPacket("KeyRotate: invalid eph pub key length"));
+                    return Err(Error::InvalidPacket(
+                        "KeyRotate: invalid eph pub key length",
+                    ));
                 }
                 if data.len() < 4 + new_eph_pub_len {
                     return Err(Error::InvalidPacket("KeyRotate invalid length"));
