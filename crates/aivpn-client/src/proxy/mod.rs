@@ -49,7 +49,20 @@ pub struct ProxyConfig {
 
 pub struct ProxyHandle {
     pub rx_queue: Arc<Mutex<VecDeque<Vec<u8>>>>,
-    pub wake_tx: std::sync::mpsc::SyncSender<()>
+    pub wake_tx: std::sync::mpsc::SyncSender<()>,
+    /// Accept-loop. Отменяется на Drop, чтобы реконнект мог пере-биндить порт
+    /// без WSAEADDRINUSE (Windows os error 10048) / EADDRINUSE.
+    pub accept_task: tokio::task::JoinHandle<()>,
+    /// Сигнал smoltcp-потоку завершиться (иначе по потоку на каждый реконнект).
+    pub stack_shutdown: Arc<AtomicBool>,
+}
+
+impl Drop for ProxyHandle {
+    fn drop(&mut self) {
+        self.stack_shutdown.store(true, Ordering::Relaxed);
+        let _ = self.wake_tx.try_send(()); // разбудить поток, чтобы он сразу увидел флаг
+        self.accept_task.abort();           // освободить TcpListener (порт 8888)
+    }
 }
 
 struct ManagedConn {
@@ -128,6 +141,9 @@ pub async fn spawn_proxy(
     let (udp_cmd_tx, udp_cmd_rx) = std::sync::mpsc::sync_channel::<UdpStackCommand>(1024);
     let (wake_tx, wake_rx) = std::sync::mpsc::sync_channel::<()>(1024);
 
+    let stack_shutdown = Arc::new(AtomicBool::new(false));
+    let stack_shutdown_thread = Arc::clone(&stack_shutdown);
+
     let vpn_ip = config.vpn_ip;
     let gateway_ip = config.gateway_ip;
     let prefix_len = config.prefix_len;
@@ -145,6 +161,7 @@ pub async fn spawn_proxy(
              vpn_ip,
              gateway_ip,
              prefix_len,
+             stack_shutdown_thread,            // ← новый аргумент
         );
     });
 
@@ -153,7 +170,7 @@ pub async fn spawn_proxy(
 
     let proxy_ip = config.listen_addr.ip();
     let wake_tx_accept = wake_tx.clone();
-    tokio::spawn(async move {
+    let accept_task = tokio::spawn(async move {   // ← было без let
         loop {
             match listener.accept().await {
                 Ok((stream, peer)) => {
@@ -171,7 +188,7 @@ pub async fn spawn_proxy(
         }
     });
 
-    Ok(ProxyHandle { rx_queue, wake_tx })
+    Ok(ProxyHandle { rx_queue, wake_tx, accept_task, stack_shutdown })
 }
 
 fn smoltcp_now() -> SmolInstant {
@@ -200,6 +217,7 @@ fn run_stack(
     vpn_ip: Ipv4Addr,
     gateway_ip: Ipv4Addr,
     prefix_len: u8,
+    stack_shutdown: Arc<AtomicBool>,          // ←
 ) {
     let mut device = VpnDevice::new(Arc::clone(&rx_queue), Arc::clone(&tx_queue), PROXY_MTU);
 
@@ -227,6 +245,9 @@ fn run_stack(
     let mut pending_dns: Vec<PendingDns> = Vec::new();
 
     loop {
+        if stack_shutdown.load(Ordering::Relaxed) {
+            return;                            // ← чистый выход, поток не накапливается
+        }
         // Принимаем новые TCP CONNECT-запросы.
         loop {
             match cmd_rx.try_recv() {

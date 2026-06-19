@@ -91,6 +91,12 @@ struct UploadCryptoState {
     keys: SessionKeys,
     counter: u64,
     seq: u16,
+    /// Новые ключи inline rekey, которые upload-таск применит СРАЗУ ПОСЛЕ
+    /// шифрования ответа KeyRotate старыми ключами. Прямое переключение
+    /// keys из обработчика гонялось с upload-таском: ответ ещё лежал в
+    /// очереди и шифровался уже новыми ключами, которые сервер может
+    /// вывести только ИЗ этого ответа → рассинхрон и RX silence.
+    pending_keys: Option<SessionKeys>,
 }
 
 /// AIVPN Client instance
@@ -114,6 +120,7 @@ pub struct AivpnClient {
     transition_recv_window: RecvWindow,
     recv_mdh_len: usize,
     prev_recv_mdh_len: Option<usize>,
+    recv_mask_id: String,
     // Traffic counters
     bytes_sent: Arc<AtomicU64>,
     bytes_received: Arc<AtomicU64>,
@@ -130,6 +137,12 @@ pub struct AivpnClient {
     last_local_port: Option<u16>,
     /// Static X25519 keypair — persisted across reconnects for device binding (0.9.0+).
     static_keypair: Option<KeyPair>,
+    /// server_eph_pub, с которым уже завершён PFS-ратчет в этой сессии.
+    /// Сервер повторяет ServerHello (retry на pre-ratchet keepalive), пока не
+    /// увидит от нас пакет с ратченутым тегом — повторный ратчет от того же
+    /// eph_pub рассинхронизировал бы ключи (у сервера PSK — начальный
+    /// session_key, у нас — уже ратченутый) → полная потеря связи (RX silence).
+    ratchet_done_eph: Option<[u8; X25519_PUBLIC_KEY_SIZE]>,
     /// Connection quality tracker — RTT, jitter, loss → 0–100 score (0.9.0+).
     quality_tracker: QualityTracker,
     /// Current adaptive mode level — adjusted from quality score (0.9.0+).
@@ -150,6 +163,7 @@ impl AivpnClient {
         let keypair = KeyPair::generate();
         let tunnel = Tunnel::new(config.tun_config.clone());
         let recv_mdh_len = packet_mdh_len_for_mask(&config.initial_mask);
+        let recv_mask_id = config.initial_mask.mask_id.to_string();
         let bytes_sent = Arc::new(AtomicU64::new(0));
         let bytes_received = Arc::new(AtomicU64::new(0));
 
@@ -179,6 +193,7 @@ impl AivpnClient {
             transition_recv_window: RecvWindow::new(),
             recv_mdh_len,
             prev_recv_mdh_len: None,
+            recv_mask_id,
             bytes_sent: bytes_sent.clone(),
             bytes_received: bytes_received.clone(),
             // Pre-allocate buffers to MAX_PACKET_SIZE to avoid reallocations
@@ -190,6 +205,7 @@ impl AivpnClient {
             keepalive_interval: Duration::from_secs(DEFAULT_KEEPALIVE_SECS as u64),
             last_local_port: None,
             static_keypair,
+            ratchet_done_eph: None,
             quality_tracker: QualityTracker::new(),
             adaptive_level: AdaptiveLevel::Off,
             keepalive_sent_ms: Arc::new(AtomicU64::new(0)),
@@ -353,6 +369,8 @@ impl AivpnClient {
             self.config.preshared_key.as_ref(),
             &self.keypair.public_key_bytes(),
         ));
+        // Новая сессия → ждём новый ServerHello с новым server_eph_pub.
+        self.ratchet_done_eph = None;
         let keys = self
             .session_keys
             .as_ref()
@@ -462,7 +480,8 @@ impl AivpnClient {
                 }
             }
         }));
-
+ 
+        let mut _proxy_guard: Option<crate::proxy::ProxyHandle> = None;
         // Proxy mode: start smoltcp + SOCKS5 instead of creating a TUN device
         if let Some(listen_addr) = self.config.proxy_listen {
             let vpn_ip = self
@@ -488,6 +507,7 @@ impl AivpnClient {
                 .map_err(Error::Io)?;
             self.proxy_rx_queue = Some(Arc::clone(&handle.rx_queue));
             self.proxy_wake_tx = Some(handle.wake_tx.clone());
+            _proxy_guard = Some(handle);       // ← держим до конца функции
         }
 
         // Take the TUN reader for the spawned task (skipped in proxy mode)
@@ -643,6 +663,7 @@ impl AivpnClient {
             keys: upload_keys,
             counter: upload_counter,
             seq: upload_seq,
+            pending_keys: None,
         }));
         self.upload_state = Some(upload_state.clone());
 
@@ -743,7 +764,13 @@ impl AivpnClient {
 
                     if let Err(e) = self.receive_and_write_packet(&packet).await {
                         match &e {
-                            Error::InvalidPacket(_) => warn!("Receive invalid packet: {}", e),
+                            Error::InvalidPacket(_) => warn!(
+                                "Receive invalid packet: {} (rx_mask={}, mdh_len={}, transition_keys={})",
+                                e,
+                                self.recv_mask_id,
+                                self.recv_mdh_len,
+                                self.transition_recv_keys.is_some(),
+                            ),
                             Error::Crypto(_) => warn!("Receive error (crypto): {}", e),
                             _ => {
                                 warn!("Receive error: {}", e);
@@ -758,11 +785,14 @@ impl AivpnClient {
         // Stop background tasks before disconnecting.
         tun_task.abort();
         udp_task.abort();
+        upload_task.abort();   // ← держал Arc<UdpSocket> и слал keepalive в мёртвый сокет
+        stats_task.abort();    // ← плодился по таску на реконнект
         let _ = tun_task.await;
         let _ = udp_task.await;
+        // upload_task НЕ await — он мог уже завершиться в select (&mut upload_task),
+        // повторный await на готовом JoinHandle паникует; abort() безопасен в любом случае.
 
-        self.disconnect().await;
-
+        self.disconnect().await;   // тут _proxy_guard уходит из scope → Drop → accept abort + поток стоп
         run_res
     }
 
@@ -840,8 +870,20 @@ impl AivpnClient {
                 let inner = build_inner_packet(InnerType::Control, state.seq, &bytes);
                 state.seq = state.seq.wrapping_add(1);
                 let keys = state.keys.clone();
-                self.engine
-                    .build_packet(&inner, &keys, &mut state.counter, None)
+                let pkt = self
+                    .engine
+                    .build_packet(&inner, &keys, &mut state.counter, None)?;
+                // Ответ KeyRotate обязан уйти старыми ключами (сервер выводит
+                // новые только из него в commit_session_rekey). Переключаемся на
+                // новые ключи атомарно сразу после его шифрования — без гонки
+                // с основным циклом.
+                if matches!(payload, ControlPayload::KeyRotate { .. }) {
+                    if let Some(new_keys) = state.pending_keys.take() {
+                        state.keys = new_keys;
+                        state.counter = 0;
+                    }
+                }
+                Ok(pkt)
             }
 
             fn encrypt_keepalive(&mut self) -> Result<Vec<u8>> {
@@ -1056,31 +1098,48 @@ impl AivpnClient {
                         return Ok(());
                     }
                 };
+                // tag_secret ротируется вместе с остальными ключами — сервер в
+                // commit_session_rekey ставит полный new_keys (включая tag_secret)
+                // и пересчитывает tag-окно. Старый tag_secret сделал бы все наши
+                // пакеты нерезолвируемыми после rekey.
                 let new_keys = crypto::derive_session_keys(
                     &dh_rekey,
                     Some(&current_sk),
                     &client_rekey_kp.public_key_bytes(),
                 );
-                // Send response with OLD keys before switching
+                // ГОНКА (фикс): send_control лишь кладёт ответ в очередь upload-таска.
+                // Раньше keys переключались здесь синхронно, и upload-таск успевал
+                // зашифровать ответ уже НОВЫМИ ключами — а сервер выводит новые
+                // ключи только из самого ответа → он его не расшифровывал, rekey
+                // не коммитился, стороны расходились → RX silence через 45 c.
+                // Теперь новые ключи кладём в pending_keys, а upload-таск применит
+                // их сам сразу после шифрования ответа старыми ключами.
+                let Some(upload_state) = self.upload_state.clone() else {
+                    warn!("Inline rekey: upload state not initialized, ignoring KeyRotate");
+                    return Ok(());
+                };
+                {
+                    let mut state = upload_state.lock().unwrap_or_else(|e| e.into_inner());
+                    state.pending_keys = Some(new_keys.clone());
+                }
                 let response = ControlPayload::KeyRotate {
                     new_eph_pub: client_rekey_kp.public_key_bytes(),
                 };
                 if let Err(e) = self.send_control(&response).await {
                     warn!("Inline rekey: failed to send response: {}", e);
+                    // Откат: ответ не ушёл — остаёмся на старых ключах.
+                    let mut state = upload_state.lock().unwrap_or_else(|e| e.into_inner());
+                    state.pending_keys = None;
                     return Ok(());
                 }
-                // Keep old keys for 2 s to accept in-flight server packets
+                // RX: держим старые ключи 2 с для in-flight пакетов сервера
+                // (сервер шлёт старыми, пока не получит наш ответ и не закоммитит).
                 self.transition_recv_keys = self.session_keys.clone();
                 self.transition_recv_deadline = Some(Instant::now() + Duration::from_secs(2));
                 self.transition_recv_window = std::mem::take(&mut self.recv_window);
                 self.session_keys = Some(new_keys);
                 self.counter = 0;
                 self.recv_window.reset();
-                if let Some(upload_state) = &self.upload_state {
-                    let mut state = upload_state.lock().unwrap_or_else(|e| e.into_inner());
-                    state.keys = self.session_keys.clone().expect("keys set");
-                    state.counter = 0;
-                }
                 info!("Inline PFS rekey complete — new session keys active");
             }
             ControlPayload::ServerHello {
@@ -1116,6 +1175,20 @@ impl AivpnClient {
                     }
                 }
 
+                // Дубликат ServerHello: сервер ретраит hello, пока не получит от нас
+                // пакет с ратченутым тегом (например, наш pre-ratchet keepalive
+                // догнал сервер уже после создания сессии). Повторный ратчет от
+                // того же server_eph_pub давал бы ratchet(ratchet(keys)) на клиенте
+                // против ratchet(keys) на сервере → мёртвый туннель. Игнорируем и
+                // шлём keepalive новыми ключами, чтобы сервер завершил ратчет.
+                if self.ratchet_done_eph == Some(server_eph_pub) {
+                    debug!("Duplicate ServerHello — ratchet already completed, ignoring");
+                    let _ = self
+                        .send_control(&ControlPayload::Keepalive { send_ts: 0 })
+                        .await;
+                    return Ok(());
+                }
+
                 info!("ServerHello received — completing PFS ratchet");
 
                 if let Some(network_config) = network_config {
@@ -1134,6 +1207,11 @@ impl AivpnClient {
                     .as_ref()
                     .ok_or(Error::Session("No session keys for ratchet".into()))?
                     .session_key;
+                // ВАЖНО: tag_secret тоже ратчетится. Сервер помечает сессию
+                // ратченутой, только увидев тег из ратченутого tag_secret
+                // (ratcheted_expected_tags в session.rs), и лишь после этого сам
+                // переходит на новые ключи. Пока сервер шлёт со старым (стабильным)
+                // тегом, его пакеты декодируются через transition_recv_keys ниже.
                 let ratcheted = crypto::derive_session_keys(
                     &dh2,
                     Some(&current_key),
@@ -1154,8 +1232,10 @@ impl AivpnClient {
                     let mut state = upload_state.lock().unwrap_or_else(|e| e.into_inner());
                     state.keys = self.session_keys.clone().expect("session keys set");
                     state.counter = 0;
+                    state.pending_keys = None; // ратчет отменяет незавершённый rekey
                     info!("Outbound ratchet activated — upload switched to new keys");
                 }
+                self.ratchet_done_eph = Some(server_eph_pub);
                 info!("PFS ratchet complete — forward secrecy established");
 
                 // Send mTLS ClientCert now that the PFS ratchet is complete.
@@ -1361,6 +1441,7 @@ impl AivpnClient {
             self.prev_recv_mdh_len = Some(self.recv_mdh_len);
         }
         self.recv_mdh_len = new_mdh_len;
+        self.recv_mask_id = new_mask.mask_id.to_string();
         info!(
             "Updating mask to {} (mdh_len: {})",
             new_mask.mask_id, new_mdh_len
