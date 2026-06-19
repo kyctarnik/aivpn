@@ -293,7 +293,7 @@ ios:
 	@set -e; \
 	RUSTUP="$$(command -v rustup 2>/dev/null || echo $$HOME/.cargo/bin/rustup)"; \
 	[ -x "$$RUSTUP" ] || { echo "ERROR: rustup not found. Install from https://rustup.rs" >&2; exit 1; }; \
-	"$$RUSTUP" toolchain install stable --profile minimal 2>/dev/null || true; \
+	"$$RUSTUP" update stable 2>/dev/null || true; \
 	"$$RUSTUP" target add --toolchain stable \
 	    aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios; \
 	CARGO="$$("$$RUSTUP" which --toolchain stable cargo)"; \
@@ -373,6 +373,7 @@ macos:
 	@echo "==> Building aivpn-client for macOS Universal Binary..."
 	@if command -v rustup >/dev/null 2>&1 || [ -x "$$HOME/.cargo/bin/rustup" ]; then \
 	    RUSTUP="$$(command -v rustup 2>/dev/null || echo $$HOME/.cargo/bin/rustup)"; \
+	    "$$RUSTUP" update stable 2>/dev/null || true; \
 	    "$$RUSTUP" target add aarch64-apple-darwin x86_64-apple-darwin 2>/dev/null || true; \
 	fi
 	cargo build --release -p aivpn-client --target aarch64-apple-darwin
