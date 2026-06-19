@@ -578,7 +578,6 @@ aivpn/
 ├── aivpn-windows/         # Windows egui GUI
 ├── aivpn-macos/           # macOS SwiftUI menu bar app
 ├── mask-assets/           # Bundled traffic mimicry profiles (JSON)
-├── scripts/               # Build and deployment scripts
 ├── docker/                # Dockerfiles and entrypoint
 ├── Dockerfile
 ├── docker-compose.yml
