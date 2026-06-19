@@ -296,7 +296,7 @@ ios:
 	"$$RUSTUP" update stable 2>/dev/null || true; \
 	"$$RUSTUP" target add --toolchain stable \
 	    aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios; \
-	CARGO="cargo +stable"; \
+	CARGO="cargo"; \
 	echo "==> cargo: $$CARGO"; \
 	REPO_ROOT="$$(pwd)"; \
 	IOS_DIR="$$REPO_ROOT/aivpn-ios"; \
