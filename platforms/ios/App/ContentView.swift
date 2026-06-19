@@ -150,18 +150,18 @@ private struct StatusRing: View {
     var body: some View {
         ZStack {
             Circle()
-                .stroke(color.opacity(0.2), lineWidth: 10)
-                .frame(width: 120, height: 120)
+                .stroke(color.opacity(0.2), lineWidth: 8)
+                .frame(width: 96, height: 96)
             Circle()
                 .trim(from: 0, to: isConnecting ? 0.6 : 1)
-                .stroke(color, style: StrokeStyle(lineWidth: 10, lineCap: .round))
-                .frame(width: 120, height: 120)
+                .stroke(color, style: StrokeStyle(lineWidth: 8, lineCap: .round))
+                .frame(width: 96, height: 96)
                 .rotationEffect(.degrees(-90))
                 .animation(isConnecting
                     ? .linear(duration: 1.2).repeatForever(autoreverses: false)
                     : .easeInOut, value: isConnecting)
             Image(systemName: symbol)
-                .font(.system(size: 36, weight: .medium))
+                .font(.system(size: 28, weight: .medium))
                 .foregroundColor(color)
         }
     }
@@ -279,7 +279,7 @@ struct ContentView: View {
     @State private var showSplitTunnel: Bool = false
 
     var body: some View {
-        NavigationView {
+        NavigationStack {
             ScrollView {
                 VStack(spacing: 20) {
                     statusSection
@@ -300,7 +300,6 @@ struct ContentView: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar { toolbarContent }
         }
-        .navigationViewStyle(.stack)
         .sheet(isPresented: $showAddKey) {
             KeyEditSheet(existingKey: nil,
                 onSave: { name, val, cert in
@@ -337,6 +336,56 @@ struct ContentView: View {
         .sheet(isPresented: $showSplitTunnel) {
             SplitTunnelView()
                 .environmentObject(loc)
+        }
+        .sheet(isPresented: $showDiagnostics) {
+            NavigationStack {
+                VStack(spacing: 20) {
+                    if benchRunning {
+                        ProgressView(loc.t("bench_running"))
+                    } else if benchQuality > 0 {
+                        VStack(spacing: 8) {
+                            Text("Quality: \(benchQuality)/100")
+                                .font(.title2).fontWeight(.bold)
+                                .foregroundColor(benchQuality >= 80 ? .green : benchQuality >= 50 ? .orange : .red)
+                            Text("P50: \(benchP50) ms")
+                                .font(.subheadline).foregroundColor(.secondary)
+                        }
+                    } else {
+                        Text(loc.t("bench_idle"))
+                            .foregroundColor(.secondary)
+                            .multilineTextAlignment(.center)
+                            .padding()
+                    }
+                    Button(loc.t("run_benchmark")) {
+                        guard let addr = vpn.selectedKey?.serverAddress, !addr.isEmpty else { return }
+                        benchRunning = true
+                        DispatchQueue.global(qos: .utility).async {
+                            runBenchPosix(serverAddr: addr) { p50, quality in
+                                DispatchQueue.main.async {
+                                    if p50 == -1 {
+                                        benchP50 = 0
+                                        benchQuality = 0
+                                    } else {
+                                        benchP50 = p50
+                                        benchQuality = quality
+                                    }
+                                    benchRunning = false
+                                }
+                            }
+                        }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(benchRunning)
+                }
+                .navigationTitle(loc.t("diagnostics"))
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .confirmationAction) {
+                        Button(loc.t("done")) { showDiagnostics = false }
+                    }
+                }
+                .padding()
+            }
         }
     }
 
@@ -381,6 +430,10 @@ struct ContentView: View {
                 Divider().frame(height: 44)
                 statCell(icon: "clock.fill", color: .orange,
                          label: loc.t("duration"), value: formatDuration(vpn.connectionDuration))
+                Divider().frame(height: 44)
+                statCell(icon: "chart.bar.fill",
+                         color: vpn.liveQuality >= 80 ? .green : vpn.liveQuality >= 50 ? .orange : .red,
+                         label: loc.t("quality"), value: vpn.liveQuality > 0 ? "\(vpn.liveQuality)/100" : "—")
             }
             .padding(.horizontal)
             .background(Color(.secondarySystemBackground))
@@ -474,54 +527,6 @@ struct ContentView: View {
                 }
                 .buttonStyle(.bordered)
                 .padding(.horizontal)
-                .sheet(isPresented: $showDiagnostics) {
-                    NavigationView {
-                        VStack(spacing: 20) {
-                            if benchRunning {
-                                ProgressView(loc.t("bench_running"))
-                            } else if benchQuality > 0 {
-                                VStack(spacing: 8) {
-                                    Text("Quality: \(benchQuality)/100")
-                                        .font(.title2).fontWeight(.bold)
-                                        .foregroundColor(benchQuality >= 80 ? .green : benchQuality >= 50 ? .orange : .red)
-                                    Text("P50: \(benchP50) ms")
-                                        .font(.subheadline).foregroundColor(.secondary)
-                                }
-                            } else {
-                                Text(loc.t("bench_idle"))
-                                    .foregroundColor(.secondary)
-                                    .multilineTextAlignment(.center)
-                                    .padding()
-                            }
-                            Button(loc.t("run_benchmark")) {
-                                guard let addr = vpn.selectedKey?.serverAddress, !addr.isEmpty else { return }
-                                benchRunning = true
-                                DispatchQueue.global(qos: .utility).async {
-                                    runBenchPosix(serverAddr: addr) { p50, quality in
-                                        DispatchQueue.main.async {
-                                            if p50 == -1 {
-                                                // IPv6 not yet supported
-                                                benchP50 = 0
-                                                benchQuality = 0
-                                            } else {
-                                                benchP50 = p50
-                                                benchQuality = quality
-                                            }
-                                            benchRunning = false
-                                        }
-                                    }
-                                }
-                            }
-                            .buttonStyle(.borderedProminent)
-                            .disabled(benchRunning)
-                        }
-                        .navigationTitle(loc.t("diagnostics"))
-                        .navigationBarItems(trailing: Button(loc.t("cancel")) {
-                            showDiagnostics = false
-                        })
-                        .padding()
-                    }
-                }
             }
             HStack(spacing: 12) {
                 Button {

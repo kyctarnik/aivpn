@@ -999,7 +999,12 @@ mod tests {
             (0x1A, ControlSubtype::AdaptiveHint),
         ];
         for (byte, expected) in pairs {
-            assert_eq!(ControlSubtype::from_u8(*byte), Some(*expected), "byte={:#04x}", byte);
+            assert_eq!(
+                ControlSubtype::from_u8(*byte),
+                Some(*expected),
+                "byte={:#04x}",
+                byte
+            );
         }
         assert_eq!(ControlSubtype::from_u8(0x00), None);
         assert_eq!(ControlSubtype::from_u8(0x1B), None);
@@ -1011,7 +1016,10 @@ mod tests {
 
     #[test]
     fn inner_header_encode_decode_data() {
-        let hdr = InnerHeader { inner_type: InnerType::Data, seq_num: 0x1234 };
+        let hdr = InnerHeader {
+            inner_type: InnerType::Data,
+            seq_num: 0x1234,
+        };
         let encoded = hdr.encode();
         let decoded = InnerHeader::decode(&encoded).unwrap();
         assert_eq!(decoded.inner_type, InnerType::Data);
@@ -1020,7 +1028,10 @@ mod tests {
 
     #[test]
     fn inner_header_encode_decode_fragment() {
-        let hdr = InnerHeader { inner_type: InnerType::Fragment, seq_num: 0xFFFF };
+        let hdr = InnerHeader {
+            inner_type: InnerType::Fragment,
+            seq_num: 0xFFFF,
+        };
         let encoded = hdr.encode();
         let decoded = InnerHeader::decode(&encoded).unwrap();
         assert_eq!(decoded.inner_type, InnerType::Fragment);
@@ -1103,7 +1114,9 @@ mod tests {
         let tag = make_tag();
         let mdh = vec![0x01u8; 2];
         let payload = vec![0x00u8; 4];
-        let mut bytes = AivpnPacket::new(tag, mdh.clone(), payload, 0).to_bytes().to_vec();
+        let mut bytes = AivpnPacket::new(tag, mdh.clone(), payload, 0)
+            .to_bytes()
+            .to_vec();
 
         // Overwrite pad_len field (at offset TAG_SIZE + mdh.len()) with 0xFFFF
         let pad_offset = TAG_SIZE + mdh.len();
@@ -1187,9 +1200,16 @@ mod tests {
     fn control_payload_mask_update_roundtrip() {
         let mask_data = vec![1u8, 2, 3, 4, 5];
         let signature = [0x7Fu8; 64];
-        let p = ControlPayload::MaskUpdate { mask_data: mask_data.clone(), signature };
+        let p = ControlPayload::MaskUpdate {
+            mask_data: mask_data.clone(),
+            signature,
+        };
         let decoded = roundtrip(&p);
-        if let ControlPayload::MaskUpdate { mask_data: md, signature: sig } = decoded {
+        if let ControlPayload::MaskUpdate {
+            mask_data: md,
+            signature: sig,
+        } = decoded
+        {
             assert_eq!(md, mask_data);
             assert_eq!(sig, signature);
         } else {
@@ -1199,7 +1219,9 @@ mod tests {
 
     #[test]
     fn control_payload_keepalive_roundtrip() {
-        let p = ControlPayload::Keepalive { send_ts: 0xDEAD_BEEF_1234_5678 };
+        let p = ControlPayload::Keepalive {
+            send_ts: 0xDEAD_BEEF_1234_5678,
+        };
         let decoded = roundtrip(&p);
         if let ControlPayload::Keepalive { send_ts } = decoded {
             assert_eq!(send_ts, 0xDEAD_BEEF_1234_5678);
@@ -1210,7 +1232,9 @@ mod tests {
 
     #[test]
     fn control_payload_telemetry_request_roundtrip() {
-        let p = ControlPayload::TelemetryRequest { metric_flags: 0b0000_1111 };
+        let p = ControlPayload::TelemetryRequest {
+            metric_flags: 0b0000_1111,
+        };
         let decoded = roundtrip(&p);
         if let ControlPayload::TelemetryRequest { metric_flags } = decoded {
             assert_eq!(metric_flags, 0b0000_1111);
@@ -1228,7 +1252,13 @@ mod tests {
             buffer_pct: 88,
         };
         let decoded = roundtrip(&p);
-        if let ControlPayload::TelemetryResponse { packet_loss, rtt_ms, jitter_ms, buffer_pct } = decoded {
+        if let ControlPayload::TelemetryResponse {
+            packet_loss,
+            rtt_ms,
+            jitter_ms,
+            buffer_pct,
+        } = decoded
+        {
             assert_eq!(packet_loss, 300);
             assert_eq!(rtt_ms, 42);
             assert_eq!(jitter_ms, 7);
@@ -1240,7 +1270,9 @@ mod tests {
 
     #[test]
     fn control_payload_time_sync_roundtrip() {
-        let p = ControlPayload::TimeSync { server_ts_ms: 1_700_000_000_000 };
+        let p = ControlPayload::TimeSync {
+            server_ts_ms: 1_700_000_000_000,
+        };
         let decoded = roundtrip(&p);
         if let ControlPayload::TimeSync { server_ts_ms } = decoded {
             assert_eq!(server_ts_ms, 1_700_000_000_000);
@@ -1262,9 +1294,16 @@ mod tests {
 
     #[test]
     fn control_payload_control_ack_roundtrip() {
-        let p = ControlPayload::ControlAck { ack_seq: 0x1001, ack_for_subtype: 0x09 };
+        let p = ControlPayload::ControlAck {
+            ack_seq: 0x1001,
+            ack_for_subtype: 0x09,
+        };
         let decoded = roundtrip(&p);
-        if let ControlPayload::ControlAck { ack_seq, ack_for_subtype } = decoded {
+        if let ControlPayload::ControlAck {
+            ack_seq,
+            ack_for_subtype,
+        } = decoded
+        {
             assert_eq!(ack_seq, 0x1001);
             assert_eq!(ack_for_subtype, 0x09);
         } else {
@@ -1282,7 +1321,12 @@ mod tests {
             network_config: None,
         };
         let decoded = roundtrip(&p);
-        if let ControlPayload::ServerHello { server_eph_pub: k, signature: sig, network_config: nc } = decoded {
+        if let ControlPayload::ServerHello {
+            server_eph_pub: k,
+            signature: sig,
+            network_config: nc,
+        } = decoded
+        {
             assert_eq!(k, server_eph_pub);
             assert_eq!(sig, signature);
             assert!(nc.is_none());
@@ -1293,7 +1337,9 @@ mod tests {
 
     #[test]
     fn control_payload_recording_start_roundtrip() {
-        let p = ControlPayload::RecordingStart { service: "zoom".to_string() };
+        let p = ControlPayload::RecordingStart {
+            service: "zoom".to_string(),
+        };
         let decoded = roundtrip(&p);
         if let ControlPayload::RecordingStart { service } = decoded {
             assert_eq!(service, "zoom");
@@ -1305,9 +1351,16 @@ mod tests {
     #[test]
     fn control_payload_recording_ack_roundtrip() {
         let session_id = [0xABu8; 16];
-        let p = ControlPayload::RecordingAck { session_id, status: "ok".to_string() };
+        let p = ControlPayload::RecordingAck {
+            session_id,
+            status: "ok".to_string(),
+        };
         let decoded = roundtrip(&p);
-        if let ControlPayload::RecordingAck { session_id: sid, status } = decoded {
+        if let ControlPayload::RecordingAck {
+            session_id: sid,
+            status,
+        } = decoded
+        {
             assert_eq!(sid, session_id);
             assert_eq!(status, "ok");
         } else {
@@ -1335,7 +1388,12 @@ mod tests {
             confidence: 0.987_654,
         };
         let decoded = roundtrip(&p);
-        if let ControlPayload::RecordingComplete { service, mask_id, confidence } = decoded {
+        if let ControlPayload::RecordingComplete {
+            service,
+            mask_id,
+            confidence,
+        } = decoded
+        {
             assert_eq!(service, "https");
             assert_eq!(mask_id, "mask-001");
             assert!((confidence - 0.987_654f32).abs() < 1e-5);
@@ -1346,7 +1404,9 @@ mod tests {
 
     #[test]
     fn control_payload_recording_failed_roundtrip() {
-        let p = ControlPayload::RecordingFailed { reason: "disk full".to_string() };
+        let p = ControlPayload::RecordingFailed {
+            reason: "disk full".to_string(),
+        };
         let decoded = roundtrip(&p);
         if let ControlPayload::RecordingFailed { reason } = decoded {
             assert_eq!(reason, "disk full");
@@ -1369,7 +1429,11 @@ mod tests {
             active_service: Some("quic".to_string()),
         };
         let decoded = roundtrip(&p);
-        if let ControlPayload::RecordingStatus { can_record, active_service } = decoded {
+        if let ControlPayload::RecordingStatus {
+            can_record,
+            active_service,
+        } = decoded
+        {
             assert!(can_record);
             assert_eq!(active_service, Some("quic".to_string()));
         } else {
@@ -1384,7 +1448,11 @@ mod tests {
             active_service: None,
         };
         let decoded = roundtrip(&p);
-        if let ControlPayload::RecordingStatus { can_record, active_service } = decoded {
+        if let ControlPayload::RecordingStatus {
+            can_record,
+            active_service,
+        } = decoded
+        {
             assert!(!can_record);
             assert!(active_service.is_none());
         } else {
@@ -1395,9 +1463,14 @@ mod tests {
     #[test]
     fn control_payload_bootstrap_descriptor_update_roundtrip() {
         let descriptor_data = vec![0xDE, 0xAD, 0xC0, 0xDE];
-        let p = ControlPayload::BootstrapDescriptorUpdate { descriptor_data: descriptor_data.clone() };
+        let p = ControlPayload::BootstrapDescriptorUpdate {
+            descriptor_data: descriptor_data.clone(),
+        };
         let decoded = roundtrip(&p);
-        if let ControlPayload::BootstrapDescriptorUpdate { descriptor_data: dd } = decoded {
+        if let ControlPayload::BootstrapDescriptorUpdate {
+            descriptor_data: dd,
+        } = decoded
+        {
             assert_eq!(dd, descriptor_data);
         } else {
             panic!("wrong variant");
@@ -1407,7 +1480,9 @@ mod tests {
     #[test]
     fn control_payload_pool_sync_roundtrip() {
         let clients_json = br#"[{"name":"alice"}]"#.to_vec();
-        let p = ControlPayload::PoolSync { clients_json: clients_json.clone() };
+        let p = ControlPayload::PoolSync {
+            clients_json: clients_json.clone(),
+        };
         let decoded = roundtrip(&p);
         if let ControlPayload::PoolSync { clients_json: cj } = decoded {
             assert_eq!(cj, clients_json);
@@ -1419,7 +1494,9 @@ mod tests {
     #[test]
     fn control_payload_route_sync_roundtrip() {
         let subnets_json = br#"["10.0.0.0/8","192.168.0.0/16"]"#.to_vec();
-        let p = ControlPayload::RouteSync { subnets_json: subnets_json.clone() };
+        let p = ControlPayload::RouteSync {
+            subnets_json: subnets_json.clone(),
+        };
         let decoded = roundtrip(&p);
         if let ControlPayload::RouteSync { subnets_json: sj } = decoded {
             assert_eq!(sj, subnets_json);
@@ -1431,7 +1508,9 @@ mod tests {
     #[test]
     fn control_payload_chain_forward_roundtrip() {
         let payload = vec![0x45, 0x00, 0x00, 0x28]; // fake IP header start
-        let p = ControlPayload::ChainForward { payload: payload.clone() };
+        let p = ControlPayload::ChainForward {
+            payload: payload.clone(),
+        };
         let decoded = roundtrip(&p);
         if let ControlPayload::ChainForward { payload: pl } = decoded {
             assert_eq!(pl, payload);
@@ -1443,7 +1522,9 @@ mod tests {
     #[test]
     fn control_payload_client_cert_roundtrip() {
         let cert_bytes = vec![0xCCu8; 104];
-        let p = ControlPayload::ClientCert { cert_bytes: cert_bytes.clone() };
+        let p = ControlPayload::ClientCert {
+            cert_bytes: cert_bytes.clone(),
+        };
         let decoded = roundtrip(&p);
         if let ControlPayload::ClientCert { cert_bytes: cb } = decoded {
             assert_eq!(cb, cert_bytes);
@@ -1463,9 +1544,16 @@ mod tests {
     fn control_payload_device_enrollment_roundtrip() {
         let static_pub = [0x33u8; 32];
         let dh_proof = [0x44u8; 32];
-        let p = ControlPayload::DeviceEnrollment { static_pub, dh_proof };
+        let p = ControlPayload::DeviceEnrollment {
+            static_pub,
+            dh_proof,
+        };
         let decoded = roundtrip(&p);
-        if let ControlPayload::DeviceEnrollment { static_pub: sp, dh_proof: dp } = decoded {
+        if let ControlPayload::DeviceEnrollment {
+            static_pub: sp,
+            dh_proof: dp,
+        } = decoded
+        {
             assert_eq!(sp, static_pub);
             assert_eq!(dp, dh_proof);
         } else {
@@ -1475,7 +1563,9 @@ mod tests {
 
     #[test]
     fn control_payload_keepalive_ack_roundtrip() {
-        let p = ControlPayload::KeepaliveAck { echo_ts: 0x0102_0304_0506_0708 };
+        let p = ControlPayload::KeepaliveAck {
+            echo_ts: 0x0102_0304_0506_0708,
+        };
         let decoded = roundtrip(&p);
         if let ControlPayload::KeepaliveAck { echo_ts } = decoded {
             assert_eq!(echo_ts, 0x0102_0304_0506_0708);
@@ -1493,7 +1583,13 @@ mod tests {
             jitter_ms: 3,
         };
         let decoded = roundtrip(&p);
-        if let ControlPayload::QualityReport { quality, rtt_ms, loss_ppm, jitter_ms } = decoded {
+        if let ControlPayload::QualityReport {
+            quality,
+            rtt_ms,
+            loss_ppm,
+            jitter_ms,
+        } = decoded
+        {
             assert_eq!(quality, 95);
             assert_eq!(rtt_ms, 12);
             assert_eq!(loss_ppm, 500);

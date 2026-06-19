@@ -95,7 +95,7 @@ struct ContentView: View {
                             Spacer()
                         }
                         if vpn.serverAdaptiveLevel > 0 {
-                            let label = ["Off", "Light", "Aggressive", "Satellite"][min(vpn.serverAdaptiveLevel, 3)]
+                            let label = ["Off", "Light", "Aggressive", "Satellite"][max(0, min(vpn.serverAdaptiveLevel, 3))]
                             Text("A: \(label)")
                                 .font(.caption)
                                 .foregroundColor(.cyan)
@@ -267,9 +267,9 @@ struct ContentView: View {
                                 .textFieldStyle(.roundedBorder)
                                 .font(.system(size: 11))
                                 .frame(width: 64)
-                                .onReceive(proxyPort.publisher.collect()) { _ in
-                                    let filtered = proxyPort.filter { $0.isNumber }
-                                    if filtered != proxyPort { proxyPort = filtered }
+                                .onChange(of: proxyPort) { newValue in
+                                    let filtered = newValue.filter { $0.isNumber }
+                                    if filtered != newValue { proxyPort = filtered }
                                 }
                             Spacer()
                         }

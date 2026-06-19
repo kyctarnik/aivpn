@@ -82,6 +82,8 @@ class LocalizationManager: ObservableObject {
                                 "ru": "mTLS сертификат (base64, оставьте пустым для отключения)"],
         "kill_switch":         ["en": "Kill Switch (block traffic if VPN drops)",
                                 "ru": "Kill Switch (блок трафика при разрыве VPN)"],
+        "done":                ["en": "Done",           "ru": "Готово"],
+        "quality":             ["en": "Quality",        "ru": "Качество"],
     ]
 
     init() {

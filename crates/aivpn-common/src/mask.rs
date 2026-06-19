@@ -921,11 +921,15 @@ pub mod preset_masks {
     }
 
     fn load_webrtc_vk_teams_v1() -> MaskProfile {
-        parse_mask(include_str!("../../../assets/masks/webrtc_vk_teams_v1.json"))
+        parse_mask(include_str!(
+            "../../../assets/masks/webrtc_vk_teams_v1.json"
+        ))
     }
 
     fn load_webrtc_sberjazz_v1() -> MaskProfile {
-        parse_mask(include_str!("../../../assets/masks/webrtc_sberjazz_v1.json"))
+        parse_mask(include_str!(
+            "../../../assets/masks/webrtc_sberjazz_v1.json"
+        ))
     }
 
     pub fn webrtc_zoom_v3() -> MaskProfile {

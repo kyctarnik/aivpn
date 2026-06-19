@@ -11,7 +11,7 @@
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 
 use crate::vpn_manager::{format_bytes, ConnectionState, TrafficStats};
@@ -20,15 +20,18 @@ use crate::vpn_manager::{format_bytes, ConnectionState, TrafficStats};
 const MENU_SHOW_ID: &str = "aivpn_show";
 const MENU_QUIT_ID: &str = "aivpn_quit";
 
-// Atomic action values
+// Atomic action values — ordered by priority: QUIT > SHOW > NONE.
+// The background thread must never downgrade a higher-priority action.
 const ACTION_NONE: u8 = 0;
 const ACTION_SHOW: u8 = 1;
 const ACTION_QUIT: u8 = 2;
 
 pub struct TrayManager {
     _tray_icon: TrayIcon,
-    /// Shared atomic flag: background thread writes, main thread reads
+    /// Shared atomic flag: background thread writes, main thread reads.
     pub action: Arc<AtomicU8>,
+    /// Set to true by Drop to signal the event thread to exit.
+    shutdown: Arc<AtomicBool>,
 }
 
 impl TrayManager {
@@ -59,21 +62,24 @@ impl TrayManager {
             .map_err(|e| format!("Tray build error: {}", e))?;
 
         let action = Arc::new(AtomicU8::new(ACTION_NONE));
+        let shutdown = Arc::new(AtomicBool::new(false));
 
         // Spawn background thread to monitor tray events.
         // This thread runs even when the main window is hidden (SW_HIDE),
         // which is when eframe stops calling update().
         let action_clone = action.clone();
+        let shutdown_clone = shutdown.clone();
         std::thread::Builder::new()
             .name("tray-events".into())
             .spawn(move || {
-                tray_event_loop(action_clone);
+                tray_event_loop(action_clone, shutdown_clone);
             })
             .map_err(|e| format!("Failed to spawn tray thread: {}", e))?;
 
         Ok(Self {
             _tray_icon: tray_icon,
             action,
+            shutdown,
         })
     }
 
@@ -90,16 +96,41 @@ impl TrayManager {
     }
 }
 
+impl Drop for TrayManager {
+    fn drop(&mut self) {
+        // Signal the background thread to exit cleanly.
+        self.shutdown.store(true, Ordering::SeqCst);
+    }
+}
+
 // ── Background thread ──────────────────────────────────────────────────────
+
+/// Raise the pending action to `new_action` only if it has higher priority.
+/// Priority order: QUIT (2) > SHOW (1) > NONE (0).
+/// This prevents a stray icon-click event from overwriting a pending QUIT.
+fn raise_action(action: &AtomicU8, new_action: u8) {
+    // CAS loop: only store if new_action > current value.
+    let mut current = action.load(Ordering::SeqCst);
+    while new_action > current {
+        match action.compare_exchange(current, new_action, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => break,
+            Err(actual) => current = actual,
+        }
+    }
+}
 
 /// Continuously poll tray icon and menu events.
 /// When an action is detected, set the atomic flag AND call Win32 ShowWindow
 /// to make the hidden window visible again (waking up eframe).
-fn tray_event_loop(action: Arc<AtomicU8>) {
+fn tray_event_loop(action: Arc<AtomicU8>, shutdown: Arc<AtomicBool>) {
     let menu_rx = MenuEvent::receiver();
     let icon_rx = TrayIconEvent::receiver();
 
     loop {
+        if shutdown.load(Ordering::SeqCst) {
+            break;
+        }
+
         let mut did_something = false;
 
         // Process all queued menu events
@@ -107,11 +138,11 @@ fn tray_event_loop(action: Arc<AtomicU8>) {
             did_something = true;
             match event.id.as_ref() {
                 MENU_SHOW_ID => {
-                    action.store(ACTION_SHOW, Ordering::SeqCst);
+                    raise_action(&action, ACTION_SHOW);
                     wake_and_show_window();
                 }
                 MENU_QUIT_ID => {
-                    action.store(ACTION_QUIT, Ordering::SeqCst);
+                    raise_action(&action, ACTION_QUIT);
                     // Show window briefly so eframe can process the quit
                     wake_and_show_window();
                 }
@@ -129,12 +160,12 @@ fn tray_event_loop(action: Arc<AtomicU8>) {
                     button_state: tray_icon::MouseButtonState::Up,
                     ..
                 } => {
-                    action.store(ACTION_SHOW, Ordering::SeqCst);
+                    raise_action(&action, ACTION_SHOW);
                     wake_and_show_window();
                 }
                 // Double-click → show window (Windows-only)
                 TrayIconEvent::DoubleClick { .. } => {
-                    action.store(ACTION_SHOW, Ordering::SeqCst);
+                    raise_action(&action, ACTION_SHOW);
                     wake_and_show_window();
                 }
                 _ => {}

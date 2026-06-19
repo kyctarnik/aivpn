@@ -45,6 +45,7 @@ class VPNManager: ObservableObject {
     @Published var canRecordMasks: Bool = false
     @Published var recordingCapabilityKnown: Bool = false
     @Published var lastRecordingResult: RecordingResultSummary?
+    @Published var liveQuality: Int = 0
 
     var keys: [ConnectionKey] { KeychainStorage.shared.keys }
     var selectedKeyId: String? {
@@ -82,7 +83,13 @@ class VPNManager: ObservableObject {
                 proto.serverAddress = "aivpn"
                 m.protocolConfiguration = proto
                 m.localizedDescription = "AIVPN"
+                m.isEnabled = true
                 self.manager = m
+                m.saveToPreferences { [weak self] error in
+                    if let error = error {
+                        DispatchQueue.main.async { self?.lastError = error.localizedDescription }
+                    }
+                }
             }
             self.observeStatus()
             // loadAllFromPreferences calls back on a private queue; marshal to main
@@ -130,6 +137,7 @@ class VPNManager: ObservableObject {
                 recordingState = .idle
                 canRecordMasks = false
                 recordingCapabilityKnown = false
+                liveQuality = 0
             }
         @unknown default:
             break
@@ -195,11 +203,13 @@ class VPNManager: ObservableObject {
                 }
                 return
             }
-            self.observeStatus()
-            do {
-                try (self.manager?.connection as? NETunnelProviderSession)?.startTunnel(options: nil)
-            } catch {
-                DispatchQueue.main.async {
+            // saveToPreferences callback runs on an arbitrary queue; marshal to main
+            // before touching the manager/statusObserver and calling NetworkExtension API.
+            DispatchQueue.main.async {
+                self.observeStatus()
+                do {
+                    try (self.manager?.connection as? NETunnelProviderSession)?.startTunnel(options: nil)
+                } catch {
                     self.isConnecting = false
                     self.lastError = error.localizedDescription
                 }
@@ -258,6 +268,7 @@ class VPNManager: ObservableObject {
             guard let self = self, let r = response else { return }
             if let up = r["upload"] as? Int64 { self.bytesSent = up }
             if let down = r["download"] as? Int64 { self.bytesReceived = down }
+            if let q = r["quality_score"] as? Int { self.liveQuality = q }
             if let canRec = r["can_record"] as? Bool {
                 self.canRecordMasks = canRec
                 self.recordingCapabilityKnown = true
@@ -297,14 +308,24 @@ class VPNManager: ObservableObject {
         case "analyzing":  recordingState = .analyzing(service: service)
         case "success":
             recordingState = .success(service: service, maskId: maskId)
-            let details = maskId.map { "Mask saved. ID: \($0)" } ?? "Mask saved successfully."
-            lastRecordingResult = RecordingResultSummary(succeeded: true, title: "Mask recorded", details: details)
-            postNotification(title: "Mask recorded", body: details)
+            let details = maskId.map { "ID: \($0)" } ?? service
+            lastRecordingResult = RecordingResultSummary(
+                succeeded: true,
+                title: LocalizationManager.shared.t("recording_result_success_title"),
+                details: details)
+            postNotification(
+                title: LocalizationManager.shared.t("recording_success"),
+                body: details)
         case "failed":
-            let reason = message ?? "Recording failed"
+            let reason = message ?? service
             recordingState = .failed(service: service, reason: reason)
-            lastRecordingResult = RecordingResultSummary(succeeded: false, title: "Recording failed", details: reason)
-            postNotification(title: "Mask recording failed", body: reason)
+            lastRecordingResult = RecordingResultSummary(
+                succeeded: false,
+                title: LocalizationManager.shared.t("recording_result_failed_title"),
+                details: reason)
+            postNotification(
+                title: LocalizationManager.shared.t("recording_failed"),
+                body: reason)
         default:
             recordingState = .idle
         }
@@ -336,7 +357,7 @@ class VPNManager: ObservableObject {
                 DispatchQueue.main.async { completion?(json) }
             }
         } catch {
-            completion?(nil)
+            DispatchQueue.main.async { completion?(nil) }
         }
     }
 

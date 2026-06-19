@@ -4,7 +4,6 @@ import UserNotifications
 @main
 struct AivpnApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
-    @StateObject private var localization = LocalizationManager()
 
     var body: some Scene {
         Settings {
@@ -60,6 +59,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
             NSApp.activate(ignoringOtherApps: true)
         }
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        if let monitor = eventMonitor {
+            NSEvent.removeMonitor(monitor)
+            eventMonitor = nil
+        }
+        VPNManager.shared.disconnect()
     }
 
     func updateStatusIcon(connected: Bool) {

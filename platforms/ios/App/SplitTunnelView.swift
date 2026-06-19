@@ -66,7 +66,7 @@ class SplitTunnelManager: ObservableObject {
 }
 
 struct SplitTunnelView: View {
-    @StateObject private var mgr = SplitTunnelManager.shared
+    @ObservedObject private var mgr = SplitTunnelManager.shared
     @EnvironmentObject private var loc: LocalizationManager
     @Environment(\.dismiss) private var dismiss
 
@@ -74,7 +74,7 @@ struct SplitTunnelView: View {
     @State private var newRoute: String  = ""
 
     var body: some View {
-        NavigationView {
+        NavigationStack {
             List {
                 // MARK: Excluded routes (CIDR)
                 Section(header: Text(loc.t("split_tunnel_routes"))) {
@@ -141,7 +141,7 @@ struct SplitTunnelView: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
-                    Button(loc.t("save_key")) { dismiss() }
+                    Button(loc.t("done")) { dismiss() }
                 }
             }
         }

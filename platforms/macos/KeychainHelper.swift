@@ -3,7 +3,7 @@ import Security
 
 class KeychainHelper {
     func save(key: String, value: String) {
-        let data = value.data(using: .utf8)!
+        guard let data = value.data(using: .utf8) else { return }
 
         // Delete existing
         let deleteQuery: [String: Any] = [

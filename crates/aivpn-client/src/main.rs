@@ -930,8 +930,7 @@ mod tests {
     fn test_parse_connection_key_bare_payload_without_prefix() {
         // Bare base64url (no "aivpn://" prefix) must also be accepted.
         let json = r#"{"s":"10.0.0.1:1194","k":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}"#;
-        let bare =
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json.as_bytes());
+        let bare = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json.as_bytes());
         let val = parse_connection_key(&bare).expect("must parse bare payload");
         assert_eq!(val["s"].as_str().unwrap(), "10.0.0.1:1194");
     }
@@ -942,7 +941,10 @@ mod tests {
         let json = r#"{"s":"1.2.3.4:443","k":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","n":{"client_ip":"10.8.0.2","server_vpn_ip":"10.8.0.1","prefix_len":24,"mtu":1400,"mdh_len":20}}"#;
         let key = make_conn_key(json);
         let val = parse_connection_key(&key).expect("must parse");
-        assert!(val.get("n").is_some(), "network config block must survive round-trip");
+        assert!(
+            val.get("n").is_some(),
+            "network config block must survive round-trip"
+        );
     }
 
     #[test]

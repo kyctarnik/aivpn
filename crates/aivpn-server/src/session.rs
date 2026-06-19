@@ -1488,7 +1488,12 @@ mod tests {
     fn make_session() -> Session {
         let session_id = [0u8; 16];
         let addr: std::net::SocketAddr = "127.0.0.1:9999".parse().unwrap();
-        Session::new(session_id, addr, make_keys(1), [0u8; X25519_PUBLIC_KEY_SIZE])
+        Session::new(
+            session_id,
+            addr,
+            make_keys(1),
+            [0u8; X25519_PUBLIC_KEY_SIZE],
+        )
     }
 
     // ── u256 bitmap ──────────────────────────────────────────────────────────
@@ -1531,7 +1536,10 @@ mod tests {
 
     #[test]
     fn u256_shift_left_by_256_clears_all() {
-        let mut b = u256 { lo: u128::MAX, hi: u128::MAX };
+        let mut b = u256 {
+            lo: u128::MAX,
+            hi: u128::MAX,
+        };
         b.shift_left(256);
         assert!(!b.get_bit(0));
         assert!(!b.get_bit(255));
@@ -1548,7 +1556,10 @@ mod tests {
 
     #[test]
     fn u256_clear_zeroes_all_bits() {
-        let mut b = u256 { lo: u128::MAX, hi: u128::MAX };
+        let mut b = u256 {
+            lo: u128::MAX,
+            hi: u128::MAX,
+        };
         b.clear();
         assert!(!b.get_bit(0));
         assert!(!b.get_bit(255));

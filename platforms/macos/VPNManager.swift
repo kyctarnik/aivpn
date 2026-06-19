@@ -124,9 +124,8 @@ class VPNManager: ObservableObject {
             savedKey = keyValue
         }
 
-        // Check helper availability and load device key after a short delay
+        // Load the device public key after a short delay (helper check is done by AppDelegate).
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
-            self?.checkHelperAvailable()
             self?.loadDeviceKey()
         }
     }
@@ -534,7 +533,8 @@ class VPNManager: ObservableObject {
         proxyProcess?.terminate()
         proxyProcess = nil
         stopProxyPoll()
-        DispatchQueue.main.async {
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
             self.isConnected = false
             self.isConnecting = false
             self.isProxyMode = false
@@ -557,15 +557,17 @@ class VPNManager: ObservableObject {
         guard let log = try? String(contentsOfFile: proxyLogPath, encoding: .utf8) else { return }
         if log.contains("SOCKS5 proxy listening") {
             stopProxyPoll()
-            DispatchQueue.main.async {
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self else { return }
                 self.isConnected = true
                 self.isConnecting = false
             }
         } else if log.contains("ERROR") || log.contains("error") {
             let lines = log.components(separatedBy: "\n").filter { !$0.isEmpty }
             if let last = lines.last {
-                DispatchQueue.main.async {
-                    self.lastError = String(last.prefix(200))
+                let truncated = String(last.prefix(200))
+                DispatchQueue.main.async { [weak self] in
+                    self?.lastError = truncated
                 }
             }
         }

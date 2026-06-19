@@ -1,5 +1,61 @@
 # Changelog
 
+## [0.9.2] - 2026-06-19
+
+### Fixed
+
+- **iOS: VPN profile not registered in system settings** — `loadManager()` only called `saveToPreferences` on the first connect attempt; on a fresh install the profile was never written to the OS VPN list, causing a "Permission denied" error on connect. `loadManager()` now immediately calls `saveToPreferences` (with `isEnabled = true`) on manager creation so the profile exists before the first connection.
+- **iOS: black area at top of screen** — `NavigationView` is deprecated on iOS 16+ and inserts extra vertical spacing when embedded in a tab bar; replaced with `NavigationStack` in both `ContentView` and `SplitTunnelView`, eliminating the blank black area.
+- **iOS: StatusRing oversized** — ring `lineWidth` reduced 10 → 8, frame shrunk 120×120 → 96×96, icon font 36 pt → 28 pt, restoring proper proportions on all iPhone screen sizes.
+- **iOS: Live Quality Score not shown** — the `quality_score` field was already computed and sent by the tunnel process via IPC but `VPNManager` silently discarded it and `ContentView` had no corresponding UI. Added `@Published var liveQuality: Int` to `VPNManager`, parsed from the `quality_score` IPC key in `fetchTrafficStats()`, reset to 0 on disconnect, and displayed as a fourth stat cell (`chart.bar.fill` icon, green/orange/red colour based on value, `—` when disconnected).
+- **iOS: SplitTunnelView `@StateObject` singleton lifecycle bug** — `SplitTunnelManager.shared` was declared with `@StateObject` inside a `View`, causing SwiftUI to create a second independent instance and lose the shared state; changed to `@ObservedObject`.
+- **iOS: SplitTunnelView toolbar label mismatch** — the toolbar confirm button showed the localised key `"save_key"` ("Save") instead of the expected `"done"` ("Done"); corrected.
+- **macOS: duplicate `LocalizationManager` instance** — `AivpnApp` declared a separate `@StateObject private var localization` alongside the `AppDelegate`-owned singleton, causing two observers; removed the unused duplicate.
+- **macOS: event monitor and VPN not cleaned up on quit** — `applicationWillTerminate` was not implemented; the NSEvent global monitor was leaked and the VPN process left running after the app exited; both are now released in `applicationWillTerminate`.
+- **macOS: `serverAdaptiveLevel` array index out-of-bounds** — `ContentView` indexed `["Off","Light","Aggressive","Satellite"][min(vpn.serverAdaptiveLevel, 3)]` without guarding against negative values; added `max(0, ...)` to prevent a crash when the server sends an unexpected level byte.
+- **macOS: deprecated `.onReceive(publisher.collect())` for text field filtering** — the proxy-port `TextField` used `.onReceive(proxyPort.publisher.collect())` to filter non-digit input, which was deprecated and fired unreliably; replaced with `.onChange(of: proxyPort)`.
+- **macOS: VPNManager retain cycles in closures** — `disconnect()` and `pollProxyLog()` captured `self` strongly inside `DispatchQueue.main.async` blocks; changed to `[weak self]` with `guard let self` / optional chaining to prevent leaks when the manager is deallocated during shutdown.
+- **macOS: helper `ping` returns stale connection state** — the ping response always used the initial `connected: false` default regardless of whether a client process was actually running; now computed as `isConnected && managedPID > 0 && kill(managedPID, 0) == 0`.
+- **Android: PSK incorrectly required in connection key** — `parseConnectionKey` returned `null` when the `"p"` PSK field was absent or blank, rejecting valid connection keys that rely on server-side PSK lookup; changed `psk` to `String?` — connections proceed with a null PSK and the field is passed as empty to the JNI layer.
+- **Android: split-tunnel hint string duplicated bypass count** — the one-app-excluded branch concatenated two string resources resulting in "N site(s) excluded N site(s) excluded"; replaced with a single `split_tunnel_bypass_count` resource.
+- **Windows: tray background thread not stopped on app exit** — `TrayManager` had no `Drop` impl; the `tray-events` background thread kept polling `MenuEvent`/`TrayIconEvent` receivers after `TrayManager` was dropped, leaking the thread until process exit. Added `Drop` impl that sets a `shutdown: AtomicBool`; the event loop checks the flag each iteration and exits.
+- **Windows: tray action priority inversion** — `tray_event_loop` used `action.store(ACTION_SHOW)` unconditionally; a stray icon-click arriving after the user chose Quit from the menu would overwrite `ACTION_QUIT` with the lower-priority `ACTION_SHOW`, causing the app to show the window instead of exiting. Replaced with `raise_action()` that performs a CAS loop and only upgrades the action value.
+
+### Changed
+
+- Version bumped 0.9.1 → 0.9.2 across workspace `Cargo.toml`, iOS `App/Info.plist` and `Tunnel/Info.plist` (build 7).
+- Added `"quality"` localisation key (EN: "Quality" / RU: "Качество") to `LocalizationManager`.
+
+---
+
+## [0.9.2] — 2026-06-19
+
+### Исправлено
+
+- **iOS: VPN-профиль не добавлялся в системные настройки** — `loadManager()` вызывал `saveToPreferences` только при первом подключении; при свежей установке профиль не попадал в список VPN ОС, что вызывало ошибку «Permission denied». Теперь `loadManager()` вызывает `saveToPreferences` (с `isEnabled = true`) сразу при создании менеджера.
+- **iOS: чёрная область сверху** — `NavigationView` устарел на iOS 16+ и добавлял лишние отступы при встраивании в таб-бар; заменён на `NavigationStack` в `ContentView` и `SplitTunnelView`.
+- **iOS: слишком большое кольцо StatusRing** — `lineWidth` 10 → 8, размер фрейма 120×120 → 96×96, иконка 36 pt → 28 pt — пропорции восстановлены для всех размеров экранов iPhone.
+- **iOS: Live Quality Score не отображался** — поле `quality_score` уже вычислялось и передавалось туннелем через IPC, но `VPNManager` молча его игнорировал, а `ContentView` не имел соответствующего UI. Добавлено `@Published var liveQuality: Int`, значение парсится из IPC в `fetchTrafficStats()`, обнуляется при отключении и отображается четвёртой ячейкой статистики (иконка `chart.bar.fill`, цвет зелёный/оранжевый/красный по значению, `—` при отключении).
+- **iOS: баг жизненного цикла `@StateObject` в SplitTunnelView** — `SplitTunnelManager.shared` объявлялся через `@StateObject` внутри `View`, из-за чего SwiftUI создавал второй независимый экземпляр и терял общее состояние; исправлено на `@ObservedObject`.
+- **iOS: неверная надпись кнопки в SplitTunnelView** — кнопка подтверждения использовала ключ `"save_key"` («Сохранить») вместо `"done"` («Готово»); исправлено.
+- **macOS: дублирующийся экземпляр `LocalizationManager`** — `AivpnApp` создавал отдельный `@StateObject private var localization` наряду с синглтоном из `AppDelegate`; лишний экземпляр удалён.
+- **macOS: event monitor и VPN-процесс не завершались при выходе из приложения** — `applicationWillTerminate` не был реализован: глобальный NSEvent-монитор утекал, а VPN-процесс продолжал работать после закрытия приложения; теперь оба освобождаются в `applicationWillTerminate`.
+- **macOS: выход за границы массива при `serverAdaptiveLevel`** — `ContentView` индексировал `["Off","Light","Aggressive","Satellite"][min(vpn.serverAdaptiveLevel, 3)]` без защиты от отрицательных значений; добавлен `max(0, ...)`.
+- **macOS: устаревший `.onReceive(publisher.collect())` для фильтрации ввода** — текстовое поле порта прокси использовало устаревший и ненадёжный API; заменено на `.onChange(of: proxyPort)`.
+- **macOS: retain-cycle в замыканиях VPNManager** — `disconnect()` и `pollProxyLog()` захватывали `self` сильно внутри `DispatchQueue.main.async`; заменено на `[weak self]` с `guard let self` / опциональной цепочкой.
+- **macOS: helper `ping` возвращал устаревшее состояние подключения** — ответ на ping всегда использовал `connected: false` по умолчанию; теперь вычисляется как `isConnected && managedPID > 0 && kill(managedPID, 0) == 0`.
+- **Android: PSK некорректно требовался в ключе подключения** — `parseConnectionKey` возвращал `null` при отсутствии поля `"p"`, отклоняя валидные ключи с серверным PSK; изменён тип `psk` на `String?` — соединение продолжается с пустым PSK.
+- **Android: строка подсказки split-tunnel дублировала счётчик** — ветка с одним сайтом конкатенировала два строковых ресурса, получая «N сайт(ов) исключено N сайт(ов) исключено»; заменено одним ресурсом `split_tunnel_bypass_count`.
+- **Windows: фоновый поток tray не завершался при выходе** — у `TrayManager` не было реализации `Drop`; поток `tray-events` продолжал опрашивать события после удаления `TrayManager`. Добавлен `Drop`, устанавливающий `shutdown: AtomicBool`; цикл событий проверяет флаг и завершается.
+- **Windows: инверсия приоритета действий tray** — `action.store(ACTION_SHOW)` мог перезаписать `ACTION_QUIT` случайным кликом по иконке; заменено на `raise_action()` с CAS-циклом, допускающим только повышение приоритета.
+
+### Изменено
+
+- Версия 0.9.1 → 0.9.2 в `Cargo.toml` воркспейса, iOS `App/Info.plist` и `Tunnel/Info.plist` (сборка 7).
+- Добавлен ключ локализации `"quality"` (EN: "Quality" / RU: "Качество") в `LocalizationManager`.
+
+---
+
 ## [0.9.1] - 2026-06-19
 
 ### Fixed

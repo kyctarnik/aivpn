@@ -43,7 +43,7 @@ class MainActivity : AppCompatActivity() {
     private data class ParsedConnectionKey(
         val server: String,
         val serverKey: String,
-        val psk: String,
+        val psk: String?,
         val vpnIp: String,
         val serverVpnIp: String,
         val prefixLen: Int,
@@ -377,7 +377,7 @@ class MainActivity : AppCompatActivity() {
                 getString(R.string.split_tunnel_hint_apps, appCount),
                 getString(R.string.split_tunnel_hint_sites, siteCount))
             appCount > 0 -> getString(R.string.split_tunnel_vpn_count, appCount)
-            siteCount > 0 -> getString(R.string.split_tunnel_hint_sites, siteCount) + " " + getString(R.string.split_tunnel_bypass_count, siteCount).substringAfter(" ")
+            siteCount > 0 -> getString(R.string.split_tunnel_bypass_count, siteCount)
             else -> getString(R.string.split_tunnel_desc)
         }
     }
@@ -440,7 +440,7 @@ class MainActivity : AppCompatActivity() {
             val json = JSONObject(String(jsonBytes))
             val server = json.getString("s")
             val serverKey = json.getString("k")
-            val psk = json.optString("p").takeUnless { it.isNullOrBlank() } ?: return null
+            val psk = json.optString("p").takeUnless { it.isNullOrBlank() }
             val networkConfig = json.optJSONObject("n")
             val vpnIp = networkConfig?.optString("client_ip")?.takeUnless { it.isNullOrBlank() }
                 ?: json.optString("i").takeUnless { it.isNullOrBlank() } ?: return null

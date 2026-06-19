@@ -3,9 +3,7 @@
 use aivpn_common::crypto;
 use aivpn_common::event_log::{EventBus, EventSinkConfig};
 use aivpn_common::mask::{IATDistType, MaskProfile, SizeDistType};
-use aivpn_common::network_config::{
-    netmask_to_prefix_len, ClientNetworkConfig, VpnNetworkConfig,
-};
+use aivpn_common::network_config::{netmask_to_prefix_len, ClientNetworkConfig, VpnNetworkConfig};
 use aivpn_server::audit_log::AuditLogger;
 use aivpn_server::backup::{export_server, import_server, ExportOptions};
 #[cfg(feature = "dns")]
@@ -177,8 +175,8 @@ async fn main() {
         Some(MtuSetting::Fixed(v)) => *v,
         Some(MtuSetting::Auto) | None => detect_mtu(),
     };
-    let network_config =
-        resolve_network_config(file_config.as_ref(), effective_tun_mtu).unwrap_or_else(|e| {
+    let network_config = resolve_network_config(file_config.as_ref(), effective_tun_mtu)
+        .unwrap_or_else(|e| {
             eprintln!("Failed to resolve VPN network config: {}", e);
             std::process::exit(1);
         });
@@ -885,9 +883,7 @@ fn resolve_network_config(
                 raw_mtu
             };
             VpnNetworkConfig {
-                server_vpn_ip: jnc
-                    .server_vpn_ip
-                    .unwrap_or(Ipv4Addr::new(10, 0, 0, 1)),
+                server_vpn_ip: jnc.server_vpn_ip.unwrap_or(Ipv4Addr::new(10, 0, 0, 1)),
                 prefix_len: jnc.prefix_len.unwrap_or(24),
                 mtu,
                 keepalive_secs: jnc.keepalive_secs,

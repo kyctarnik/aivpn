@@ -662,7 +662,9 @@ func handleConnection(_ clientFD: Int32) {
         response = getStatus()
 
     case "ping":
-        response = HelperResponse(status: "ok", message: "pong", version: HELPER_VERSION)
+        response = HelperResponse(status: "ok", message: "pong",
+                                  connected: isConnected && managedPID > 0 && kill(managedPID, 0) == 0,
+                                  version: HELPER_VERSION)
 
     case "log":
         response = getLog()
