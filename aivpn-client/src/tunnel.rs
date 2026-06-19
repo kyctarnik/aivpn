@@ -785,7 +785,15 @@ impl Tunnel {
             if status.success() {
                 info!("Added full-tunnel route: {} via {}", net, tun_name);
             } else {
-                error!("Failed to add full-tunnel route {}", net);
+                return Err(Error::Io(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!(
+                        "route add -net {} -interface {} failed (exit {:?})",
+                        net,
+                        tun_name,
+                        status.code()
+                    ),
+                )));
             }
         }
 
