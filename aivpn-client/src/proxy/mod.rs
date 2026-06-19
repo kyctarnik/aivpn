@@ -49,6 +49,7 @@ pub struct ProxyConfig {
 
 pub struct ProxyHandle {
     pub rx_queue: Arc<Mutex<VecDeque<Vec<u8>>>>,
+    pub wake_tx: std::sync::mpsc::Sender<()>
 }
 
 struct ManagedConn {
@@ -124,6 +125,7 @@ pub async fn spawn_proxy(
 
     let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<NewConn>();
     let (udp_cmd_tx, udp_cmd_rx) = std::sync::mpsc::channel::<UdpStackCommand>();
+    let (wake_tx, wake_rx) = std::sync::mpsc::channel::<()>();
 
     let vpn_ip = config.vpn_ip;
     let gateway_ip = config.gateway_ip;
@@ -133,14 +135,15 @@ pub async fn spawn_proxy(
 
     std::thread::spawn(move || {
         run_stack(
-            rx_clone,
-            tx_clone,
-            tun_to_udp_tx,
-            cmd_rx,
-            udp_cmd_rx,
-            vpn_ip,
-            gateway_ip,
-            prefix_len,
+             rx_clone,
+             tx_clone,
+             tun_to_udp_tx,
+             cmd_rx,
+             udp_cmd_rx,
+             wake_rx,
+             vpn_ip,
+             gateway_ip,
+             prefix_len,
         );
     });
 
@@ -148,6 +151,7 @@ pub async fn spawn_proxy(
     info!("SOCKS5 proxy listening on {}", config.listen_addr);
 
     let proxy_ip = config.listen_addr.ip();
+    let wake_tx_accept = wake_tx.clone();
     tokio::spawn(async move {
         loop {
             match listener.accept().await {
@@ -155,7 +159,8 @@ pub async fn spawn_proxy(
                     debug!("Proxy: connection from {}", peer);
                     let tx = cmd_tx.clone();
                     let udp_tx = udp_cmd_tx.clone();
-                    tokio::spawn(handle_socks5(stream, tx, udp_tx, proxy_ip));
+                    let wtx = wake_tx_accept.clone();
+                    tokio::spawn(handle_socks5(stream, tx, udp_tx, wtx, proxy_ip));
                 }
                 Err(e) => {
                     error!("Proxy accept error: {}", e);
@@ -165,7 +170,7 @@ pub async fn spawn_proxy(
         }
     });
 
-    Ok(ProxyHandle { rx_queue })
+    Ok(ProxyHandle { rx_queue, wake_tx })
 }
 
 fn smoltcp_now() -> SmolInstant {
@@ -190,6 +195,7 @@ fn run_stack(
     tun_to_udp_tx: mpsc::Sender<Vec<u8>>,
     cmd_rx: std::sync::mpsc::Receiver<NewConn>,
     udp_cmd_rx: std::sync::mpsc::Receiver<UdpStackCommand>,
+    wake_rx: std::sync::mpsc::Receiver<()>,
     vpn_ip: Ipv4Addr,
     gateway_ip: Ipv4Addr,
     prefix_len: u8,
@@ -228,6 +234,7 @@ fn run_stack(
                     let tx_buf = TcpSocketBuffer::new(vec![0u8; TCP_BUF]);
                     let mut socket = TcpSocket::new(rx_buf, tx_buf);
                     socket.set_ack_delay(None);
+                    socket.set_nagle_enabled(false);
 
                     let mut cx = iface.context();
                     match socket.connect(&mut cx, nc.target, nc.src_port) {
@@ -391,13 +398,22 @@ fn run_stack(
                 sockets.remove(assoc.handle);
             }
         }
+        let timeout: std::time::Duration = iface
+            .poll_delay(smoltcp_now(), &sockets)
+            .map(Into::into)                                   // если From не найдётся:
+            .unwrap_or(std::time::Duration::from_millis(100)); // Duration::from_micros(d.total_micros())
 
-        std::thread::sleep(Duration::from_millis(1));
+        match wake_rx.recv_timeout(timeout) {
+            Ok(()) => { while wake_rx.try_recv().is_ok() {} }  // сдренировать пачку сигналов
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+        }
     }
 }
 
 async fn resolve_via_tunnel(
     cmd_tx: &std::sync::mpsc::Sender<UdpStackCommand>,
+    wake_tx: &std::sync::mpsc::Sender<()>,
     host: &str,
     port: u16,
     want_v6: bool,
@@ -423,6 +439,7 @@ async fn resolve_via_tunnel(
                 "stack thread gone",
             ));
         }
+        let _ = wake_tx.send(()); // разбудить стек: DNS-запрос
         let ip = tokio::task::spawn_blocking(move || {
             rx.recv_timeout(DNS_QUERY_TIMEOUT).ok().flatten()
         })
@@ -600,6 +617,7 @@ async fn handle_socks5(
     stream: tokio::net::TcpStream,
     cmd_tx: std::sync::mpsc::Sender<NewConn>,
     udp_cmd_tx: std::sync::mpsc::Sender<UdpStackCommand>,
+    wake_tx: std::sync::mpsc::Sender<()>,
     proxy_ip: IpAddr,
 ) {
     let mut session = Socks5Session::new(stream);
@@ -615,10 +633,10 @@ async fn handle_socks5(
 
     match req {
         Socks5Command::Connect(target) => {
-            handle_connect(session, cmd_tx, udp_cmd_tx, target).await;  // ← +udp_cmd_tx
+            handle_connect(session, cmd_tx, udp_cmd_tx, wake_tx, target).await;  // ← +udp_cmd_tx
         }
         Socks5Command::UdpAssociate(_) => {
-            handle_udp_associate(session, udp_cmd_tx, proxy_ip).await;
+            handle_udp_associate(session, udp_cmd_tx, wake_tx, proxy_ip).await;
         }
     }
 }
@@ -627,12 +645,13 @@ async fn handle_connect(
     mut session: Socks5Session,
     cmd_tx: std::sync::mpsc::Sender<NewConn>,
     udp_cmd_tx: std::sync::mpsc::Sender<UdpStackCommand>,
+    wake_tx: std::sync::mpsc::Sender<()>,
     target_addr: TargetAddr,
 ) {
     let target: SocketAddr = match target_addr {
         TargetAddr::Ip(a) => a,
         TargetAddr::Domain(host, port) => {
-            match resolve_via_tunnel(&udp_cmd_tx, &host, port, /*want_v6=*/ false).await {
+            match resolve_via_tunnel(&udp_cmd_tx, &wake_tx, &host, port, /*want_v6=*/ false).await {
                 Ok(a) => a,
                 Err(e) => {
                     warn!("TCP CONNECT DNS error {host}:{port}: {e}");
@@ -679,6 +698,7 @@ async fn handle_connect(
         let _ = session.send_reply(REP_GENERAL_FAILURE).await;
         return;
     }
+    let _ = wake_tx.send(()); // разбудить стек: новый CONNECT
 
     let connected = tokio::task::spawn_blocking(move || {
         ready_rx.recv_timeout(CONNECT_TIMEOUT).unwrap_or(false)
@@ -699,6 +719,7 @@ async fn handle_connect(
     let (mut socks_rd, mut socks_wr) = session.stream.into_split();
     let inbound_clone = Arc::clone(&inbound);
     let close_flag_rd = Arc::clone(&close_flag);
+    let wake_tx_rd = wake_tx.clone();
 
     let read_half = tokio::spawn(async move {
         let mut buf = vec![0u8; 8192];
@@ -707,6 +728,7 @@ async fn handle_connect(
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
                     inbound_clone.lock().unwrap().push_back(buf[..n].to_vec());
+                    let _ = wake_tx_rd.send(()); // разбудить стек: данные от клиента
                 }
             }
         }
@@ -748,6 +770,7 @@ fn smol_ip_to_std(ip: IpAddress) -> IpAddr {
 async fn handle_udp_associate(
     mut session: Socks5Session,
     udp_cmd_tx: std::sync::mpsc::Sender<UdpStackCommand>,
+    wake_tx: std::sync::mpsc::Sender<()>,
     proxy_ip: IpAddr,
 ) {
     // Слушаем на том же IP, что и прокси (эфемерный порт).
@@ -786,6 +809,7 @@ async fn handle_udp_associate(
         let _ = session.send_reply(REP_GENERAL_FAILURE).await;
         return;
     }
+    let _ = wake_tx.send(()); // разбудить стек: новая UDP-ассоциация
 
     // Ждём, пока smoltcp-поток зарегистрирует UDP-сокет.
     let ready = tokio::task::spawn_blocking(move || {
@@ -819,6 +843,7 @@ async fn handle_udp_associate(
     let close_flag_rd = Arc::clone(&close_flag);
     let client_addr_rd = Arc::clone(&client_addr);
     let udp_tx = udp_cmd_tx.clone();
+    let wake_tx_rd = wake_tx.clone();
 
     // Задача «клиент → VPN».
     let read_task = tokio::spawn(async move {
@@ -872,7 +897,7 @@ async fn handle_udp_associate(
                     if let Some(a) = dns_cache.get(&key) {
                         *a
                     } else {
-                        match resolve_via_tunnel(&udp_tx, host, *port, /*want_v6=*/ false).await {
+                        match resolve_via_tunnel(&udp_tx, &wake_tx_rd, host, *port, /*want_v6=*/ false).await {
                             Ok(a) => { dns_cache.insert(key, a); a }
                             Err(e) => { warn!("SOCKS5 UDP DNS error {host}:{port}: {e}"); continue; }
                         }
@@ -890,6 +915,7 @@ async fn handle_udp_associate(
             {
                 break;
             }
+            let _ = wake_tx_rd.send(()); // разбудить стек: исходящий UDP-пакет
         }
 
         close_flag_rd.store(true, Ordering::Relaxed);
