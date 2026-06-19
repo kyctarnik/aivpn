@@ -193,9 +193,7 @@ CLI (PowerShell, elevated):
 Build on macOS (Xcode 15+ required):
 
 ```bash
-rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
-cargo install xcodegen
-./scripts/build-ios.sh YOUR_TEAM_ID
+make ios TEAM_ID=YOUR_TEAM_ID
 ```
 
 Install `releases/aivpn-ios.ipa`:
@@ -345,45 +343,64 @@ Default config path: `config/server.json` (local) or `/etc/aivpn/server.json`. C
 | `metrics` | Prometheus exporter |
 | `passive-distribution` | Bootstrap descriptor distribution channels |
 
-```bash
-cargo build --release --bin aivpn-server --features "management-api,metrics,neural"
-```
-
 ---
 
 ## Build from Source
 
-Requires: Rust 1.75+, `cargo`.
+Requires: Rust 1.75+, `cargo`, `make`.
 
 ```bash
-git clone https://github.com/infosave2007/aivpn.git
+git clone https://github.com/infosave2007/aivpn
 cd aivpn
+make help          # show all available targets
+```
 
-# Build all workspace members
-cargo build --release
+### Server builds (Linux)
 
-# Individual binaries
-cargo build --release --bin aivpn-server
-cargo build --release --bin aivpn-client
+```bash
+make server        # x86_64 → releases/aivpn-server-linux-x86_64
+make server-arm64  # ARM64  → releases/aivpn-server-linux-arm64
+make server-docker # via Docker (minimal host dependencies)
+```
 
-# Run tests
-cargo test
+### Client builds
 
-# Static musl cross-builds (ARMv7 / MIPSel)
-./scripts/build-musl-release.sh server armv7-unknown-linux-musleabihf
-./scripts/build-musl-release.sh client mipsel-unknown-linux-musl
+```bash
+make client        # Linux x86_64
+```
 
-# Docker server build (outputs to releases/)
-./scripts/build-server-release.sh
+### musl static cross-builds (for routers)
 
-# Windows GUI (cross-compile from Linux)
-./scripts/build-windows-gui.sh
+```bash
+make server-musl-armv7    # ARMv7
+make server-musl-mipsel   # MIPSel
+make server-musl-aarch64  # AArch64
+```
 
-# iOS (macOS + Xcode 15+)
-rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
-cargo install xcodegen
-./scripts/build-ios.sh              # unsigned / simulator
-./scripts/build-ios.sh YOUR_TEAM_ID # signed for device
+### Platform builds
+
+```bash
+make windows              # Windows GUI + zip (cross-compile from Linux)
+make windows-docker       # Windows GUI via Docker (no mingw-w64 required)
+make ios [TEAM_ID=XX]     # iOS IPA (macOS + Xcode 15+ only)
+make macos                # macOS .app + .pkg + .dmg (macOS only)
+make linux-appimage        # Linux AppImage
+```
+
+### Deploy
+
+```bash
+make deploy               # VPS: download binary + start docker compose
+make server-deploy HOST=vps.example.com  # SSH upload local binary to VPS
+```
+
+### Tests and development
+
+```bash
+make test           # cargo test --workspace
+make clippy         # cargo clippy
+make check          # cargo check (fast)
+make test-docker    # integration test: server + client in Docker
 ```
 
 ### Android
@@ -398,6 +415,12 @@ cd aivpn-android
 ```
 
 Signed build: create `aivpn-android/keystore.properties` before running the script.
+
+### Optional Cargo features (server)
+
+```bash
+cargo build --release --bin aivpn-server --features "management-api,metrics,neural"
+```
 
 ### Install from crates.io
 
