@@ -10,6 +10,11 @@ repository.workspace = true
 name = "aivpn-client"
 path = "src/main.rs"
 
+[profile.release]
+panic = "unwind"
+
+[env]
+RUST_BACKTRACe = "1"
 
 [features]
 default = []
