@@ -35,6 +35,7 @@
 
 ### Added
 
+- **Server: `network_config.mtu: "auto"`** — `network_config.mtu` in `server.json` now accepts `"auto"` (or may be omitted entirely). When set to `"auto"`, the advertised client MTU is derived from the same `detect_mtu()` call that sets `tun_mtu`, keeping both values in sync automatically. On constrained links (VXLAN/GRE overlays, Kubernetes pods, PPPoE) where the physical MTU is below 1410 bytes, `"auto"` prevents the previous mismatch where clients were told to use 1346-byte inner packets while the server TUN could only forward 1236-byte packets, causing packet loss. The invariant `network_config.mtu ≤ tun_mtu` is now enforced at startup (oversized values are clamped with a warning). `config/server.json.example` updated to `"mtu": "auto"`.
 - **Kernel module: `aivpn_udp_hook_install_by_fd()` ioctl** — new C function in `udp_hook.c` allows userspace to install the UDP RX hook by passing a socket file descriptor via `IOC_SET_UDP_SOCK`, eliminating any need for out-of-band socket passing.
 - **CI: aarch64 musl server + client in release matrix** — `aivpn-server-linux-aarch64-musl` and `aivpn-client-linux-aarch64-musl` static binaries now built and published on every tagged release.
 
@@ -80,6 +81,7 @@
 
 ### Добавлено
 
+- **Сервер: `network_config.mtu: "auto"`** — поле `network_config.mtu` в `server.json` теперь принимает значение `"auto"` (или может быть опущено). При `"auto"` рекламируемый клиентам MTU берётся из того же вызова `detect_mtu()`, что устанавливает `tun_mtu`, — оба значения всегда синхронизированы. На ограниченных линках (VXLAN/GRE-оверлеи, поды Kubernetes, PPPoE), где физический MTU ниже 1410 байт, `"auto"` устраняет рассинхронизацию, при которой клиентам сообщался MTU 1346 байт, тогда как серверный TUN мог форвардировать лишь 1236-байтные пакеты. Инвариант `network_config.mtu ≤ tun_mtu` теперь принудительно соблюдается при запуске: завышенные значения усекаются с предупреждением. `config/server.json.example` обновлён на `"mtu": "auto"`.
 - **Модуль ядра: ioctl `aivpn_udp_hook_install_by_fd()`** — новая C-функция в `udp_hook.c` позволяет userspace устанавливать UDP-хук передачей fd через `IOC_SET_UDP_SOCK`.
 - **CI: aarch64 musl в release-матрице** — статические бинарники `aivpn-server-linux-aarch64-musl` и `aivpn-client-linux-aarch64-musl` публикуются при каждом теге релиза.
 

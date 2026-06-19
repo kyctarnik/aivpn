@@ -6,7 +6,7 @@
   "network_config": {
     "server_vpn_ip": "10.0.0.1",
     "prefix_len": 24,
-    "mtu": 1346
+    "mtu": "auto"
   },
 
   "mask_dir": "/var/lib/aivpn/masks",
