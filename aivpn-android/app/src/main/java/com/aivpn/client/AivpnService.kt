@@ -735,7 +735,8 @@ class AivpnService : VpnService() {
 
     private fun isUsableUnderlyingNetwork(caps: NetworkCapabilities): Boolean {
         return !caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN) &&
-            caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+            caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+            caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
     }
 
     // ──────────── Address parsing ────────────
