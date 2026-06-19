@@ -19,7 +19,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use aivpn_common::mask::MaskProfile;
 
@@ -150,11 +150,13 @@ pub struct BakedMaskEncoder {
 impl BakedMaskEncoder {
     /// Bake an encoder from a mask's signature vector.
     pub fn from_signature(signature: &[f32], hidden: usize) -> Self {
-        assert!(
-            signature.len() >= FEAT_DIM,
-            "signature must have at least {} floats",
-            FEAT_DIM
-        );
+        if signature.len() < FEAT_DIM {
+            warn!(
+                "mask signature too short ({} < {}) — encoder may be less accurate",
+                signature.len(),
+                FEAT_DIM
+            );
+        }
 
         // Deterministic seed: BLAKE3 hash of the signature serialized as LE f32s.
         // The XOF is expanded to give every weight an independent pseudo-random

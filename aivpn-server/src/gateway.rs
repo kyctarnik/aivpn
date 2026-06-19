@@ -788,13 +788,16 @@ impl Gateway {
             if let Some(tun_reader) = nat.take_reader().await {
                 let sessions = self.session_manager.clone();
                 let socket = self.udp_socket.as_ref().unwrap().clone();
-                let mask = self
+                let Some(mask) = self
                     .mask_catalog
                     .masks
                     .iter()
                     .next()
                     .map(|e| e.value().clone())
-                    .expect("at least one mask must be loaded");
+                else {
+                    error!("No masks loaded — cannot start gateway");
+                    return Ok(());
+                };
                 let server_vpn_ip = self.config.network_config.server_vpn_ip;
                 let recorder = self.recording_manager.clone();
 

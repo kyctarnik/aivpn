@@ -99,6 +99,10 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             // Load or generate the device private key for JIT Device Enrollment.
             let deviceKey = loadOrCreateDeviceKey()
 
+            // Wire on_ready → completionHandler via C-compatible trampoline.
+            let readyBox = TunnelReadyBox(completionHandler)
+            let readyCtx = Unmanaged.passRetained(readyBox).toOpaque()
+
             let thread = Thread {
                 sKeyArr.withUnsafeBufferPointer { sKeyPtr in
                     deviceKey.withUnsafeBufferPointer { dkPtr in
@@ -120,7 +124,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                                                      certPtr, certCount,
                                                      dkPtr.baseAddress!, Int32(32),
                                                      Int32(adaptiveLevel),
-                                                     nil, nil)
+                                                     tunnelOnReady, readyCtx)
                             }
                         }
                     }
@@ -132,7 +136,6 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             thread.start()
 
             self.startBridge()
-            completionHandler(nil)
         }
     }
 
@@ -379,6 +382,19 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         NSError(domain: "com.aivpn.tunnel", code: -1,
                 userInfo: [NSLocalizedDescriptionKey: msg])
     }
+}
+
+// MARK: - on_ready trampoline (bridges Rust C callback → Swift completionHandler)
+
+private final class TunnelReadyBox {
+    let handler: (Error?) -> Void
+    init(_ h: @escaping (Error?) -> Void) { handler = h }
+}
+
+private func tunnelOnReady(_: UnsafePointer<CChar>?, _ ctx: UnsafeMutableRawPointer?) {
+    guard let ctx else { return }
+    let box = Unmanaged<TunnelReadyBox>.fromOpaque(ctx).takeRetainedValue()
+    DispatchQueue.main.async { box.handler(nil) }
 }
 
 // MARK: - Minimal connection key parser (tunnel extension cannot import App target)

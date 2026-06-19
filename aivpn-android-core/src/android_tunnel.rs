@@ -309,7 +309,11 @@ pub async fn run_tunnel_android(
         return Err(Error::Io(std::io::Error::last_os_error()));
     }
 
-    unsafe { libc::fcntl(owned_tun_fd, libc::F_SETFL, libc::O_NONBLOCK) };
+    let fcntl_ret = unsafe { libc::fcntl(owned_tun_fd, libc::F_SETFL, libc::O_NONBLOCK) };
+    if fcntl_ret < 0 {
+        unsafe { libc::close(owned_tun_fd) };
+        return Err(Error::Io(std::io::Error::last_os_error()));
+    }
     // SAFETY: this is Rust's private duplicate of the Android-owned TUN fd.
     let owned_tun = unsafe { OwnedFd::from_raw_fd(owned_tun_fd) };
     let tun = AsyncFd::new(owned_tun)?;

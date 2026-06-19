@@ -201,7 +201,11 @@ class AivpnService : VpnService() {
                 closeTunnel()
 
                 createNotificationChannel()
-                startForeground(NOTIFICATION_ID, buildNotification(getString(R.string.notification_connecting)))
+                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                    startForeground(NOTIFICATION_ID, buildNotification(getString(R.string.notification_connecting)), android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+                } else {
+                    startForeground(NOTIFICATION_ID, buildNotification(getString(R.string.notification_connecting)))
+                }
 
                 unregisterNetworkCallback()
                 registerNetworkCallback()

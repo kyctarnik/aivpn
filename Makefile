@@ -315,6 +315,7 @@ ios:
 	echo "==> Lipo: universal simulator lib ..."; \
 	lipo -create "$$SIM_ARM_LIB" "$$SIM_X86_LIB" -output "$$SIM_FAT"; \
 	echo "==> Creating XCFramework ..."; \
+	mkdir -p "$$CORE_DIR/include"; \
 	XCFW="$$LIB_DIR/AivpnCore.xcframework"; \
 	rm -rf "$$XCFW"; \
 	xcodebuild -create-xcframework \

@@ -440,10 +440,10 @@ class MainActivity : AppCompatActivity() {
             val json = JSONObject(String(jsonBytes))
             val server = json.getString("s")
             val serverKey = json.getString("k")
-            val psk = json.getString("p")
+            val psk = json.optString("p").takeUnless { it.isNullOrBlank() } ?: return null
             val networkConfig = json.optJSONObject("n")
             val vpnIp = networkConfig?.optString("client_ip")?.takeUnless { it.isNullOrBlank() }
-                ?: json.getString("i")
+                ?: json.optString("i").takeUnless { it.isNullOrBlank() } ?: return null
             val serverVpnIp = networkConfig?.optString("server_vpn_ip")?.takeUnless { it.isNullOrBlank() }
                 ?: "10.0.0.1"
             val prefixLen = networkConfig?.optInt("prefix_len", 24) ?: 24

@@ -244,7 +244,11 @@ impl AivpnPacket {
         cursor += 2;
 
         // Encrypted payload (everything except padding)
-        let payload_len = data.len() - cursor - pad_len as usize;
+        let remaining = data.len().saturating_sub(cursor);
+        if pad_len as usize > remaining {
+            return Err(Error::InvalidPacket("pad_len exceeds packet bounds"));
+        }
+        let payload_len = remaining - pad_len as usize;
         let encrypted_payload = data[cursor..cursor + payload_len].to_vec();
         cursor += payload_len;
 
@@ -585,6 +589,9 @@ impl ControlPayload {
                     return Err(Error::InvalidPacket("KeyRotate too short"));
                 }
                 let new_eph_pub_len = u16::from_le_bytes([data[2], data[3]]) as usize;
+                if new_eph_pub_len != 32 {
+                    return Err(Error::InvalidPacket("KeyRotate: invalid eph pub key length"));
+                }
                 if data.len() < 4 + new_eph_pub_len {
                     return Err(Error::InvalidPacket("KeyRotate invalid length"));
                 }
@@ -913,7 +920,7 @@ impl AckPacket {
     }
 
     pub fn decode(data: &[u8]) -> Result<Self> {
-        if data.len() < 5 {
+        if data.len() < 7 {
             return Err(Error::InvalidPacket("ACK too short"));
         }
         let ack_seq = u16::from_le_bytes([data[2], data[3]]);
