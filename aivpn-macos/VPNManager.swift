@@ -131,10 +131,10 @@ class VPNManager: ObservableObject {
         }
     }
 
+    /// Returns the bundled aivpn-client path that is acceptable to the privileged helper.
+    /// Only paths inside /Applications/ or /Library/ are in the helper's allowlist.
+    /// Returns nil when running from DerivedData/Downloads — helper then uses DEFAULT_CLIENT_PATH.
     private func helperClientBinaryPath() -> String? {
-        // Only send paths from root-owned system locations (/Applications, /Library).
-        // User-writable locations (DerivedData, ~/Applications) are rejected by the
-        // privileged helper; fall back to nil so the helper uses DEFAULT_CLIENT_PATH.
         let candidates = [
             Bundle.main.bundlePath + "/Contents/Resources/aivpn-client",
             Bundle.main.bundlePath + "/Contents/MacOS/aivpn-client",
@@ -143,6 +143,21 @@ class VPNManager: ObservableObject {
         for path in candidates {
             let trusted = trustedPrefixes.contains(where: { path.hasPrefix($0) })
             if trusted, FileManager.default.isExecutableFile(atPath: path) {
+                return path
+            }
+        }
+        return nil
+    }
+
+    /// Returns the bundled aivpn-client path for use as the current user (proxy mode, no helper).
+    /// Does not require a trusted install location — proxy mode runs as the logged-in user.
+    private func bundledClientBinaryPath() -> String? {
+        let candidates = [
+            Bundle.main.bundlePath + "/Contents/Resources/aivpn-client",
+            Bundle.main.bundlePath + "/Contents/MacOS/aivpn-client",
+        ]
+        for path in candidates {
+            if FileManager.default.isExecutableFile(atPath: path) {
                 return path
             }
         }
@@ -158,7 +173,7 @@ class VPNManager: ObservableObject {
     }
 
     private func runBundledClientCommand(_ args: [String], completion: ((Bool, String) -> Void)? = nil) {
-        guard let binaryPath = helperClientBinaryPath() else {
+        guard let binaryPath = bundledClientBinaryPath() else {
             completion?(false, "Bundled aivpn-client not found")
             return
         }
@@ -471,11 +486,10 @@ class VPNManager: ObservableObject {
         bytesSent = 0
         bytesReceived = 0
 
-        guard let binaryPath = helperClientBinaryPath(),
-              FileManager.default.isExecutableFile(atPath: binaryPath) else {
+        guard let binaryPath = bundledClientBinaryPath() else {
             isConnecting = false
             isProxyMode = false
-            lastError = "aivpn-client binary not found"
+            lastError = "aivpn-client binary not found in app bundle"
             return
         }
 
