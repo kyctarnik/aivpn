@@ -17,13 +17,20 @@ TEAM_ID ?=
 # ─────────────────────────────────────────────────────────────────────────────
 # Phony targets
 # ─────────────────────────────────────────────────────────────────────────────
+# MikroTik image tag — make mikrotik IMAGE=myrepo/aivpn-mikrotik:latest
+IMAGE    ?= infosave2007/aivpn-mikrotik:latest
+
 .PHONY: help setup check test clippy fmt \
         server client server-docker \
         server-arm64 client-arm64 \
         server-musl-armv7 server-musl-mipsel server-musl-aarch64 \
         client-musl-armv7 client-musl-mipsel client-musl-aarch64 \
-        windows ios macos linux-appimage \
-        deploy clean clean-releases
+        windows windows-docker ios macos linux-appimage \
+        kernel kernel-install \
+        mikrotik mikrotik-local \
+        openwrt \
+        android \
+        deploy server-deploy test-docker clean clean-releases
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Help
@@ -54,10 +61,20 @@ help:
 	@printf "    %-40s %s\n" "make ios [TEAM_ID=XX]"    "iOS IPA            (macOS + Xcode only)"
 	@printf "    %-40s %s\n" "make macos"               "macOS .app + .pkg + .dmg (macOS only)"
 	@printf "    %-40s %s\n" "make linux-appimage"      "Linux AppImage"
+	@printf "\n  Kernel module (Linux 6.1+, requires kernel headers)\n"
+	@printf "    %-40s %s\n" "make kernel"              "Build aivpn-linux-kernel .ko (+ XDP BPF if clang)"
+	@printf "    %-40s %s\n" "make kernel-install"      "Install kernel module + depmod (root)"
+	@printf "\n  MikroTik RouterOS container\n"
+	@printf "    %-40s %s\n" "make mikrotik [IMAGE=x]"  "Build + push multi-arch manifest to Docker Hub"
+	@printf "    %-40s %s\n" "make mikrotik-local"      "Build single-arch image locally (no push)"
+	@printf "\n  OpenWrt package\n"
+	@printf "    %-40s %s\n" "make openwrt"             "Build musl client binaries for ARMv7/MIPSel/AArch64"
+	@printf "\n  Android\n"
+	@printf "    %-40s %s\n" "make android"             "Build Android APK (requires SDK+NDK)"
 	@printf "\n  Deploy\n"
 	@printf "    %-40s %s\n" "make deploy"              "Deploy server to VPS via Docker"
 	@printf "\n  Clean\n"
-	@printf "    %-40s %s\n" "make clean"               "cargo clean"
+	@printf "    %-40s %s\n" "make clean"               "cargo clean + kernel module objects"
 	@printf "    %-40s %s\n" "make clean-releases"      "Remove releases/"
 	@printf "\n"
 
@@ -466,11 +483,167 @@ print(ipaddress.IPv4Network(f'{sip}/{pl}',strict=False).with_prefixlen)" 2>/dev/
 	echo "Server deployed."; \
 	echo "Manage clients: docker compose exec aivpn-server aivpn-server --help"
 
+# Usage:
+#   make server-deploy HOST=vps.example.com              (key-based auth)
+#   make server-deploy HOST=vps.example.com SSH_PASS=xx  (password, needs sshpass)
+#   make server-deploy HOST=vps.example.com USER=ubuntu SSH_OPTS="-p 2222"
+# ─────────────────────────────────────────────────────────────────────────────
+server-deploy:
+	@[ -n "$(HOST)" ] || { \
+	    printf "ERROR: HOST is required.\nUsage: make server-deploy HOST=vps.example.com [USER=root] [SSH_PASS=xx]\n" >&2; \
+	    exit 1; }
+	@[ -f releases/aivpn-server-linux-x86_64 ] || { \
+	    echo "ERROR: releases/aivpn-server-linux-x86_64 not found. Run 'make server' or 'make server-docker' first." >&2; \
+	    exit 1; }
+	@set -e; \
+	if [ -n "$(SSH_PASS)" ]; then \
+	    command -v sshpass >/dev/null 2>&1 || { echo "ERROR: SSH_PASS requires sshpass (apt install sshpass)" >&2; exit 1; }; \
+	    SSH_PFX="SSHPASS='$(SSH_PASS)' sshpass -e"; \
+	else \
+	    SSH_PFX=""; \
+	fi; \
+	SSHOPTS="$(SSH_OPTS) -o StrictHostKeyChecking=accept-new -o BatchMode=$$([ -n '$(SSH_PASS)' ] && echo no || echo yes)"; \
+	R="$(RUSER)@$(HOST)"; \
+	SSH="$$SSH_PFX ssh $$SSHOPTS $$R"; \
+	SCP="$$SSH_PFX scp $$SSHOPTS"; \
+	echo "==> Creating remote directories on $(HOST)..."; \
+	eval "$$SSH" "mkdir -p $(REMOTE)/releases $(REMOTE)/config $(REMOTE)/docker $(REMOTE)/masks"; \
+	echo "==> Uploading server binary..."; \
+	eval "$$SCP" "releases/aivpn-server-linux-x86_64" "$$R:$(REMOTE)/releases/"; \
+	echo "==> Uploading Docker files..."; \
+	eval "$$SCP" "docker-compose.yml" "$$R:$(REMOTE)/"; \
+	eval "$$SCP" "docker/Dockerfile.prebuilt" "docker/docker-entrypoint.sh" "$$R:$(REMOTE)/docker/"; \
+	if [ -f config/server.json ]; then \
+	    echo "==> Uploading config..."; \
+	    eval "$$SCP" "config/server.json" "$$R:$(REMOTE)/config/"; \
+	fi; \
+	echo "==> Installing Docker on remote (if needed)..."; \
+	eval "$$SSH" "export DEBIAN_FRONTEND=noninteractive && \
+	    apt-get update -y -qq && \
+	    (apt-get install -y docker.io docker-compose-plugin iptables iproute2 ca-certificates curl openssl 2>/dev/null || \
+	     apt-get install -y docker.io docker-compose iptables iproute2 ca-certificates curl openssl) && \
+	    systemctl enable docker && systemctl start docker"; \
+	echo "==> Generating server key if missing..."; \
+	eval "$$SSH" "test -f $(REMOTE)/config/server.key || { openssl rand 32 > $(REMOTE)/config/server.key && chmod 600 $(REMOTE)/config/server.key; }"; \
+	echo "==> Starting server via Docker Compose..."; \
+	eval "$$SSH" "cd $(REMOTE) && \
+	    if docker compose version >/dev/null 2>&1; then DC='docker compose'; else DC='docker-compose'; fi && \
+	    AIVPN_SERVER_DOCKERFILE=docker/Dockerfile.prebuilt \$$DC up -d --build --force-recreate aivpn-server"; \
+	echo ""; \
+	echo "==> Deploy complete. Server running at $(HOST)"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Windows GUI via Docker — no local mingw-w64 required
+# Extracts aivpn-client.exe from Docker image into releases/
+# ─────────────────────────────────────────────────────────────────────────────
+windows-docker: releases/
+	@set -e; \
+	IMAGE=aivpn-windows-client:build; \
+	CTR=aivpn-windows-$$RANDOM; \
+	docker build -t $$IMAGE -f docker/Dockerfile.windows-client .; \
+	docker create --name $$CTR $$IMAGE >/dev/null; \
+	trap "docker rm -f $$CTR >/dev/null 2>&1 || true" EXIT; \
+	docker cp $$CTR:/aivpn-client.exe releases/aivpn-client.exe; \
+	echo "→ releases/aivpn-client.exe  ($$(du -h releases/aivpn-client.exe | cut -f1))"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Integration test: server + client in Docker bridge network
+# ─────────────────────────────────────────────────────────────────────────────
+test-docker:
+	docker compose -f docker/docker-compose.test.yml up --build --abort-on-container-exit
+	docker compose -f docker/docker-compose.test.yml down
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Linux kernel module (requires kernel headers ≥ 6.1)
+# Usage:
+#   make kernel              → build .ko in aivpn-linux-kernel/
+#   make kernel KVER=6.6.0  → target a specific kernel
+#   make kernel-install      → install + depmod (root)
+# ─────────────────────────────────────────────────────────────────────────────
+kernel:
+	@echo "==> Building aivpn-linux-kernel module (kernel: $$(uname -r))..."
+	$(MAKE) -C aivpn-linux-kernel
+	@echo "→ aivpn-linux-kernel/aivpn.ko"
+
+kernel-install: kernel
+	@echo "==> Installing kernel module..."
+	$(MAKE) -C aivpn-linux-kernel install
+	@echo "→ module installed, depmod done"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MikroTik RouterOS container image
+# Usage:
+#   make mikrotik                                      → push infosave2007/aivpn-mikrotik:latest
+#   make mikrotik IMAGE=myrepo/aivpn-mikrotik:v1.0    → custom tag
+#   make mikrotik-local                               → arm64 image locally, no push
+# ─────────────────────────────────────────────────────────────────────────────
+mikrotik:
+	@echo "==> Building multi-arch MikroTik images and pushing manifest..."
+	bash aivpn-mikrotik/build-mikrotik.sh "$(IMAGE)"
+
+mikrotik-local:
+	@echo "==> Building local arm64 MikroTik image (no push)..."
+	docker build \
+	  --platform linux/amd64 \
+	  --build-arg MUSL_IMAGE_TAG=aarch64-musl \
+	  --build-arg TARGET_TRIPLE=aarch64-unknown-linux-musl \
+	  -t aivpn-mikrotik:local \
+	  -f aivpn-mikrotik/Dockerfile .
+	@echo "→ aivpn-mikrotik:local (aarch64)"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# OpenWrt — build musl client binaries for common router architectures
+# The OpenWrt package Makefile (aivpn-openwrt/package/aivpn/Makefile) must be
+# built inside the OpenWrt build system or SDK. This target compiles the
+# standalone musl client binaries that can be packaged into an ipk manually.
+# ─────────────────────────────────────────────────────────────────────────────
+openwrt: releases/
+	@echo "==> Building OpenWrt client binaries (musl static)..."
+	$(MAKE) client-musl-armv7
+	$(MAKE) client-musl-mipsel
+	$(MAKE) client-musl-aarch64
+	@echo ""
+	@echo "→ releases/aivpn-client-linux-armv7-musleabihf  (ARMv7 routers)"
+	@echo "→ releases/aivpn-client-linux-mipsel-musl       (MIPS routers)"
+	@echo "→ releases/aivpn-client-linux-aarch64-musl      (AArch64 routers)"
+	@echo ""
+	@echo "Package with the OpenWrt SDK: copy aivpn-openwrt/package/aivpn/ into"
+	@echo "  <sdk>/package/feeds/packages/aivpn and run: make package/aivpn/compile"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Android APK
+# Requires: ANDROID_SDK_ROOT, ANDROID_NDK_ROOT env vars (or /opt/android-sdk)
+# ─────────────────────────────────────────────────────────────────────────────
+android:
+	@set -e; \
+	SDK_ROOT=$${ANDROID_SDK_ROOT:-/opt/android-sdk}; \
+	NDK_ROOT=$${ANDROID_NDK_ROOT:-/opt/android-ndk}; \
+	[ -d "$$SDK_ROOT" ] || { echo "ERROR: Android SDK not found at $$SDK_ROOT" >&2; \
+	    echo "       Set ANDROID_SDK_ROOT env var or install to /opt/android-sdk" >&2; exit 1; }; \
+	[ -d "$$NDK_ROOT" ] || { echo "ERROR: Android NDK not found at $$NDK_ROOT" >&2; \
+	    echo "       Set ANDROID_NDK_ROOT env var or install to /opt/android-ndk" >&2; exit 1; }; \
+	export ANDROID_SDK_ROOT="$$SDK_ROOT"; \
+	export ANDROID_NDK_ROOT="$$NDK_ROOT"; \
+	echo "SDK: $$SDK_ROOT"; \
+	echo "NDK: $$NDK_ROOT"; \
+	echo "sdk.dir=$$SDK_ROOT" > aivpn-android/local.properties; \
+	echo "==> Building Android APK (release)..."; \
+	cd aivpn-android && bash build-rust-android.sh release; \
+	APK="$$(find aivpn-android -name '*.apk' | grep release | head -1)"; \
+	if [ -n "$$APK" ]; then \
+	    mkdir -p releases; \
+	    cp "$$APK" releases/aivpn-android.apk; \
+	    echo "→ releases/aivpn-android.apk"; \
+	else \
+	    echo "WARN: APK not found at expected path — check aivpn-android/app/build/outputs/"; \
+	fi
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Clean
 # ─────────────────────────────────────────────────────────────────────────────
 clean:
 	cargo clean
+	$(MAKE) -C aivpn-linux-kernel clean 2>/dev/null || true
 
 clean-releases:
 	rm -rf releases/
