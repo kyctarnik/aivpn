@@ -2,29 +2,33 @@
 //! aivpn kernel module — entry point (Rust control plane)
 
 #![no_std]
-#![feature(allocator_api)]
 
 use kernel::prelude::*;
 
 mod dev;
 
+extern "C" {
+    fn aivpn_session_table_init() -> i32;
+    fn aivpn_session_table_fini();
+}
+
 module! {
     type: AivpnModule,
     name: "aivpn",
-    author: "AIVPN contributors",
+    authors: ["AIVPN contributors"],
     description: "AIVPN kernel data-plane accelerator (optional, auto-detected)",
     license: "GPL",
     params: {},
 }
 
 struct AivpnModule {
-    _dev: Pin<Box<dev::AivpnDev>>,
+    _dev: Pin<KBox<dev::AivpnDev>>,
 }
 
 impl kernel::Module for AivpnModule {
     fn init(_module: &'static ThisModule) -> Result<Self> {
         // SAFETY: called once at module load before any ioctl can arrive.
-        let ret = unsafe { bindings::aivpn_session_table_init() };
+        let ret = unsafe { aivpn_session_table_init() };
         if ret != 0 {
             pr_err!("aivpn: session table init failed: {}\n", ret);
             return Err(Error::from_errno(ret));
@@ -38,7 +42,7 @@ impl kernel::Module for AivpnModule {
 impl Drop for AivpnModule {
     fn drop(&mut self) {
         // SAFETY: misc device deregistered before this runs (via _dev Drop).
-        unsafe { bindings::aivpn_session_table_fini() };
+        unsafe { aivpn_session_table_fini() };
         pr_info!("aivpn: module unloaded\n");
     }
 }

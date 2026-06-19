@@ -23,4 +23,13 @@ int  aivpn_udp_hook_install(struct socket *sock);
  */
 void aivpn_udp_hook_remove(struct socket *sock);
 
+/**
+ * aivpn_udp_hook_install_by_fd - install UDP hook via a userspace file descriptor.
+ * @fd: file descriptor of the UDP socket.
+ *
+ * Looks up the socket with sockfd_lookup(), installs the hook, then releases.
+ * Returns 0 on success, -errno on error.
+ */
+int aivpn_udp_hook_install_by_fd(int fd);
+
 #endif /* AIVPN_UDP_HOOK_H */

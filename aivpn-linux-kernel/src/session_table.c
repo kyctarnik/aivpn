@@ -24,6 +24,7 @@
 #include <linux/rcupdate.h>
 #include <linux/atomic.h>
 #include <crypto/aead.h>
+#include <crypto/algapi.h>
 #include "session_table.h"
 #include "helpers.h"
 
