@@ -119,10 +119,14 @@ jobs:
             artifact_name: aivpn-server-linux-armv7-musleabihf
           - make_target: server-musl-mipsel
             artifact_name: aivpn-server-linux-mipsel-musl
+          - make_target: server-musl-aarch64
+            artifact_name: aivpn-server-linux-aarch64-musl
           - make_target: client-musl-armv7
             artifact_name: aivpn-client-linux-armv7-musleabihf
           - make_target: client-musl-mipsel
             artifact_name: aivpn-client-linux-mipsel-musl
+          - make_target: client-musl-aarch64
+            artifact_name: aivpn-client-linux-aarch64-musl
 
     steps:
       - name: Checkout repository
