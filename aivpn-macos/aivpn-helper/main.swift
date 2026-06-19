@@ -310,7 +310,18 @@ func startClient(key: String, fullTunnel: Bool, binaryPath: String?, mtlsCertPat
 }
 
 func runClientCommand(args: [String], binaryPath: String?) -> HelperResponse {
-    let clientPath = binaryPath ?? DEFAULT_CLIENT_PATH
+    let requestedPath = binaryPath ?? DEFAULT_CLIENT_PATH
+    let resolvedPath = URL(fileURLWithPath: requestedPath)
+        .resolvingSymlinksInPath().standardized.path
+    let clientPath: String
+    if ALLOWED_CLIENT_PATHS.contains(resolvedPath) {
+        clientPath = resolvedPath
+    } else if ALLOWED_CLIENT_PATHS.contains(requestedPath) {
+        clientPath = requestedPath
+    } else {
+        log("ERROR: runClientCommand binaryPath '\(requestedPath)' not in allowlist — rejected")
+        return HelperResponse(status: "error", message: "Rejected: binary path is not permitted")
+    }
 
     guard FileManager.default.isExecutableFile(atPath: clientPath) else {
         return HelperResponse(status: "error", message: "aivpn-client binary not found at \(clientPath)")
