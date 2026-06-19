@@ -401,6 +401,9 @@ impl SizeDistribution {
                 match self.parametric_type {
                     Some(ParametricType::LogNormal) => {
                         if let Some(params) = &self.parametric_params {
+                            if params.len() < 2 {
+                                return rng.gen_range(64..512);
+                            }
                             let mu: f64 = params[0];
                             let sigma: f64 = params[1];
                             // Box-Muller transform: generate standard normal from two uniform samples
@@ -458,6 +461,9 @@ impl IATDistribution {
             }
             IATDistType::Gamma => {
                 // Simplified gamma sampling (sum of k exponentials for integer k)
+                if self.params.len() < 2 {
+                    return 20.0;
+                }
                 let k: f64 = self.params[0];
                 let theta: f64 = self.params[1];
                 let sum: f64 = (0..k.max(1.0) as i32)
@@ -469,6 +475,9 @@ impl IATDistribution {
                 sum * theta
             }
             IATDistType::Empirical => {
+                if self.params.is_empty() {
+                    return 20.0;
+                }
                 let idx = rng.gen_range(0..self.params.len());
                 self.params[idx]
             }

@@ -436,6 +436,7 @@ fn draw_keys_section(ui: &mut egui::Ui, app: &mut AivpnApp) {
                         app.new_key_use_proxy = key.proxy_listen.is_some();
                         app.new_key_proxy_listen = key.proxy_listen.clone().unwrap_or_default();
                         app.new_key_mtls_cert = key.mtls_cert_path.clone().unwrap_or_default();
+                        app.new_key_exclude_routes = key.exclude_routes.join("\n");
                         app.editing_key_idx = Some(idx);
                         app.show_add_key = true;
                     }

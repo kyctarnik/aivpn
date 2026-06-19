@@ -1,5 +1,97 @@
 # Changelog
 
+## [0.9.1] - 2026-06-19
+
+### Fixed
+
+- **Security (CRITICAL): macOS helper shell-injection RCE** — `aivpn_helper.sh` executed `nohup $CMD` with an unquoted `$KEY` variable; a crafted connection key containing shell metacharacters would run arbitrary commands as root via the privileged helper. Script removed entirely; the `runClientCommand()` Swift code path now applies the same symlink-resolved `ALLOWED_CLIENT_PATHS` allowlist that `startClient()` uses, so arbitrary binary execution via the helper Unix socket is no longer possible.
+- **Security (CRITICAL): macOS helper `runClientCommand` allowlist bypass** — `runClientCommand()` accepted an arbitrary `binaryPath` argument without checking `ALLOWED_CLIENT_PATHS`; any local user with access to the helper socket could execute an arbitrary binary as root. Allowlist check now applied identically to `startClient()`.
+- **Security: integer underflow on malformed `pad_len`** — `protocol.rs` subtracted `pad_len` from the packet length before a bounds check, wrapping to a huge value and causing a read beyond the buffer on crafted packets; bounds check added before subtraction.
+- **Security: `KeyRotate` key length not validated** — a malformed `KeyRotate` control packet with `new_eph_pub_len ≠ 32` would cause `from_raw_parts` to alias memory of the wrong length; explicit `!= 32` rejection added.
+- **Security: `AckPacket` minimum-length guard off by 2** — the guard compared `len >= 5` but then read fields at byte indices 5 and 6, allowing a 5- or 6-byte packet to trigger an out-of-bounds read; corrected to `len >= 7`.
+- **Security: `mask.rs` out-of-bounds in distribution sampling** — `LogNormal` and `Gamma` samplers indexed `params[]` without checking length; `Empirical` passed an empty slice to `gen_range`, causing a panic. Guards added for each distribution variant.
+- **Security: `gateway.rs` `expect()` panic when no masks loaded** — calling `expect()` on an empty mask list crashed the server process; replaced with a graceful `warn!()` + error return.
+- **Security: `neural.rs` `assert!()` panic on short signature vector** — a mask with a short `signature_vector` triggered an assertion failure crashing the process; replaced with `warn!()` and fallback behaviour.
+- **Security: Android `fcntl(F_SETFL, O_NONBLOCK)` return value ignored** — failure to set non-blocking mode was silently accepted; the dup'd fd was also not closed on subsequent failure, potentially blocking `AsyncFd`. Both issues fixed.
+- **Security: iOS `server_host` / `server_key` null pointer dereference** — `aivpn_run_tunnel` FFI entry dereferenced `server_host` and `server_key` via `CStr::from_ptr` without a null check; null pointers now return an error immediately.
+- **iOS: `completionHandler` fired before Rust handshake completed** — `PacketTunnelProvider` called `completionHandler(nil)` immediately after `thread.start()`, marking the tunnel connected before the Rust handshake finished; wired via a `TunnelReadyBox` C trampoline so the callback fires only after `on_ready` is invoked from the Rust side.
+- **iOS: DNS routing inverted in full-tunnel mode** — `matchDomains` was incorrectly set to `excludedDomains`, routing excluded-domain DNS through the VPN and leaking general DNS outside the tunnel in full-tunnel mode; set to `nil` so all DNS queries are routed through the VPN DNS server.
+- **Android: `foregroundServiceType` missing for API 34+** — `startForeground()` was called without the required `foregroundServiceType` on Android 14 (API 34+), causing a crash on newer devices; `FOREGROUND_SERVICE_TYPE_SYSTEM_EXEMPTED` added.
+- **Android: `JSONException` on malformed connection keys** — `MainActivity` used `getString()` for PSK and VPN IP JSON fields; absent or null fields threw an uncaught `JSONException`; changed to `optString()` with defaults.
+- **Android: underlying network not validated** — `NetworkCallback` accepted any available network including captive portals as the VPN transport; now requires `NET_CAPABILITY_VALIDATED`.
+- **macOS: full-tunnel route errors silently ignored** — `setTunnelNetworkSettings` route configuration failures were swallowed and the tunnel started with a broken default route; propagated as errors so the connection fails cleanly.
+- **macOS: proxy mode 'binary not found' outside `/Applications`** — `startClient()` resolved the helper binary path relative to `/Applications/AIVPN.app`; running from any other path caused immediate failure; resolution now walks from the helper's own bundle path.
+- **Windows: `disconnect()` blocked the egui UI thread** — `VpnManager::disconnect()` contained a `for _ in 0..5 { thread::sleep(100ms) }` loop before `child.kill()`, stalling the render loop for up to 500 ms on every disconnect; replaced with immediate `child.kill() + child.wait()`.
+- **Windows: startup blocked on `get_device_public_key()`** — `AivpnApp::new()` called `VpnManager::get_device_public_key()` synchronously, blocking the egui event loop until the subprocess returned; moved to a background thread with an `mpsc::channel`; `update()` polls via `try_recv()` and fills the field lazily.
+- **Windows: bench command shows console window** — `run_bench_blocking()` spawned `aivpn-client.exe` without `CREATE_NO_WINDOW`; a blank console window flashed on every latency test; flag added with `#[cfg(windows)]`.
+- **Windows: edit-key form loses `exclude_routes`** — `KeyAction::Edit` handler restored all key fields except `exclude_routes`; the missing `app.new_key_exclude_routes = key.exclude_routes.join("\n")` assignment caused the field to appear empty when editing an existing key.
+- **Kernel module: port Rust bindings to Linux 7.x `Rust-for-Linux` API** — `dev.rs` fully rewritten for `kernel::miscdevice::{MiscDevice, MiscDeviceOptions, MiscDeviceRegistration}` and `kernel::uaccess::{UserSlice, UserPtr}`; `#[pin_data]` + `KBox::pin_init` + `try_pin_init!` used for the pinned device struct; `ioctl` return type changed from `Result<i32>` to `Result<isize>`; `module!` macro `author:` key changed to `authors: [...]`; `#![feature(allocator_api)]` removed (not permitted in kernel modules).
+- **Kernel module: `ktime_get_ms()` undefined on Linux 6.4+** — function removed in Linux 6.4; replaced with `ktime_to_ms(ktime_get())` wrapped in a local `aivpn_ktime_ms()` helper.
+- **Kernel module: `crypto_memneq()` undeclared** — `session_table.c` used `crypto_memneq` without `#include <crypto/algapi.h>`; include added.
+- **Kernel module: `aivpn_udp_hook_install_by_fd()` unresolved at link** — `dev.rs` declared and called the function but it was never implemented in C; added to `udp_hook.c` using `sockfd_lookup()` / `sockfd_put()`.
+- **MikroTik Docker: native `strip` corrupts aarch64 cross-compiled binary** — the builder stage ran `strip /aivpn-client` with the host x86_64 tool after cross-compiling for aarch64; native strip cannot process foreign-architecture ELF and silently corrupts the binary; `strip` step removed.
+- **Build: Makefile targets fail with `rustup: not found`** — `make windows`, `make ios`, and `make kernel` invoked `rustup` and `cargo` by name; in environments where the shell profile was not sourced (CI, `sudo make`) commands resolved to the system package-manager toolchain or failed outright; `export PATH := $(HOME)/.cargo/bin:$(PATH)` added at the top of the Makefile.
+- **Android build: system `rustc` shadows rustup when `JAVA_HOME=/usr`** — `build-rust-android.sh` prepended `${JAVA_HOME}/bin` to PATH after rustup setup; on systems where `java` resolves to `/usr/bin/java` this placed `/usr/bin` (which contains the distro-packaged `rustc`) before `~/.cargo/bin`, causing `cargo ndk` to compile with a `rustc` that has no Android targets; `~/.cargo/bin` is now kept first after the `JAVA_HOME/bin` prepend.
+
+### Added
+
+- **Server: `network_config.mtu: "auto"`** — `network_config.mtu` in `server.json` now accepts `"auto"` (or may be omitted entirely). When set to `"auto"`, the advertised client MTU is derived from the same `detect_mtu()` call that sets `tun_mtu`, keeping both values in sync automatically. On constrained links (VXLAN/GRE overlays, Kubernetes pods, PPPoE) where the physical MTU is below 1410 bytes, `"auto"` prevents the previous mismatch where clients were told to use 1346-byte inner packets while the server TUN could only forward 1236-byte packets, causing packet loss. The invariant `network_config.mtu ≤ tun_mtu` is now enforced at startup (oversized values are clamped with a warning). `config/server.json.example` updated to `"mtu": "auto"`.
+- **Kernel module: `aivpn_udp_hook_install_by_fd()` ioctl** — new C function in `udp_hook.c` allows userspace to install the UDP RX hook by passing a socket file descriptor via `IOC_SET_UDP_SOCK`, eliminating any need for out-of-band socket passing.
+- **CI: aarch64 musl server + client in release matrix** — `aivpn-server-linux-aarch64-musl` and `aivpn-client-linux-aarch64-musl` static binaries now built and published on every tagged release.
+
+### Changed
+
+- **Build system: unified `Makefile` replaces `scripts/`** — all per-platform build scripts consolidated into a single top-level `Makefile` with named targets: `make server`, `make client`, `make windows`, `make ios`, `make macos`, `make android`, `make kernel`, `make mikrotik`, `make openwrt`. CI workflows updated accordingly.
+- Version bumped 0.9.0 → 0.9.1 across workspace `Cargo.toml`, all crate `Cargo.toml` files, macOS `Info.plist` (build 8), iOS `App/Info.plist` and `Tunnel/Info.plist` (build 6).
+
+---
+
+## [0.9.1] — 2026-06-19
+
+### Исправлено
+
+- **Безопасность (КРИТИЧЕСКОЕ): RCE через shell-injection в helper macOS** — `aivpn_helper.sh` выполнял `nohup $CMD` с неэкранированной переменной `$KEY`; сформированный connection key со спецсимволами оболочки позволял выполнить произвольный код от имени root через привилегированный helper. Скрипт удалён полностью; функция `runClientCommand()` в Swift-коде теперь применяет тот же allowlist `ALLOWED_CLIENT_PATHS` с разрешением симлинков, что и `startClient()`.
+- **Безопасность (КРИТИЧЕСКОЕ): обход allowlist в `runClientCommand` helper'а macOS** — `runClientCommand()` принимал произвольный `binaryPath` без проверки `ALLOWED_CLIENT_PATHS`; любой локальный пользователь с доступом к сокету helper'а мог выполнить произвольный бинарник от имени root. Проверка allowlist теперь идентична `startClient()`.
+- **Безопасность: целочисленное переполнение при некорректном `pad_len`** — `protocol.rs` вычитал `pad_len` до проверки границ; результат оборачивался в огромное число и вызывал чтение за пределами буфера; проверка добавлена до вычитания.
+- **Безопасность: длина ключа `KeyRotate` не проверялась** — сформированный пакет `KeyRotate` с `new_eph_pub_len ≠ 32` вызывал `from_raw_parts` с неверной длиной; добавлена явная проверка с отклонением пакета.
+- **Безопасность: граница минимальной длины `AckPacket` занижена на 2** — проверка `len >= 5` допускала out-of-bounds-чтение по индексам 5 и 6; исправлено на `len >= 7`.
+- **Безопасность: выход за границы в сэмплировании `mask.rs`** — `LogNormal` и `Gamma` обращались к `params[]` без проверки длины; `Empirical` вызывал `gen_range` с пустым срезом, вызывая панику; добавлены проверки для каждого варианта.
+- **Безопасность: `expect()` в `gateway.rs` при отсутствии масок** — крашил серверный процесс; заменён на `warn!()` и возврат ошибки.
+- **Безопасность: `assert!()` в `neural.rs` при коротком `signature_vector`** — крашил процесс; заменено на `warn!()` с fallback-поведением.
+- **Безопасность: возвращаемое значение `fcntl` игнорировалось на Android** — ошибка установки O_NONBLOCK игнорировалась; дублированный fd не закрывался при ошибках, блокируя `AsyncFd`; оба дефекта исправлены.
+- **Безопасность: разыменование null-указателей `server_host`/`server_key` на iOS** — FFI-точка входа `aivpn_run_tunnel` разыменовывала указатели через `CStr::from_ptr` без проверки на null; нулевые указатели теперь немедленно возвращают ошибку.
+- **iOS: `completionHandler` вызывался до завершения рукопожатия Rust** — ОС помечала туннель подключённым до завершения Rust-рукопожатия; теперь используется трамплин `TunnelReadyBox` — callback вызывается только после `on_ready` из Rust.
+- **iOS: DNS-маршрутизация инвертирована в full-tunnel режиме** — `matchDomains` ошибочно устанавливался в `excludedDomains`, пропуская общий DNS мимо туннеля; исправлено на `nil` — весь DNS маршрутизируется через VPN.
+- **Android: отсутствует `foregroundServiceType` для API 34+** — `startForeground()` без обязательного типа крашил приложение на Android 14; добавлено `FOREGROUND_SERVICE_TYPE_SYSTEM_EXEMPTED`.
+- **Android: `JSONException` при некорректных ключах подключения** — `getString()` для PSK и VPN IP выбрасывал непойманное исключение; заменено на `optString()` с дефолтными значениями.
+- **Android: невалидированная сеть принималась как транспорт VPN** — `NetworkCallback` принимал captive portal'ы и невалидированные сети; теперь требуется `NET_CAPABILITY_VALIDATED`.
+- **macOS: ошибки настройки маршрутов full-tunnel молча игнорировались** — туннель запускался с нерабочим default route; теперь ошибки пробрасываются и соединение завершается корректно.
+- **macOS: proxy-режим не находил бинарник вне `/Applications`** — путь разрешался относительно `/Applications/AIVPN.app`; исправлено — путь определяется от bundle самого helper'а.
+- **Windows: `disconnect()` блокировал UI-поток egui** — цикл `5 × sleep(100мс)` перед `child.kill()` замораживал render loop на до 500 мс; заменено на `child.kill() + child.wait()` без задержки.
+- **Windows: запуск блокировался на `get_device_public_key()`** — синхронный вызов подпроцесса в `new()` блокировал egui event loop; перенесено в фоновый поток с `mpsc::channel`; поле заполняется лениво через `try_recv()` в `update()`.
+- **Windows: bench-команда показывала мигающую консоль** — `aivpn-client.exe` запускался без `CREATE_NO_WINDOW`; флаг добавлен через `#[cfg(windows)]`.
+- **Windows: форма редактирования ключа теряла `exclude_routes`** — пропущенное присвоение `app.new_key_exclude_routes = key.exclude_routes.join("\n")` в обработчике `KeyAction::Edit`; поле теперь восстанавливается корректно.
+- **Модуль ядра: перенос Rust-привязок на Linux 7.x `Rust-for-Linux` API** — `dev.rs` полностью переписан: `kernel::miscdevice::{MiscDevice, MiscDeviceOptions, MiscDeviceRegistration}`, `kernel::uaccess::{UserSlice, UserPtr}`, `#[pin_data]` + `KBox::pin_init` + `try_pin_init!`; тип возврата `ioctl` → `Result<isize>`; `author:` → `authors: [...]`; `#![feature(allocator_api)]` удалён.
+- **Модуль ядра: `ktime_get_ms()` удалён в Linux 6.4** — заменён на `ktime_to_ms(ktime_get())` в хелпере `aivpn_ktime_ms()`.
+- **Модуль ядра: `crypto_memneq()` не объявлен** — добавлен `#include <crypto/algapi.h>` в `session_table.c`.
+- **Модуль ядра: `aivpn_udp_hook_install_by_fd()` не разрешался при линковке** — реализация добавлена в `udp_hook.c` через `sockfd_lookup()` / `sockfd_put()`.
+- **MikroTik Docker: нативный `strip` повреждал aarch64 ELF** — хостовый x86_64 `strip` не обрабатывает ELF чужой архитектуры; шаг удалён из builder-стадии.
+- **Сборка: цели Makefile завершались с `rustup: not found`** — в средах без sourced-профиля команды разрешались в системный toolchain; добавлен `export PATH := $(HOME)/.cargo/bin:$(PATH)` в начало Makefile.
+- **Android build: системный `rustc` перекрывал rustup при `JAVA_HOME=/usr`** — `${JAVA_HOME}/bin` (=/usr/bin) ставился раньше `~/.cargo/bin` в PATH, подставляя системный `rustc` без Android-таргетов; `~/.cargo/bin` теперь принудительно первым.
+
+### Добавлено
+
+- **Сервер: `network_config.mtu: "auto"`** — поле `network_config.mtu` в `server.json` теперь принимает значение `"auto"` (или может быть опущено). При `"auto"` рекламируемый клиентам MTU берётся из того же вызова `detect_mtu()`, что устанавливает `tun_mtu`, — оба значения всегда синхронизированы. На ограниченных линках (VXLAN/GRE-оверлеи, поды Kubernetes, PPPoE), где физический MTU ниже 1410 байт, `"auto"` устраняет рассинхронизацию, при которой клиентам сообщался MTU 1346 байт, тогда как серверный TUN мог форвардировать лишь 1236-байтные пакеты. Инвариант `network_config.mtu ≤ tun_mtu` теперь принудительно соблюдается при запуске: завышенные значения усекаются с предупреждением. `config/server.json.example` обновлён на `"mtu": "auto"`.
+- **Модуль ядра: ioctl `aivpn_udp_hook_install_by_fd()`** — новая C-функция в `udp_hook.c` позволяет userspace устанавливать UDP-хук передачей fd через `IOC_SET_UDP_SOCK`.
+- **CI: aarch64 musl в release-матрице** — статические бинарники `aivpn-server-linux-aarch64-musl` и `aivpn-client-linux-aarch64-musl` публикуются при каждом теге релиза.
+
+### Изменено
+
+- **Система сборки: единый `Makefile` заменяет `scripts/`** — все скрипты сборки по платформам заменены именованными целями: `make server`, `make client`, `make windows`, `make ios`, `make macos`, `make android`, `make kernel`, `make mikrotik`, `make openwrt`.
+- Версия 0.9.0 → 0.9.1 обновлена в `Cargo.toml` воркспейса, во всех `Cargo.toml` крейтов, macOS `Info.plist` (сборка 8), iOS `App/Info.plist` и `Tunnel/Info.plist` (сборка 6).
+
+---
+
 ## [0.9.0] - 2026-06-17
 
 ### Added

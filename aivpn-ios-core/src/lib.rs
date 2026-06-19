@@ -32,6 +32,10 @@ pub extern "C" fn aivpn_run_tunnel(
     on_ready: Option<OnReadyFn>,
     ctx: *mut libc::c_void,
 ) -> libc::c_int {
+    if server_host.is_null() || server_key.is_null() {
+        return -1;
+    }
+
     // SAFETY: server_host is a NUL-terminated C string from Swift.
     let host = unsafe {
         match std::ffi::CStr::from_ptr(server_host).to_str() {
@@ -40,7 +44,7 @@ pub extern "C" fn aivpn_run_tunnel(
         }
     };
 
-    // SAFETY: server_key points to 32 bytes passed by Swift.
+    // SAFETY: server_key points to 32 bytes passed by Swift; null checked above.
     let key_bytes = unsafe {
         let mut arr = [0u8; 32];
         arr.copy_from_slice(std::slice::from_raw_parts(server_key, 32));

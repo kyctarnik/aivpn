@@ -66,7 +66,7 @@ class AivpnTileService : TileService() {
         val intent = Intent(this, AivpnService::class.java).apply {
             action = AivpnService.ACTION_DISCONNECT
         }
-        startForegroundService(intent)
+        startService(intent)
         qsTile?.let { tile ->
             tile.state = Tile.STATE_INACTIVE
             tile.updateTile()

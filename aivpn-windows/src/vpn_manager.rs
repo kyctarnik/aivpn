@@ -213,12 +213,6 @@ impl VpnManager {
         self.state = ConnectionState::Disconnecting;
 
         if let Some(ref mut child) = self.child {
-            for _ in 0..5 {
-                if child.try_wait().map(|s| s.is_some()).unwrap_or(true) {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
             let _ = child.kill();
             let _ = child.wait();
         }
@@ -240,10 +234,15 @@ impl VpnManager {
         if server_addr.is_empty() {
             return None;
         }
-        let out = Command::new(binary)
-            .args(["bench", "--server", server_addr, "--json"])
-            .output()
-            .ok()?;
+        let mut cmd = Command::new(binary);
+        cmd.args(["bench", "--server", server_addr, "--json"]);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+        let out = cmd.output().ok()?;
         if !out.status.success() {
             return None;
         }
@@ -252,10 +251,20 @@ impl VpnManager {
 
     /// Run `aivpn-client --show-device-key` and return the base64-encoded device public key.
     pub fn get_device_public_key(&self) -> Option<String> {
-        let out = Command::new(&self.client_binary)
-            .arg("--show-device-key")
-            .output()
-            .ok()?;
+        Self::get_device_public_key_from(&self.client_binary)
+    }
+
+    /// Static variant for calling from a background thread (no &self required).
+    pub fn get_device_public_key_from(binary: &PathBuf) -> Option<String> {
+        let mut cmd = Command::new(binary);
+        cmd.arg("--show-device-key");
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+        let out = cmd.output().ok()?;
         if out.status.success() {
             String::from_utf8(out.stdout)
                 .ok()

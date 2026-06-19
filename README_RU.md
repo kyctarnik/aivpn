@@ -193,9 +193,7 @@ CLI (PowerShell, с правами Администратора):
 Сборка на macOS (требуется Xcode 15+):
 
 ```bash
-rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
-cargo install xcodegen
-./scripts/build-ios.sh ВАШ_TEAM_ID
+make ios TEAM_ID=ВАШ_TEAM_ID
 ```
 
 Установка `releases/aivpn-ios.ipa`:
@@ -352,37 +350,60 @@ cargo build --release --bin aivpn-server --features "management-api,metrics,neur
 
 ## Сборка из исходников
 
-Требования: Rust 1.75+, `cargo`.
+Требования: Rust 1.75+, `cargo`, `make`.
 
 ```bash
-git clone https://github.com/infosave2007/aivpn.git
+git clone https://github.com/infosave2007/aivpn
 cd aivpn
+make help          # показать все доступные цели
+```
 
-# Все компоненты воркспейса
-cargo build --release
+### Серверные сборки (Linux)
 
-# Отдельные бинарники
-cargo build --release --bin aivpn-server
-cargo build --release --bin aivpn-client
+```bash
+make server        # x86_64 → releases/aivpn-server-linux-x86_64
+make server-arm64  # ARM64  → releases/aivpn-server-linux-arm64
+make server-docker # через Docker (минимальные зависимости на хосте)
+```
 
-# Тесты
-cargo test
+### Клиентские сборки
 
-# Статические musl-сборки (ARMv7 / MIPSel)
-./scripts/build-musl-release.sh server armv7-unknown-linux-musleabihf
-./scripts/build-musl-release.sh client mipsel-unknown-linux-musl
+```bash
+make client        # Linux x86_64
+```
 
-# Docker-сборка сервера (результат в releases/)
-./scripts/build-server-release.sh
+### Статические musl-сборки (для роутеров)
 
-# Windows GUI (кросс-компиляция с Linux)
-./scripts/build-windows-gui.sh
+```bash
+make server-musl-armv7    # ARMv7
+make server-musl-mipsel   # MIPSel
+make server-musl-aarch64  # AArch64
+```
 
-# iOS (требуется macOS + Xcode 15+)
-rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
-cargo install xcodegen
-./scripts/build-ios.sh              # без подписи / симулятор
-./scripts/build-ios.sh ВАШ_TEAM_ID  # с подписью для устройства
+### Платформенные сборки
+
+```bash
+make windows              # Windows GUI + zip (кросс-компиляция с Linux)
+make windows-docker       # Windows GUI через Docker (без mingw-w64)
+make ios [TEAM_ID=XX]     # iOS IPA (только macOS + Xcode 15+)
+make macos                # macOS .app + .pkg + .dmg (только macOS)
+make linux-appimage        # Linux AppImage
+```
+
+### Деплой
+
+```bash
+make deploy               # VPS: скачать бинарник + запустить docker compose
+make server-deploy HOST=vps.example.com  # SSH: загрузить локальный бинарник на VPS
+```
+
+### Тесты и разработка
+
+```bash
+make test           # cargo test --workspace
+make clippy         # cargo clippy
+make check          # cargo check (быстро)
+make test-docker    # интеграционный тест: сервер + клиент в Docker
 ```
 
 ### Android
@@ -546,7 +567,6 @@ aivpn/
 ├── aivpn-windows/         # Windows egui GUI
 ├── aivpn-macos/           # macOS SwiftUI в строке меню
 ├── mask-assets/           # Встроенные профили мимикрии (JSON)
-├── scripts/               # Скрипты сборки и деплоя
 ├── docker/                # Dockerfiles и точка входа
 ├── Dockerfile
 ├── docker-compose.yml

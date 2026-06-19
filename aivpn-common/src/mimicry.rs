@@ -234,6 +234,13 @@ impl MimicryEncryptor {
         }
     }
 
+    /// Replaces the session keys used by this encryptor and resets the packet counter.
+    /// Called by the KeyRotate handler to keep the upload task in sync with the new epoch.
+    pub fn update_keys(&mut self, keys: SessionKeys) {
+        self.keys = keys;
+        self.counter = 0;
+    }
+
     pub fn set_fec_group(&mut self, group_size: u8) {
         self.fec_encoder = if group_size > 0 {
             Some(FecEncoder::new(group_size, 1500))

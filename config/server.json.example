@@ -1,14 +1,45 @@
 {
   "listen_addr": "0.0.0.0:443",
   "tun_name": "aivpn0",
+  "tun_mtu": "auto",
+
   "network_config": {
     "server_vpn_ip": "10.0.0.1",
     "prefix_len": 24,
-    "mtu": 1346
+    "mtu": "auto",
+    "keepalive_secs": 8,
+    "ipv6_enabled": false,
+    "ipv6_prefix": "fd10:cafe::/48"
   },
+
   "mask_dir": "/var/lib/aivpn/masks",
-  "max_sessions": 500,
-  "session_timeout_secs": 0,
-  "idle_timeout_secs": 300,
-  "default_mask": "webrtc_zoom_v3"
+  "bootstrap_mask_files": [],
+
+  "idle_timeout_secs": 30,
+
+  "allow_peer_routing": false,
+
+  "pool": {
+    "peers": [],
+    "sync_key": "",
+    "exit_node": null,
+    "exit_node_enabled": false
+  },
+
+  "site_to_site": {
+    "local_subnets": [],
+    "peers": [
+    ]
+  },
+
+  "mtls": {
+    "ca_public_key_hex": "",
+    "required": false
+  },
+
+  "dns": {
+    "upstream_doh": "https://1.1.1.1/dns-query",
+    "fallback_doh": "https://8.8.8.8/dns-query",
+    "block_plain_dns": false
+  }
 }

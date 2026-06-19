@@ -4,7 +4,7 @@ use aivpn_common::crypto;
 use aivpn_common::event_log::{EventBus, EventSinkConfig};
 use aivpn_common::mask::{IATDistType, MaskProfile, SizeDistType};
 use aivpn_common::network_config::{
-    netmask_to_prefix_len, ClientNetworkConfig, VpnNetworkConfig, DEFAULT_VPN_MTU,
+    netmask_to_prefix_len, ClientNetworkConfig, VpnNetworkConfig,
 };
 use aivpn_server::audit_log::AuditLogger;
 use aivpn_server::backup::{export_server, import_server, ExportOptions};
@@ -49,6 +49,28 @@ impl<'de> Deserialize<'de> for MtuSetting {
             _ => Err(D::Error::custom("tun_mtu must be a number or \"auto\"")),
         }
     }
+}
+
+/// JSON-only representation of `network_config` that allows `"mtu": "auto"`.
+/// Converted to `VpnNetworkConfig` (with a concrete `u16` MTU) in `resolve_network_config`.
+/// Using a separate struct avoids touching `VpnNetworkConfig` which is also used on the wire.
+#[derive(Debug, Clone, Default, Deserialize)]
+struct JsonNetworkConfig {
+    server_vpn_ip: Option<Ipv4Addr>,
+    prefix_len: Option<u8>,
+    /// `"auto"` or absent → follow `tun_mtu`; a number → fixed (clamped to ≤ tun_mtu).
+    #[serde(default)]
+    mtu: Option<MtuSetting>,
+    #[serde(default)]
+    keepalive_secs: Option<u8>,
+    #[serde(default)]
+    ipv6_enabled: bool,
+    #[serde(default = "default_ipv6_prefix_str")]
+    ipv6_prefix: String,
+}
+
+fn default_ipv6_prefix_str() -> String {
+    "fd10:cafe::/48".to_string()
 }
 
 /// Probe the outbound-interface MTU via `/sys/class/net` and subtract VPN overhead.
@@ -109,7 +131,7 @@ struct ServerFileConfig {
     tun_name: Option<String>,
     tun_addr: Option<Ipv4Addr>,
     tun_netmask: Option<Ipv4Addr>,
-    network_config: Option<VpnNetworkConfig>,
+    network_config: Option<JsonNetworkConfig>,
     mask_dir: Option<String>,
     bootstrap_mask_files: Option<Vec<String>>,
     session_timeout_secs: Option<u64>,
@@ -151,10 +173,15 @@ async fn main() {
 
     let config_path = resolve_config_path(&args);
     let file_config = load_server_file_config(config_path.as_deref());
-    let network_config = resolve_network_config(file_config.as_ref()).unwrap_or_else(|e| {
-        eprintln!("Failed to resolve VPN network config: {}", e);
-        std::process::exit(1);
-    });
+    let effective_tun_mtu: u16 = match file_config.as_ref().and_then(|c| c.tun_mtu.as_ref()) {
+        Some(MtuSetting::Fixed(v)) => *v,
+        Some(MtuSetting::Auto) | None => detect_mtu(),
+    };
+    let network_config =
+        resolve_network_config(file_config.as_ref(), effective_tun_mtu).unwrap_or_else(|e| {
+            eprintln!("Failed to resolve VPN network config: {}", e);
+            std::process::exit(1);
+        });
     let bootstrap_masks = load_bootstrap_masks(file_config.as_ref()).unwrap_or_else(|e| {
         eprintln!("Failed to load bootstrap masks: {}", e);
         std::process::exit(1);
@@ -360,10 +387,7 @@ async fn main() {
         session_timeout_secs: file_config.as_ref().and_then(|c| c.session_timeout_secs),
         idle_timeout_secs: file_config.as_ref().and_then(|c| c.idle_timeout_secs),
         bootstrap_masks,
-        tun_mtu: match file_config.as_ref().and_then(|c| c.tun_mtu.as_ref()) {
-            Some(MtuSetting::Fixed(v)) => *v,
-            Some(MtuSetting::Auto) | None => detect_mtu(),
-        },
+        tun_mtu: effective_tun_mtu,
         event_bus: event_bus.clone(),
         qos_enforcer,
         chain_forwarder: None,
@@ -841,10 +865,35 @@ fn resolve_config_path(args: &ServerArgs) -> Option<String> {
 
 fn resolve_network_config(
     file_config: Option<&ServerFileConfig>,
+    effective_tun_mtu: u16,
 ) -> aivpn_common::error::Result<VpnNetworkConfig> {
     let config = if let Some(file_config) = file_config {
-        if let Some(network_config) = file_config.network_config.clone() {
-            network_config
+        if let Some(jnc) = &file_config.network_config {
+            // Resolve MTU: "auto"/absent → follow tun_mtu; fixed → clamp to tun_mtu.
+            let raw_mtu = match &jnc.mtu {
+                Some(MtuSetting::Fixed(v)) => *v,
+                Some(MtuSetting::Auto) | None => effective_tun_mtu,
+            };
+            let mtu = if raw_mtu > effective_tun_mtu {
+                tracing::warn!(
+                    "network_config.mtu {} > tun_mtu {}, clamping to tun_mtu",
+                    raw_mtu,
+                    effective_tun_mtu
+                );
+                effective_tun_mtu
+            } else {
+                raw_mtu
+            };
+            VpnNetworkConfig {
+                server_vpn_ip: jnc
+                    .server_vpn_ip
+                    .unwrap_or(Ipv4Addr::new(10, 0, 0, 1)),
+                prefix_len: jnc.prefix_len.unwrap_or(24),
+                mtu,
+                keepalive_secs: jnc.keepalive_secs,
+                ipv6_enabled: jnc.ipv6_enabled,
+                ipv6_prefix: jnc.ipv6_prefix.clone(),
+            }
         } else {
             VpnNetworkConfig {
                 server_vpn_ip: file_config.tun_addr.unwrap_or(Ipv4Addr::new(10, 0, 0, 1)),
@@ -853,7 +902,7 @@ fn resolve_network_config(
                         .tun_netmask
                         .unwrap_or(Ipv4Addr::new(255, 255, 255, 0)),
                 )?,
-                mtu: DEFAULT_VPN_MTU,
+                mtu: effective_tun_mtu,
                 keepalive_secs: None,
                 ipv6_enabled: false,
                 ipv6_prefix: "fd10:cafe::/48".to_string(),
@@ -1452,11 +1501,10 @@ mod tests {
             tun_name: None,
             tun_addr: Some(Ipv4Addr::new(10, 0, 0, 1)),
             tun_netmask: Some(Ipv4Addr::new(255, 255, 255, 0)),
-            network_config: Some(VpnNetworkConfig {
-                server_vpn_ip: Ipv4Addr::new(10, 150, 0, 1),
-                prefix_len: 24,
-                mtu: 1400,
-                keepalive_secs: None,
+            network_config: Some(JsonNetworkConfig {
+                server_vpn_ip: Some(Ipv4Addr::new(10, 150, 0, 1)),
+                prefix_len: Some(24),
+                mtu: Some(MtuSetting::Fixed(1400)),
                 ..Default::default()
             }),
             mask_dir: None,
@@ -1468,9 +1516,42 @@ mod tests {
             ..Default::default()
         };
 
-        let resolved = resolve_network_config(Some(&file_config)).unwrap();
+        // effective_tun_mtu=1400 so fixed 1400 is not clamped.
+        let resolved = resolve_network_config(Some(&file_config), 1400).unwrap();
         assert_eq!(resolved.server_vpn_ip, Ipv4Addr::new(10, 150, 0, 1));
         assert_eq!(resolved.mtu, 1400);
+    }
+
+    #[test]
+    fn resolve_network_config_auto_mtu_follows_tun_mtu() {
+        let file_config = ServerFileConfig {
+            network_config: Some(JsonNetworkConfig {
+                server_vpn_ip: Some(Ipv4Addr::new(10, 0, 0, 1)),
+                prefix_len: Some(24),
+                mtu: None, // auto
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        // When MTU is absent (auto), network_config.mtu == effective_tun_mtu.
+        let resolved = resolve_network_config(Some(&file_config), 1280).unwrap();
+        assert_eq!(resolved.mtu, 1280);
+    }
+
+    #[test]
+    fn resolve_network_config_clamps_oversized_mtu() {
+        let file_config = ServerFileConfig {
+            network_config: Some(JsonNetworkConfig {
+                server_vpn_ip: Some(Ipv4Addr::new(10, 0, 0, 1)),
+                prefix_len: Some(24),
+                mtu: Some(MtuSetting::Fixed(1400)),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        // Fixed 1400 exceeds effective_tun_mtu=1280 → clamped to 1280.
+        let resolved = resolve_network_config(Some(&file_config), 1280).unwrap();
+        assert_eq!(resolved.mtu, 1280);
     }
 
     #[test]

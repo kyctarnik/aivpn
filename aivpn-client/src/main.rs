@@ -869,6 +869,22 @@ async fn main() {
     }
 }
 
+/// Parse an `aivpn://` connection key and return the decoded JSON value.
+///
+/// Accepts both the full `aivpn://...` URI form and a bare base64url payload.
+/// Returns an error string on any parse failure so callers can surface a
+/// human-readable message without calling `std::process::exit`.
+fn parse_connection_key(conn_key: &str) -> Result<serde_json::Value, String> {
+    let payload = conn_key
+        .trim()
+        .strip_prefix("aivpn://")
+        .unwrap_or(conn_key.trim());
+    let json_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .map_err(|e| format!("Invalid connection key base64: {}", e))?;
+    serde_json::from_slice(&json_bytes).map_err(|e| format!("Malformed connection key JSON: {}", e))
+}
+
 fn fallback_network_config(tun_addr: &str) -> ClientNetworkConfig {
     let client_ip = tun_addr.parse::<Ipv4Addr>().unwrap_or_else(|_| {
         error!("Invalid TUN address '{}': expected IPv4 address", tun_addr);
@@ -883,5 +899,107 @@ fn fallback_network_config(tun_addr: &str) -> ClientNetworkConfig {
         mdh_len: 20,
         keepalive_secs: None,
         ipv6_address: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::Engine as _;
+
+    /// Build a valid aivpn:// connection key from a JSON object literal.
+    fn make_conn_key(json: &str) -> String {
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json.as_bytes());
+        format!("aivpn://{}", encoded)
+    }
+
+    // ── valid key round-trip ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_connection_key_valid_full() {
+        // A realistic key contains server address (s), server public key (k), and PSK (p).
+        let json = r#"{"s":"1.2.3.4:443","k":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","p":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}"#;
+        let key = make_conn_key(json);
+        let val = parse_connection_key(&key).expect("must parse");
+        assert_eq!(val["s"].as_str().unwrap(), "1.2.3.4:443");
+        assert!(val["k"].as_str().is_some());
+        assert!(val["p"].as_str().is_some());
+    }
+
+    #[test]
+    fn test_parse_connection_key_bare_payload_without_prefix() {
+        // Bare base64url (no "aivpn://" prefix) must also be accepted.
+        let json = r#"{"s":"10.0.0.1:1194","k":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}"#;
+        let bare =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json.as_bytes());
+        let val = parse_connection_key(&bare).expect("must parse bare payload");
+        assert_eq!(val["s"].as_str().unwrap(), "10.0.0.1:1194");
+    }
+
+    #[test]
+    fn test_parse_connection_key_optional_network_config() {
+        // The "n" field carries a ClientNetworkConfig block.
+        let json = r#"{"s":"1.2.3.4:443","k":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","n":{"client_ip":"10.8.0.2","server_vpn_ip":"10.8.0.1","prefix_len":24,"mtu":1400,"mdh_len":20}}"#;
+        let key = make_conn_key(json);
+        let val = parse_connection_key(&key).expect("must parse");
+        assert!(val.get("n").is_some(), "network config block must survive round-trip");
+    }
+
+    #[test]
+    fn test_parse_connection_key_with_server_pool() {
+        // The "pool" field carries a Vec<ServerEntry>.
+        let json = r#"{"s":"node1.example.com:443","k":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","pool":[{"addr":"node2.example.com:443"},{"addr":"node3.example.com:443"}]}"#;
+        let key = make_conn_key(json);
+        let val = parse_connection_key(&key).expect("must parse");
+        let pool = val["pool"].as_array().expect("pool must be an array");
+        assert_eq!(pool.len(), 2);
+    }
+
+    // ── invalid / malformed keys ──────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_connection_key_rejects_invalid_base64() {
+        let err = parse_connection_key("aivpn://this is not valid base64!!!");
+        assert!(err.is_err());
+        assert!(err.unwrap_err().contains("Invalid connection key"));
+    }
+
+    #[test]
+    fn test_parse_connection_key_rejects_non_json_payload() {
+        // Valid base64 but the decoded content is not JSON.
+        let bad = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"not json");
+        let err = parse_connection_key(&format!("aivpn://{}", bad));
+        assert!(err.is_err());
+        assert!(err.unwrap_err().contains("Malformed connection key"));
+    }
+
+    #[test]
+    fn test_parse_connection_key_empty_object_is_valid_json() {
+        // An empty JSON object parses without error (missing fields are caught
+        // later by the caller — that's not the parser's job).
+        let key = make_conn_key("{}");
+        assert!(parse_connection_key(&key).is_ok());
+    }
+
+    // ── fallback_network_config ───────────────────────────────────────────────
+
+    #[test]
+    fn test_fallback_network_config_parses_valid_ipv4() {
+        let cfg = fallback_network_config("10.0.0.5");
+        assert_eq!(cfg.client_ip.to_string(), "10.0.0.5");
+        assert_eq!(cfg.prefix_len, 24);
+        assert_eq!(cfg.mtu, DEFAULT_VPN_MTU);
+        assert_eq!(cfg.mdh_len, 20);
+        assert!(cfg.keepalive_secs.is_none());
+    }
+
+    // ── decode_base64_key ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_decode_base64_key_valid_32_bytes() {
+        // 32 zero bytes encoded in standard base64.
+        let b64 = base64::engine::general_purpose::STANDARD.encode([0u8; 32]);
+        let key = decode_base64_key("test key", &b64);
+        assert_eq!(key, [0u8; 32]);
     }
 }

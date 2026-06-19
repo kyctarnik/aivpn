@@ -15,6 +15,7 @@
 
 #include <linux/net.h>
 #include <linux/skbuff.h>
+#include <linux/socket.h>
 #include <net/sock.h>
 #include "udp_hook.h"
 #include "session_table.h"
@@ -142,4 +143,18 @@ void aivpn_udp_hook_remove(struct socket *sock)
 	release_sock(sk);
 
 	aivpn_info("UDP hook removed\n");
+}
+
+int aivpn_udp_hook_install_by_fd(int fd)
+{
+	struct socket *sock;
+	int err = 0;
+
+	sock = sockfd_lookup(fd, &err);
+	if (!sock)
+		return err ? err : -EBADF;
+
+	err = aivpn_udp_hook_install(sock);
+	sockfd_put(sock);
+	return err;
 }

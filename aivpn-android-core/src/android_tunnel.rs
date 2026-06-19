@@ -278,7 +278,7 @@ pub async fn run_tunnel_android(
     let dest: SocketAddr = tokio::select! {
         biased;
         _ = wait_for_stop_signal(&stop_signal) => {
-            return Err(Error::Session("Stop requested".into()));
+            return Ok(());
         }
         result = tokio::time::timeout(
             Duration::from_secs(5),
@@ -293,14 +293,14 @@ pub async fn run_tunnel_android(
     };
 
     if session.stop_requested.load(Ordering::SeqCst) {
-        return Err(Error::Session("Stop requested".into()));
+        return Ok(());
     }
 
     let raw_udp_fd = create_protected_udp_socket(&vm, &vpn_service, dest, &session)?;
 
     if session.stop_requested.load(Ordering::SeqCst) {
         unsafe { libc::close(raw_udp_fd) };
-        return Err(Error::Session("Stop requested".into()));
+        return Ok(());
     }
 
     // ── 3. Set TUN fd to non-blocking for AsyncFd ──
@@ -309,7 +309,11 @@ pub async fn run_tunnel_android(
         return Err(Error::Io(std::io::Error::last_os_error()));
     }
 
-    unsafe { libc::fcntl(owned_tun_fd, libc::F_SETFL, libc::O_NONBLOCK) };
+    let fcntl_ret = unsafe { libc::fcntl(owned_tun_fd, libc::F_SETFL, libc::O_NONBLOCK) };
+    if fcntl_ret < 0 {
+        unsafe { libc::close(owned_tun_fd) };
+        return Err(Error::Io(std::io::Error::last_os_error()));
+    }
     // SAFETY: this is Rust's private duplicate of the Android-owned TUN fd.
     let owned_tun = unsafe { OwnedFd::from_raw_fd(owned_tun_fd) };
     let tun = AsyncFd::new(owned_tun)?;
@@ -351,18 +355,21 @@ pub async fn run_tunnel_android(
 
         tokio::select! {
             _ = wait_for_stop_signal(&stop_signal) => {
-                return Err(Error::Session("Tunnel stop requested".into()));
+                return Ok(());
             }
 
             res = udp.recv(&mut recv_buf) => {
                 match res {
                     Ok(n) => break n,
+                    Err(_) if session.stop_requested.load(Ordering::SeqCst) => {
+                        return Ok(());
+                    }
                     Err(e) => return Err(Error::Io(e)),
                 }
             }
             _ = &mut retry => {
                 if session.stop_requested.load(Ordering::SeqCst) {
-                    return Err(Error::Session("Tunnel stop requested".into()));
+                    return Ok(());
                 }
                 retry_count += 1;
                 // Rotate keypair only once, on the 2nd retry (~1.5 s after first send).
@@ -448,7 +455,7 @@ pub async fn run_tunnel_android(
         tokio::select! {
             biased;
             _ = wait_for_stop_signal(&stop_signal) => {
-                return Err(Error::Session("Tunnel stop requested".into()));
+                return Ok(());
             }
             _ = tokio::time::sleep(Duration::from_millis(100)) => {
                 if let Ok(ka) = (ControlPayload::Keepalive { send_ts: 0 }).encode() {
@@ -549,6 +556,8 @@ pub async fn run_tunnel_android(
     let initial_mask = bootstrap_mask_for_psk(psk.as_ref());
     let mask_update_slot: Arc<Mutex<Option<MaskProfile>>> = Arc::new(Mutex::new(None));
     let mask_update_for_enc = Arc::clone(&mask_update_slot);
+    let key_rotate_slot: Arc<Mutex<Option<SessionKeys>>> = Arc::new(Mutex::new(None));
+    let key_rotate_for_enc = Arc::clone(&key_rotate_slot);
 
     let udp_tx = udp.clone();
     let keys_tx = keys.clone();
@@ -558,10 +567,25 @@ pub async fn run_tunnel_android(
             inner: MimicryEncryptor,
             session: Arc<SessionRuntime>,
             keepalive_sent_ms: Arc<AtomicU64>,
+            key_rotate_slot: Arc<Mutex<Option<SessionKeys>>>,
+        }
+
+        impl AndroidEncryptor {
+            fn check_key_rotation(&mut self) {
+                if let Some(new_keys) = self
+                    .key_rotate_slot
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .take()
+                {
+                    self.inner.update_keys(new_keys);
+                }
+            }
         }
 
         impl PacketEncryptor for AndroidEncryptor {
             fn encrypt_data(&mut self, payload: &[u8]) -> aivpn_common::error::Result<Vec<u8>> {
+                self.check_key_rotation();
                 self.inner.encrypt_data(payload)
             }
             fn encrypt_control(
@@ -595,6 +619,7 @@ pub async fn run_tunnel_android(
             ),
             session: session_for_upload,
             keepalive_sent_ms,
+            key_rotate_slot: key_rotate_for_enc,
         };
         enc.inner.set_fec_group(level.fec_n());
         let config = UploadConfig {
@@ -637,12 +662,20 @@ pub async fn run_tunnel_android(
                 }
                 tun_reader_task.abort();
                 upload_sender_task.abort();
-                return Err(Error::Session("Tunnel stop requested".into()));
+                return Ok(());
             }
 
             // ── UDP → TUN (inbound from server) ──
             r = udp.recv(&mut udp_buf) => {
-                let n = r?;
+                let n = match r {
+                    Ok(n) => n,
+                    Err(_) if session.stop_requested.load(Ordering::SeqCst) => {
+                        tun_reader_task.abort();
+                        upload_sender_task.abort();
+                        return Ok(());
+                    }
+                    Err(e) => return Err(Error::Io(e)),
+                };
                 log::debug!("aivpn: udp.recv() → {} bytes", n);
                 last_rx = Instant::now();
                 upload_at_last_rx = session.upload_bytes.load(Ordering::Relaxed);
@@ -723,6 +756,10 @@ pub async fn run_tunnel_android(
                                             Some(Instant::now() + Duration::from_secs(2));
                                         transition_recv_win = std::mem::take(&mut recv_win);
                                         keys = new_keys;
+                                        *key_rotate_slot
+                                            .lock()
+                                            .unwrap_or_else(|e| e.into_inner()) =
+                                            Some(keys.clone());
                                         log::info!("aivpn: inline PFS rekey complete");
                                     }
                                 }

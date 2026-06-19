@@ -43,21 +43,13 @@
 /**
  * aivpn_ktime_ms - return current monotonic time in milliseconds.
  *
- * ktime_get_ms() was added in 5.3; provide a shim for older kernels.
- * Our DESIGN.md requires 6.1 minimum so the shim is a belt-and-braces
- * guard for out-of-tree backports.
+ * ktime_get_ms() was removed in Linux 6.4; use ktime_to_ms(ktime_get())
+ * which is available on all kernels the module supports (6.1+).
  */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 3, 0)
-static inline u64 aivpn_ktime_ms(void)
-{
-	return ktime_get_ms();
-}
-#else
 static inline u64 aivpn_ktime_ms(void)
 {
 	return (u64)ktime_to_ms(ktime_get());
 }
-#endif
 
 /* ------------------------------------------------------------------ *
  *  netif_rx_ni compatibility shim                                      *

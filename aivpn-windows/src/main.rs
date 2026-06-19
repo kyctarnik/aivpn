@@ -231,6 +231,7 @@ pub struct AivpnApp {
     bench_rx: Option<std::sync::mpsc::Receiver<Option<vpn_manager::BenchResult>>>,
     // Device identity
     device_public_key: Option<String>,
+    device_key_rx: Option<std::sync::mpsc::Receiver<Option<String>>>,
     // Tray
     tray: Option<tray::TrayManager>,
     pub should_quit: bool,
@@ -240,7 +241,11 @@ pub struct AivpnApp {
 impl AivpnApp {
     fn new(tray: Option<tray::TrayManager>) -> Self {
         let vpn = VpnManager::new();
-        let device_public_key = vpn.get_device_public_key();
+        let binary = vpn.client_binary.clone();
+        let (key_tx, key_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = key_tx.send(VpnManager::get_device_public_key_from(&binary));
+        });
         Self {
             vpn,
             keys: KeyStorage::load(),
@@ -257,7 +262,8 @@ impl AivpnApp {
             error_message: None,
             error_timer: None,
             recording_service_name: String::new(),
-            device_public_key,
+            device_public_key: None,
+            device_key_rx: Some(key_rx),
             kill_switch: false,
             adaptive_level: 0,
             dns_proxy: String::new(),
@@ -296,6 +302,19 @@ impl eframe::App for AivpnApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.clear_old_error();
         self.vpn.poll_status();
+
+        // Poll device key loaded in background thread
+        let key_result = self.device_key_rx.as_ref().map(|rx| rx.try_recv());
+        match key_result {
+            Some(Ok(key)) => {
+                self.device_public_key = key;
+                self.device_key_rx = None;
+            }
+            Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
+                self.device_key_rx = None;
+            }
+            _ => {}
+        }
 
         // Keep event loop ticking (for tooltip updates while window is visible)
         ctx.request_repaint_after(std::time::Duration::from_secs(1));

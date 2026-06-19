@@ -1,73 +1,51 @@
-# Rust
-/target/
+# ── Rust ────────────────────────────────────────────────────────────────────
+target/
 **/target/
-target[ 0-9]*/
-**/target[ 0-9]*/
 *.rs.bk
 Cargo.lock
 
+# ── Build output ─────────────────────────────────────────────────────────────
+/releases/
 
-# Python
-__pycache__/
-*.pyc
-*.pyo
-*.egg-info/
+# Windows GUI build staging (make windows)
+aivpn-windows-gui-package/
+aivpn-windows-gui.zip
 
-# Build
-*.o
-*.a
-*.so
-*.dylib
-*.dll
+# Linux AppImage staging (make linux-appimage)
+AppDir-aivpn-linux/
 
-# IDE
-.idea/
-.vscode/
-*.swp
-*.swo
-*~
-.DS_Store
-
-# Logs
-*.log
-
-# Config (keep templates, ignore actual configs)
-config/*.json
-!config/*.example.json
-
-# Keys (never commit keys!)
+# ── Secrets & keys ──────────────────────────────────────────────────────────
 *.pem
 *.key
 *.secret
 secrets/
+.env
+*.env
+.secrets
+credentials.json
 
-# Docker
-*.dockerfile
+# ── Server config (keep templates, ignore real configs) ──────────────────────
+config/*.json
+!config/*.example.json
 
-# Test coverage
-coverage/
-*.gcov
-*.gcda
-*.gcno
+# ── Local machine config ─────────────────────────────────────────────────────
+# Machine-specific NDK / linker paths — never commit
+.cargo/
 
-# Temporary
-tmp/
-temp/
-*.tmp
+# ── Claude Code ──────────────────────────────────────────────────────────────
+.claude/
+CLAUDE.md
 
-# Documentation build
-docs/_build/
-
-# Internal documentation (not for public distribution)
-docs/
-
-# Android
+# ── Android ──────────────────────────────────────────────────────────────────
 aivpn-android/**/build/
 aivpn-android/**/bin/
 aivpn-android/.gradle/
-aivpn-android/**/local.properties
 aivpn-android/**/.cxx/
 aivpn-android/**/captures/
+aivpn-android/**/local.properties
+aivpn-android/**/local.properties.tmp
+aivpn-android/keystore.properties
+aivpn-android/*.jks
 *.apk
 *.idsig
 *.aab
@@ -76,66 +54,41 @@ aivpn-android/**/captures/
 *.class
 gen/
 
-# macOS app build output
+# ── macOS ────────────────────────────────────────────────────────────────────
 aivpn-macos/build/
+.DS_Store
 
-# Releases (pre-built binaries for download — ignored)
-/releases/
+# ── IDE ──────────────────────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
 
-# Backups (may contain server state / credentials)
-backups/
+# ── Logs & temp ──────────────────────────────────────────────────────────────
+*.log
+tmp/
+temp/
+*.tmp
 
-# Local test and development scripts (not for upstream)
-setup-docker-test.sh
-test-connection-key.sh
-test-full-tunnel-with-key.sh
-test-speed-detailed.sh
-test-speed-optimized.sh
-test-speed-simple.sh
-test-speed.sh
-test-throughput-benchmark.sh
-test-traffic.sh
-test-docker-full.sh
-test-docker-traffic.sh
-test-full-tunnel.sh
-test-throughput.sh
-test-with-key.sh
-connect-test.sh
-test-remote-speed.sh
-test-bench-macos.sh
-test-bench.sh
-docker-compose.dpi.yml
-test-dpi-emulation.sh
-build-windows-package.sh
-.tmp_docker_speed_test.sh
-.tmp_multi_client_test.sh
-deploy_recording_test.sh
-test-recording-local.sh
-test-speed-final.sh
-test_recording.sh
-test_record_youtube.sh
-test_connect_remote.sh
-run_macos_record_test.sh
-remote-speed-server.sh
-deploy-server-update.sh
-.tmp_update_remote_clients.py
-MACOS_RECORDING_TEST.md
-update-server.sh
-Dockerfile.windows-test
-Dockerfile.windows-test-full
-test-windows-docker-full.sh
-test-windows-docker.sh
+# ── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
 
-# Security: never commit deployment scripts or secrets
-deploy-release.sh
-deploy.py
-docker-entrypoint.sh
-deploy-server-release.sh
-deployment-config.sh
-.env
-*.env
-.secrets
-credentials.json
+# ── Compiled objects ─────────────────────────────────────────────────────────
+*.o
+*.a
+*.so
+*.dylib
+*.dll
 
-# Claude Code — local agent memory, never commit
-.claude/
+# ── Test coverage ────────────────────────────────────────────────────────────
+coverage/
+*.gcov
+*.gcda
+*.gcno
+
+# ── Internal docs (not for public distribution) ──────────────────────────────
+docs/

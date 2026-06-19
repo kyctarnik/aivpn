@@ -193,9 +193,7 @@ sudo ./aivpn-client -k "aivpn://..."
 在 macOS 上构建（需要 Xcode 15+）：
 
 ```
-rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
-cargo install xcodegen
-./scripts/build-ios.sh 您的TEAM_ID
+make ios TEAM_ID=您的TEAM_ID
 ```
 
 安装 `releases/aivpn-ios.ipa`：
@@ -351,37 +349,60 @@ cargo build --release --bin aivpn-server --features "management-api,metrics,neur
 
 ## 从源码构建
 
-要求：Rust 1.75+、`cargo`。
+要求：Rust 1.75+、`cargo`、`make`。
 
 ```
-git clone https://github.com/infosave2007/aivpn.git
+git clone https://github.com/infosave2007/aivpn
 cd aivpn
+make help          # 显示所有可用目标
+```
 
-# 构建所有工作区成员
-cargo build --release
+### 服务器构建（Linux）
 
-# 单独构建
-cargo build --release --bin aivpn-server
-cargo build --release --bin aivpn-client
+```
+make server        # x86_64 → releases/aivpn-server-linux-x86_64
+make server-arm64  # ARM64  → releases/aivpn-server-linux-arm64
+make server-docker # 通过 Docker 构建（主机依赖最少）
+```
 
-# 运行测试
-cargo test
+### 客户端构建
 
-# 静态 musl 交叉构建（ARMv7 / MIPSel）
-./scripts/build-musl-release.sh server armv7-unknown-linux-musleabihf
-./scripts/build-musl-release.sh client mipsel-unknown-linux-musl
+```
+make client        # Linux x86_64
+```
 
-# Docker 服务器构建（输出到 releases/）
-./scripts/build-server-release.sh
+### 静态 musl 构建（用于路由器）
 
-# Windows GUI（从 Linux 交叉编译）
-./scripts/build-windows-gui.sh
+```
+make server-musl-armv7    # ARMv7
+make server-musl-mipsel   # MIPSel
+make server-musl-aarch64  # AArch64
+```
 
-# iOS（macOS + Xcode 15+）
-rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
-cargo install xcodegen
-./scripts/build-ios.sh              # 未签名 / 模拟器
-./scripts/build-ios.sh 您的TEAM_ID # 设备签名
+### 各平台构建
+
+```
+make windows              # Windows GUI + zip（从 Linux 交叉编译）
+make windows-docker       # Windows GUI 通过 Docker（无需 mingw-w64）
+make ios TEAM_ID=XX       # iOS IPA（仅限 macOS + Xcode 15+）
+make macos                # macOS .app + .pkg + .dmg（仅限 macOS）
+make linux-appimage        # Linux AppImage
+```
+
+### 部署
+
+```
+make deploy               # VPS：下载二进制文件 + 启动 docker compose
+make server-deploy HOST=vps.example.com  # SSH：上传本地二进制文件到 VPS
+```
+
+### 测试与开发
+
+```
+make test           # cargo test --workspace
+make clippy         # cargo clippy
+make check          # cargo check（快速检查）
+make test-docker    # 集成测试：服务器 + 客户端在 Docker 中
 ```
 
 ### Android
@@ -545,7 +566,6 @@ aivpn/
 ├── aivpn-windows/
 ├── aivpn-macos/
 ├── mask-assets/
-├── scripts/
 ├── docker/
 ├── Dockerfile
 ├── docker-compose.yml

@@ -280,7 +280,13 @@ pub extern "system" fn Java_com_aivpn_client_AivpnJni_stopRecording(_env: JNIEnv
 // ──────────────────────────────────────────────────────────
 
 fn make_str(env: &mut JNIEnv, s: &str) -> jstring {
-    env.new_string(s)
-        .expect("make_str: new_string failed")
-        .into_raw()
+    if let Ok(js) = env.new_string(s) {
+        return js.into_raw();
+    }
+    // JVM may have a pending exception — clear it and retry rather than
+    // calling .expect() which would panic-abort the process.
+    let _ = env.exception_clear();
+    env.new_string("")
+        .map(|js| js.into_raw())
+        .unwrap_or(std::ptr::null_mut())
 }

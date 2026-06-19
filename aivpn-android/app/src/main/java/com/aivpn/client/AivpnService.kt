@@ -117,7 +117,7 @@ class AivpnService : VpnService() {
                 val profileId = intent.getStringExtra("profile_id") ?: return START_NOT_STICKY
                 loadAndStartVpnFromProfile(profileId)
             }
-            ACTION_DISCONNECT -> stopVpn()
+            ACTION_DISCONNECT -> stopVpn(startId)
             else -> {
                 // START_STICKY restart with null intent — OS restarted us after a kill.
                 // If no active session was in progress (e.g. we were killed while idle),
@@ -155,7 +155,9 @@ class AivpnService : VpnService() {
              savedMtlsCert != null && mtlsCert != null && savedMtlsCert.contentEquals(mtlsCert))
         val startupInFlight = restartJob?.isActive == true
         val tunnelLoopActive = serviceJob?.isActive == true
-        if (sameTarget && (startupInFlight || tunnelLoopActive)) {
+        // Allow reconnect after manual disconnect even if the old Rust call is still unwinding.
+        // The restartJob uses withTimeoutOrNull(3s)+cancelAndJoin to wait for the old session.
+        if (sameTarget && (startupInFlight || tunnelLoopActive) && !manualDisconnect) {
             Log.d(TAG, "Ignoring duplicate CONNECT while startup/session is already in progress")
             return
         }
@@ -199,7 +201,11 @@ class AivpnService : VpnService() {
                 closeTunnel()
 
                 createNotificationChannel()
-                startForeground(NOTIFICATION_ID, buildNotification(getString(R.string.notification_connecting)))
+                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                    startForeground(NOTIFICATION_ID, buildNotification(getString(R.string.notification_connecting)), android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+                } else {
+                    startForeground(NOTIFICATION_ID, buildNotification(getString(R.string.notification_connecting)))
+                }
 
                 unregisterNetworkCallback()
                 registerNetworkCallback()
@@ -224,12 +230,9 @@ class AivpnService : VpnService() {
                         sessionEstablished = false
                         networkTrigger = false
                         runTunnel()
-                        // Only close TUN when this session is still the active one.
-                        // A superseded session must not close the vpnInterface that the
-                        // new serviceJob just created in ensureVpnInterface() — doing so
-                        // passes an invalid fd to Rust and causes 0 RX on the 2nd connect.
-                        if (mySessionId == sessionId) closeTunnel()
-                        // runTunnel() returns normally only on Rust rekey trigger — reconnect fast.
+                        // runTunnel() returns normally only on Rust rekey/network trigger — reconnect fast.
+                        // Do NOT close the TUN here: keeping vpnInterface open means the next runTunnel()
+                        // reuses the same fd and Android keeps VPN routes active with no routing gap.
                         retryDelayMs = INITIAL_RETRY_DELAY_MS
                     } catch (e: CancellationException) {
                         throw e
@@ -237,7 +240,8 @@ class AivpnService : VpnService() {
                         Log.e(TAG, "Tunnel error: ${e.message}", e)
                         isRunning = false
                         if (manualDisconnect) break
-                        if (mySessionId == sessionId) closeTunnel()
+                        // Do NOT close TUN on error: reusing vpnInterface avoids establish()
+                        // race on reconnect and keeps VPN routes active during retry.
 
                         // Network-triggered reconnects and reconnects after an established
                         // session use zero delay so the switch feels instant.
@@ -523,7 +527,7 @@ class AivpnService : VpnService() {
 
     // ──────────── Stop ────────────
 
-    private fun stopVpn() {
+    private fun stopVpn(startId: Int? = null) {
         manualDisconnect = true
         isServiceActive = false
         restartJob?.cancel()
@@ -542,7 +546,11 @@ class AivpnService : VpnService() {
         val cb3 = statusCallback; cb3?.invoke(false, lastStatusText)
         val ticb1 = tileCallback; ticb1?.invoke()
         stopForeground(STOP_FOREGROUND_REMOVE)
-        stopSelf()
+        // Use stopSelf(startId) so Android does not destroy the service if a new
+        // ACTION_CONNECT intent arrived after this ACTION_DISCONNECT.  Without the
+        // startId guard, onDestroy() could fire and cancel a freshly-launched
+        // restartJob, leaving the UI stuck at "Connecting…" forever.
+        if (startId != null) stopSelf(startId) else stopSelf()
     }
 
     private fun closeTunnel() {
@@ -686,6 +694,7 @@ class AivpnService : VpnService() {
      */
     private suspend fun waitForConnectivity() {
         val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        var waitedMs = 0L
         while (currentCoroutineContext().isActive) {
             val active = findUsableUnderlyingNetwork(cm)
             val hasUsableActiveNetwork = active != null
@@ -701,7 +710,22 @@ class AivpnService : VpnService() {
             }
             if (hasAnyUsableNetwork) return
 
+            // Last resort: if any network (including our own VPN from a previous
+            // session) reports internet capability, proceed immediately.  As a
+            // VpnService we can replace any existing VPN interface, so blocking here
+            // when only the old VPN network is visible causes an infinite hang.
+            val hasAnyInternet = cm.allNetworks.any { net ->
+                cm.getNetworkCapabilities(net)
+                    ?.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) == true
+            }
+            if (hasAnyInternet) return
+
+            // Hard safety timeout: if absolutely no connectivity after 5 s, proceed
+            // anyway and let the DNS / handshake fail with a clear error message.
+            if (waitedMs >= 5_000L) return
+
             delay(300L)
+            waitedMs += 300L
         }
         throw CancellationException("Cancelled while waiting for network")
     }
@@ -715,7 +739,8 @@ class AivpnService : VpnService() {
 
     private fun isUsableUnderlyingNetwork(caps: NetworkCapabilities): Boolean {
         return !caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN) &&
-            caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+            caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+            caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
     }
 
     // ──────────── Address parsing ────────────
