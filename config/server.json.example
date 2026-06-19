@@ -7,7 +7,7 @@
     "server_vpn_ip": "10.0.0.1",
     "prefix_len": 24,
     "mtu": "auto",
-    "keepalive_secs": null,
+    "keepalive_secs": 8,
     "ipv6_enabled": false,
     "ipv6_prefix": "fd10:cafe::/48"
   },
