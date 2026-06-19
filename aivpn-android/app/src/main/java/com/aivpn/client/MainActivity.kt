@@ -677,13 +677,15 @@ class MainActivity : AppCompatActivity() {
                     getString(R.string.adaptive_aggressive),
                     getString(R.string.adaptive_satellite)
                 )
+                var selectedLevel = adaptiveLevel()
                 AlertDialog.Builder(this)
                     .setTitle(getString(R.string.adaptive_mode))
-                    .setMessage(getString(R.string.desc_adaptive_mode))
-                    .setSingleChoiceItems(names, adaptiveLevel()) { dlg, which ->
+                    .setSingleChoiceItems(names, selectedLevel) { _, which ->
+                        selectedLevel = which
+                    }
+                    .setPositiveButton(android.R.string.ok) { _, _ ->
                         getSharedPreferences("aivpn_prefs", MODE_PRIVATE)
-                            .edit().putInt("adaptive_level", which).apply()
-                        dlg.dismiss()
+                            .edit().putInt("adaptive_level", selectedLevel).apply()
                     }
                     .setNegativeButton(getString(R.string.btn_cancel), null)
                     .show()

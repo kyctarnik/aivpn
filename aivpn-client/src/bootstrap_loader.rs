@@ -493,4 +493,88 @@ mod tests {
         assert_eq!(config.channels[2].channel_type(), "GitHub");
         assert_eq!(config.channels[3].channel_type(), "IPFS");
     }
+
+    #[test]
+    fn test_validate_bootstrap_url_accepts_https() {
+        assert!(validate_bootstrap_url("https://cdn.example.com/descriptors.json").is_ok());
+        assert!(validate_bootstrap_url("https://cdn.example.com:8443/path").is_ok());
+        assert!(validate_bootstrap_url("https://example.org").is_ok());
+    }
+
+    #[test]
+    fn test_validate_bootstrap_url_rejects_http() {
+        let err = validate_bootstrap_url("http://cdn.example.com/descriptors.json");
+        assert!(err.is_err());
+        assert!(err.unwrap_err().to_string().contains("HTTPS"));
+    }
+
+    #[test]
+    fn test_validate_bootstrap_url_rejects_custom_scheme() {
+        assert!(validate_bootstrap_url("ftp://cdn.example.com/file").is_err());
+        assert!(validate_bootstrap_url("file:///etc/passwd").is_err());
+    }
+
+    #[test]
+    fn test_validate_bootstrap_url_rejects_localhost() {
+        assert!(validate_bootstrap_url("https://localhost/descriptors").is_err());
+        assert!(validate_bootstrap_url("https://127.0.0.1/descriptors").is_err());
+        assert!(validate_bootstrap_url("https://127.0.0.5:8080/path").is_err());
+    }
+
+    #[test]
+    fn test_validate_bootstrap_url_rejects_private_ranges() {
+        assert!(validate_bootstrap_url("https://10.0.0.1/descriptors").is_err());
+        assert!(validate_bootstrap_url("https://192.168.1.100/descriptors").is_err());
+        assert!(validate_bootstrap_url("https://172.16.0.1/descriptors").is_err());
+        assert!(validate_bootstrap_url("https://172.31.255.255/descriptors").is_err());
+        // 172.32.x.x is outside the /12 block — must be accepted
+        assert!(validate_bootstrap_url("https://172.32.0.1/descriptors").is_ok());
+    }
+
+    #[test]
+    fn test_validate_bootstrap_url_rejects_link_local() {
+        assert!(validate_bootstrap_url("https://169.254.1.1/descriptors").is_err());
+    }
+
+    #[test]
+    fn test_parse_descriptors_from_json_single_object() {
+        // parse_descriptors_from_json accepts a single JSON object as well as an array.
+        // A well-formed but unsigned descriptor with zero signature should round-trip through
+        // the parser (store_verified_descriptor with None key accepts zero-sig descriptors).
+        let temp = std::env::temp_dir().join("aivpn_parse_test");
+        let _ = std::fs::create_dir_all(&temp);
+        let old_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &temp);
+
+        let desc_json = r#"{
+            "descriptor_id": "parse_single_test",
+            "version": 1,
+            "created_at": 0,
+            "expires_at": 9999999999,
+            "base_mask_ids": [],
+            "embedded_masks": [],
+            "candidate_count": 1,
+            "kdf_salt": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+            "signature": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
+        }"#;
+
+        let result = parse_descriptors_from_json(desc_json);
+        assert!(result.is_ok());
+        let descs = result.unwrap();
+        assert_eq!(descs.len(), 1);
+        assert_eq!(descs[0].descriptor_id, "parse_single_test");
+
+        if let Some(h) = old_home {
+            std::env::set_var("HOME", h);
+        } else {
+            std::env::remove_var("HOME");
+        }
+        let _ = std::fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn test_parse_descriptors_from_json_invalid() {
+        let result = parse_descriptors_from_json("not valid json at all !!!!");
+        assert!(result.is_err());
+    }
 }

@@ -1471,3 +1471,152 @@ impl SessionManager {
         info!("Session inline rekey complete (new keys installed)");
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aivpn_common::crypto::{SessionKeys, CHACHA20_KEY_SIZE};
+
+    fn make_keys(seed: u8) -> SessionKeys {
+        SessionKeys {
+            session_key: [seed; CHACHA20_KEY_SIZE],
+            tag_secret: [seed + 1; 32],
+            prng_seed: [seed + 2; 32],
+        }
+    }
+
+    fn make_session() -> Session {
+        let session_id = [0u8; 16];
+        let addr: std::net::SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        Session::new(session_id, addr, make_keys(1), [0u8; X25519_PUBLIC_KEY_SIZE])
+    }
+
+    // ── u256 bitmap ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn u256_set_and_get_bit_low_range() {
+        let mut b = u256 { lo: 0, hi: 0 };
+        b.set_bit(0);
+        assert!(b.get_bit(0));
+        assert!(!b.get_bit(1));
+    }
+
+    #[test]
+    fn u256_set_and_get_bit_boundary_127() {
+        let mut b = u256 { lo: 0, hi: 0 };
+        b.set_bit(127);
+        assert!(b.get_bit(127));
+        assert!(!b.get_bit(126));
+        assert!(!b.get_bit(128));
+    }
+
+    #[test]
+    fn u256_set_and_get_bit_high_range() {
+        let mut b = u256 { lo: 0, hi: 0 };
+        b.set_bit(128);
+        assert!(b.get_bit(128));
+        assert!(!b.get_bit(127));
+        b.set_bit(255);
+        assert!(b.get_bit(255));
+    }
+
+    #[test]
+    fn u256_shift_left_moves_bits() {
+        let mut b = u256 { lo: 0, hi: 0 };
+        b.set_bit(0);
+        b.shift_left(1);
+        assert!(!b.get_bit(0));
+        assert!(b.get_bit(1));
+    }
+
+    #[test]
+    fn u256_shift_left_by_256_clears_all() {
+        let mut b = u256 { lo: u128::MAX, hi: u128::MAX };
+        b.shift_left(256);
+        assert!(!b.get_bit(0));
+        assert!(!b.get_bit(255));
+    }
+
+    #[test]
+    fn u256_shift_left_across_128_boundary() {
+        let mut b = u256 { lo: 0, hi: 0 };
+        b.set_bit(127);
+        b.shift_left(1);
+        assert!(!b.get_bit(127));
+        assert!(b.get_bit(128));
+    }
+
+    #[test]
+    fn u256_clear_zeroes_all_bits() {
+        let mut b = u256 { lo: u128::MAX, hi: u128::MAX };
+        b.clear();
+        assert!(!b.get_bit(0));
+        assert!(!b.get_bit(255));
+    }
+
+    #[test]
+    fn u256_multiple_bits_independent() {
+        let mut b = u256 { lo: 0, hi: 0 };
+        b.set_bit(5);
+        b.set_bit(130);
+        assert!(b.get_bit(5));
+        assert!(b.get_bit(130));
+        assert!(!b.get_bit(6));
+        assert!(!b.get_bit(129));
+    }
+
+    // ── Session state & anti-replay ───────────────────────────────────────────
+
+    #[test]
+    fn session_initial_state_is_pending() {
+        let s = make_session();
+        assert!(matches!(s.state, SessionState::Pending));
+    }
+
+    #[test]
+    fn session_initial_counters_are_zero() {
+        let s = make_session();
+        assert_eq!(s.counter, 0);
+        assert_eq!(s.send_counter, 0);
+    }
+
+    #[test]
+    fn mark_tag_received_advances_counter() {
+        let mut s = make_session();
+        s.mark_tag_received(5);
+        assert_eq!(s.counter, 5);
+    }
+
+    #[test]
+    fn mark_tag_received_older_counter_does_not_regress() {
+        let mut s = make_session();
+        s.mark_tag_received(10);
+        s.mark_tag_received(3);
+        assert_eq!(s.counter, 10);
+    }
+
+    #[test]
+    fn replay_detected_after_mark_tag_received() {
+        let mut s = make_session();
+        s.update_tag_window();
+
+        // Take any precomputed tag from the window.
+        let (counter, tag) = s
+            .expected_tags
+            .iter()
+            .next()
+            .map(|(&c, &t)| (c, t))
+            .expect("expected_tags must be non-empty after update_tag_window");
+
+        // First receipt must be accepted.
+        assert!(s.validate_tag(&tag).is_some());
+
+        // Mark it as received.
+        s.mark_tag_received(counter);
+
+        // Replay: same tag must be rejected (bitmap bit is now set).
+        // Re-generate the window so the tag stays in the lookup table.
+        s.update_tag_window();
+        assert!(s.validate_tag(&tag).is_none(), "replay must be rejected");
+    }
+}

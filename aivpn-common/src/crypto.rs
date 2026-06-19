@@ -297,4 +297,93 @@ mod tests {
         assert_ne!(tag1, tag2); // Different counter
         assert_eq!(tag1, tag3); // Same counter and window
     }
+
+    #[test]
+    fn test_decrypt_wrong_key_returns_err() {
+        let key = [1u8; CHACHA20_KEY_SIZE];
+        let wrong_key = [2u8; CHACHA20_KEY_SIZE];
+        let nonce = [0u8; NONCE_SIZE];
+        let plaintext = b"secret data";
+
+        let ciphertext = encrypt_payload(&key, &nonce, plaintext).unwrap();
+        let result = decrypt_payload(&wrong_key, &nonce, &ciphertext);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_resonance_tag_deterministic() {
+        let tag_secret = [7u8; 32];
+        let counter = 42u64;
+        let window = 5000u64;
+
+        let tag_a = generate_resonance_tag(&tag_secret, counter, window);
+        let tag_b = generate_resonance_tag(&tag_secret, counter, window);
+
+        assert_eq!(tag_a, tag_b);
+        assert_eq!(tag_a.len(), TAG_SIZE);
+    }
+
+    #[test]
+    fn test_resonance_tag_changes_with_counter() {
+        let tag_secret = [9u8; 32];
+        let window = 1000u64;
+
+        let tags: Vec<_> = (0u64..4)
+            .map(|c| generate_resonance_tag(&tag_secret, c, window))
+            .collect();
+
+        // All four tags must be distinct
+        for i in 0..tags.len() {
+            for j in (i + 1)..tags.len() {
+                assert_ne!(tags[i], tags[j], "tags[{i}] == tags[{j}]");
+            }
+        }
+    }
+
+    #[test]
+    fn test_hmac_sha256_deterministic() {
+        let key = b"test-hmac-key";
+        let data = b"test-data";
+
+        let mac1 = hmac_sha256(key, data);
+        let mac2 = hmac_sha256(key, data);
+
+        assert_eq!(mac1, mac2);
+        assert_eq!(mac1.len(), 32);
+    }
+
+    #[test]
+    fn test_hmac_sha256_different_keys_differ() {
+        let data = b"same-data";
+        let mac1 = hmac_sha256(b"key-one", data);
+        let mac2 = hmac_sha256(b"key-two", data);
+
+        assert_ne!(mac1, mac2);
+    }
+
+    #[test]
+    fn test_derive_session_keys_deterministic() {
+        let dh = [0xabu8; 32];
+        let psk = [0xcdu8; 32];
+        let eph_pub = [0xefu8; X25519_PUBLIC_KEY_SIZE];
+
+        let keys1 = derive_session_keys(&dh, Some(&psk), &eph_pub);
+        let keys2 = derive_session_keys(&dh, Some(&psk), &eph_pub);
+
+        assert_eq!(keys1.session_key, keys2.session_key);
+        assert_eq!(keys1.tag_secret, keys2.tag_secret);
+        assert_eq!(keys1.prng_seed, keys2.prng_seed);
+    }
+
+    #[test]
+    fn test_derive_session_keys_psk_changes_output() {
+        let dh = [0x11u8; 32];
+        let eph_pub = [0x22u8; X25519_PUBLIC_KEY_SIZE];
+
+        let with_psk = derive_session_keys(&dh, Some(&[0x33u8; 32]), &eph_pub);
+        let without_psk = derive_session_keys(&dh, None, &eph_pub);
+
+        assert_ne!(with_psk.session_key, without_psk.session_key);
+    }
 }
