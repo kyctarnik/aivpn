@@ -25,14 +25,14 @@ ENV CXX_x86_64_pc_windows_gnu=x86_64-w64-mingw32-g++
 # Copy workspace
 COPY Cargo.toml ./
 COPY Cargo.lock* ./
-COPY aivpn-common aivpn-common/
-COPY aivpn-client aivpn-client/
-COPY aivpn-server aivpn-server/
-COPY aivpn-android-core aivpn-android-core/
-COPY aivpn-windows aivpn-windows/
-COPY aivpn-ios-core aivpn-ios-core/
-COPY aivpn-linux aivpn-linux/
-COPY aivpn-common/mask-assets mask-assets/
+COPY crates/aivpn-common crates/aivpn-common/
+COPY crates/aivpn-client crates/aivpn-client/
+COPY crates/aivpn-server crates/aivpn-server/
+COPY crates/aivpn-android-core crates/aivpn-android-core/
+COPY crates/aivpn-windows crates/aivpn-windows/
+COPY crates/aivpn-ios-core crates/aivpn-ios-core/
+COPY crates/aivpn-linux crates/aivpn-linux/
+COPY assets/masks assets/masks/
 
 # Build Windows client in release mode (GNU ABI)
 RUN cargo build --release --target x86_64-pc-windows-gnu --bin aivpn-client

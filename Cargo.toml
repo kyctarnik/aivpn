@@ -1,17 +1,17 @@
 [workspace]
 members = [
-    "aivpn-common",
-    "aivpn-client",
-    "aivpn-server",
-    "aivpn-android-core",
-    "aivpn-ios-core",
-    "aivpn-windows",
-    "aivpn-linux",
+    "crates/aivpn-common",
+    "crates/aivpn-client",
+    "crates/aivpn-server",
+    "crates/aivpn-android-core",
+    "crates/aivpn-ios-core",
+    "crates/aivpn-windows",
+    "crates/aivpn-linux",
 ]
 default-members = [
-    "aivpn-common",
-    "aivpn-client",
-    "aivpn-server",
+    "crates/aivpn-common",
+    "crates/aivpn-client",
+    "crates/aivpn-server",
 ]
 resolver = "2"
 

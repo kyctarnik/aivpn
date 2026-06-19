@@ -14,14 +14,14 @@ RUN apt-get update && apt-get install -y \
 
 # Copy workspace
 COPY Cargo.toml ./
-COPY aivpn-common aivpn-common/
-COPY aivpn-server aivpn-server/
-COPY aivpn-client aivpn-client/
-COPY aivpn-android-core aivpn-android-core/
-COPY aivpn-windows aivpn-windows/
-COPY aivpn-ios-core aivpn-ios-core/
-COPY aivpn-linux aivpn-linux/
-COPY aivpn-common/mask-assets mask-assets/
+COPY crates/aivpn-common crates/aivpn-common/
+COPY crates/aivpn-server crates/aivpn-server/
+COPY crates/aivpn-client crates/aivpn-client/
+COPY crates/aivpn-android-core crates/aivpn-android-core/
+COPY crates/aivpn-windows crates/aivpn-windows/
+COPY crates/aivpn-ios-core crates/aivpn-ios-core/
+COPY crates/aivpn-linux crates/aivpn-linux/
+COPY assets/masks assets/masks/
 
 # Build in release mode (Cargo.lock is auto-generated if missing)
 RUN cargo build --release --bin aivpn-server
@@ -45,7 +45,7 @@ WORKDIR /app
 
 # Copy binary from builder
 COPY --from=builder /app/target/release/aivpn-server /usr/local/bin/aivpn-server
-COPY docker/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+COPY deploy/docker/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
 # Create config directory and TUN device node
 RUN mkdir -p /etc/aivpn /dev/net /var/lib/aivpn/bootstrap /var/lib/aivpn/masks && \
@@ -55,10 +55,10 @@ RUN mkdir -p /etc/aivpn /dev/net /var/lib/aivpn/bootstrap /var/lib/aivpn/masks &
     mkdir -p /usr/share/aivpn
 
 # Copy example config
-COPY config/server.json.example /usr/share/aivpn/server.json.example
+COPY deploy/config/server.json.example /usr/share/aivpn/server.json.example
 
 # Seed preset masks so server has masks on first run
-COPY aivpn-common/mask-assets/*.json /usr/share/aivpn/preset-masks/
+COPY assets/masks/*.json /usr/share/aivpn/preset-masks/
 
 # Expose port
 EXPOSE 443/udp

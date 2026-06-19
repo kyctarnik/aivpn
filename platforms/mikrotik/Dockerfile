@@ -13,14 +13,14 @@ ARG TARGET_TRIPLE
 
 WORKDIR /app
 COPY Cargo.toml ./
-COPY aivpn-common aivpn-common/
-COPY aivpn-client aivpn-client/
-COPY aivpn-server aivpn-server/
-COPY aivpn-android-core aivpn-android-core/
-COPY aivpn-ios-core aivpn-ios-core/
-COPY aivpn-windows aivpn-windows/
-COPY aivpn-linux aivpn-linux/
-COPY aivpn-common/mask-assets mask-assets/
+COPY crates/aivpn-common crates/aivpn-common/
+COPY crates/aivpn-client crates/aivpn-client/
+COPY crates/aivpn-server crates/aivpn-server/
+COPY crates/aivpn-android-core crates/aivpn-android-core/
+COPY crates/aivpn-ios-core crates/aivpn-ios-core/
+COPY crates/aivpn-windows crates/aivpn-windows/
+COPY crates/aivpn-linux crates/aivpn-linux/
+COPY assets/masks assets/masks/
 
 RUN cargo build --release --target "${TARGET_TRIPLE}" -p aivpn-client --bin aivpn-client \
     && cp "target/${TARGET_TRIPLE}/release/aivpn-client" /aivpn-client
@@ -31,7 +31,7 @@ RUN apk add --no-cache iproute2 ca-certificates \
     && rm -rf /var/cache/apk/*
 
 COPY --from=builder /aivpn-client /usr/local/bin/aivpn-client
-COPY aivpn-mikrotik/entrypoint.sh /entrypoint.sh
+COPY platforms/mikrotik/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh /usr/local/bin/aivpn-client
 
 # Required at runtime: /dev/net/tun must be mounted from RouterOS host

@@ -25,7 +25,7 @@ use std::sync::Arc;
 use tracing::{error, info};
 
 const DEFAULT_SERVER_CONFIG_PATH: &str = "/etc/aivpn/server.json";
-const LOCAL_SERVER_CONFIG_PATH: &str = "config/server.json";
+const LOCAL_SERVER_CONFIG_PATH: &str = "deploy/config/server.json";
 const DEFAULT_LISTEN_ADDR: &str = "0.0.0.0:443";
 
 /// `"auto"` or a fixed number in `server.json` `tun_mtu` field.

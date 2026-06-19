@@ -17,7 +17,7 @@ WORKDIR /app
 
 # Copy prebuilt Linux server binary from releases/
 COPY releases/aivpn-server-linux-x86_64 /usr/local/bin/aivpn-server
-COPY docker/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+COPY deploy/docker/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/aivpn-server
 
 # Create config directory, mask directory and TUN device node
@@ -28,10 +28,10 @@ RUN mkdir -p /etc/aivpn /var/lib/aivpn/masks /dev/net && \
     mkdir -p /usr/share/aivpn
 
 # Copy example config
-COPY config/server.json.example /usr/share/aivpn/server.json.example
+COPY deploy/config/server.json.example /usr/share/aivpn/server.json.example
 
 # Seed preset masks so server has masks on first run
-COPY aivpn-common/mask-assets/*.json /usr/share/aivpn/preset-masks/
+COPY assets/masks/*.json /usr/share/aivpn/preset-masks/
 
 # Expose port
 EXPOSE 443/udp
