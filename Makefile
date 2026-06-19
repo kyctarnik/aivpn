@@ -9,6 +9,9 @@
 .DEFAULT_GOAL := help
 MAKEFLAGS     += --no-print-directory
 
+# Ensure rustup-managed cargo/rustc take priority over any system package.
+export PATH := $(HOME)/.cargo/bin:$(PATH)
+
 APP_VERSION := $(shell awk -F'"' '/^\[workspace\.package\]/{p=1} p && /^version/{print $$2; exit}' Cargo.toml)
 
 # iOS Apple Team ID — pass as: make ios TEAM_ID=AB12CD34EF
