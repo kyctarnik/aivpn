@@ -633,14 +633,12 @@ android:
 	echo "NDK: $$NDK_ROOT"; \
 	echo "sdk.dir=$$SDK_ROOT" > aivpn-android/local.properties; \
 	echo "==> Building Android APK (release)..."; \
-	cd aivpn-android && bash build-rust-android.sh release; \
-	APK="$$(find aivpn-android -name '*.apk' | grep release | head -1)"; \
-	if [ -n "$$APK" ]; then \
-	    mkdir -p releases; \
-	    cp "$$APK" releases/aivpn-android.apk; \
+	(cd aivpn-android && bash build-rust-android.sh release); \
+	if [ -f releases/aivpn-client.apk ]; then \
+	    cp releases/aivpn-client.apk releases/aivpn-android.apk; \
 	    echo "→ releases/aivpn-android.apk"; \
 	else \
-	    echo "WARN: APK not found at expected path — check aivpn-android/app/build/outputs/"; \
+	    echo "ERROR: APK not found at releases/aivpn-client.apk"; exit 1; \
 	fi
 
 # ─────────────────────────────────────────────────────────────────────────────
