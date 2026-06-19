@@ -21,10 +21,8 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Build Linux server asset via Docker builder stage
-        run: |
-          chmod +x ./scripts/build-server-release.sh
-          ./scripts/build-server-release.sh
+      - name: Build Linux server asset via Docker
+        run: make server-docker
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
@@ -48,17 +46,8 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Build macOS client binaries
-        run: |
-          rustup target add x86_64-apple-darwin aarch64-apple-darwin
-          cargo build --release --bin aivpn-client --target x86_64-apple-darwin
-          cargo build --release --bin aivpn-client --target aarch64-apple-darwin
-
-      - name: Build macOS installer artifacts
-        run: |
-          mkdir -p releases
-          chmod +x ./aivpn-macos/build.sh
-          ./aivpn-macos/build.sh
+      - name: Build macOS .app + .pkg + .dmg
+        run: make macos
 
       - name: Upload macOS workflow artifacts
         uses: actions/upload-artifact@v4
@@ -103,16 +92,13 @@ jobs:
           echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/27.2.12479018" >> "$GITHUB_ENV"
 
       - name: Build Android release APK
-        run: |
-          cd aivpn-android
-          chmod +x ./build-rust-android.sh
-          ./build-rust-android.sh release
+        run: make android ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT ANDROID_NDK_ROOT=$ANDROID_NDK_HOME
 
       - name: Upload Android workflow artifact
         uses: actions/upload-artifact@v4
         with:
           name: aivpn-client-android-apk
-          path: releases/aivpn-client.apk
+          path: releases/aivpn-android.apk
           if-no-files-found: error
 
       - name: Publish Android APK to GitHub Release
@@ -120,7 +106,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.event.release.tag_name || github.event.inputs.tag }}
-          files: releases/aivpn-client.apk
+          files: releases/aivpn-android.apk
           fail_on_unmatched_files: true
 
   build-musl-release-assets:
@@ -129,17 +115,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - package_kind: server
-            target: armv7-unknown-linux-musleabihf
+          - make_target: server-musl-armv7
             artifact_name: aivpn-server-linux-armv7-musleabihf
-          - package_kind: server
-            target: mipsel-unknown-linux-musl
+          - make_target: server-musl-mipsel
             artifact_name: aivpn-server-linux-mipsel-musl
-          - package_kind: client
-            target: armv7-unknown-linux-musleabihf
+          - make_target: client-musl-armv7
             artifact_name: aivpn-client-linux-armv7-musleabihf
-          - package_kind: client
-            target: mipsel-unknown-linux-musl
+          - make_target: client-musl-mipsel
             artifact_name: aivpn-client-linux-mipsel-musl
 
     steps:
@@ -147,9 +129,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Build musl release artifact
-        run: |
-          chmod +x ./scripts/build-musl-release.sh
-          ./scripts/build-musl-release.sh "${{ matrix.package_kind }}" "${{ matrix.target }}"
+        run: make ${{ matrix.make_target }}
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
@@ -178,20 +158,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y mingw-w64 nsis zip
 
-      - name: Add Windows target
-        run: |
-          rustup target add x86_64-pc-windows-gnu
-
       - name: Build Windows release assets
         env:
           CC_x86_64_pc_windows_gnu: x86_64-w64-mingw32-gcc
           CXX_x86_64_pc_windows_gnu: x86_64-w64-mingw32-g++
-        run: |
-          mkdir -p releases
-          chmod +x ./scripts/build-windows-gui.sh
-          ./scripts/build-windows-gui.sh
-          # Move zip package to releases directory
-          mv aivpn-windows-gui.zip releases/
+        run: make windows
 
       - name: Upload Windows workflow artifacts
         uses: actions/upload-artifact@v4
@@ -222,14 +193,8 @@ jobs:
       - name: Install XcodeGen
         run: brew install xcodegen
 
-      - name: Add iOS targets
-        run: |
-          rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
-
-      - name: Build iOS release asset
-        run: |
-          chmod +x ./scripts/build-ios.sh
-          ./scripts/build-ios.sh
+      - name: Build iOS IPA
+        run: make ios
 
       - name: Upload iOS workflow artifact
         uses: actions/upload-artifact@v4
