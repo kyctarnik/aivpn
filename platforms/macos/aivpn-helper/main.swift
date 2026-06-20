@@ -1,0 +1,792 @@
+#!/usr/bin/env swift
+// ═══════════════════════════════════════════════════════════════
+// AIVPN Privileged Helper Daemon v1.1.0
+//
+// Manages aivpn-client process on behalf of the AIVPN GUI app.
+// Communicates via JSON over Unix domain socket.
+// Installed as LaunchDaemon — runs as root, no password prompts.
+// ═══════════════════════════════════════════════════════════════
+
+import Foundation
+import Darwin
+import SystemConfiguration
+
+// MARK: - Constants
+
+let SOCKET_PATH = "/var/run/aivpn/helper.sock"
+let DEFAULT_CLIENT_PATH = "/Library/Application Support/AIVPN/aivpn-client"
+let ALLOWED_CLIENT_PATHS = [
+    "/Applications/AIVPN.app/Contents/MacOS/aivpn-client",
+    "/Applications/AIVPN.app/Contents/Resources/aivpn-client",
+    DEFAULT_CLIENT_PATH,
+]
+let LOG_PATH = "/var/run/aivpn/client.log"
+let PID_PATH = "/var/run/aivpn/client.pid"
+let RECORDING_STATUS_PATH = "/var/run/aivpn/recording.status"
+let RECORDING_STATUS_FALLBACK_PATH = "/tmp/aivpn-recording.status"
+let HELPER_VERSION = "1.1.0"
+
+// MARK: - Protocol Types
+
+struct HelperRequest: Codable {
+    let action: String       // connect, disconnect, status, ping, log
+    let key: String?         // connection key (for connect)
+    let fullTunnel: Bool?    // full tunnel mode (for connect)
+    let binaryPath: String?  // custom binary path (for connect/dev)
+    let service: String?     // service name (for record_start)
+    let mtlsCertPath: String? // optional path to mTLS client cert file (for connect)
+    let excludeRoutes: String? // comma-separated CIDRs to bypass the VPN (split tunnel)
+    let adaptiveLevel: Int?   // 0=Off, 1=Light, 2=Aggressive, 3=Satellite; nil treated as 0
+    let dnsProxy: String?      // local bind address for DNS proxy (e.g. "127.0.0.1:5300")
+    let killSwitch: Bool?      // block all non-VPN traffic when true
+}
+
+struct HelperResponse: Codable {
+    let status: String       // ok, error
+    let message: String
+    let connected: Bool?
+    let pid: Int?
+    let version: String?
+    let log: String?
+
+    init(status: String, message: String,
+         connected: Bool? = nil, pid: Int? = nil,
+         version: String? = nil, log: String? = nil) {
+        self.status = status
+        self.message = message
+        self.connected = connected
+        self.pid = pid
+        self.version = version
+        self.log = log
+    }
+}
+
+// MARK: - Global State
+
+var managedPID: pid_t = 0
+var isConnected = false
+
+// MARK: - Logging
+
+func log(_ message: String) {
+    let ts = DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .medium)
+    fputs("[\(ts)] \(message)\n", stderr)
+}
+
+// MARK: - Shell Escaping
+
+func shellEscape(_ str: String) -> String {
+    return "'" + str.replacingOccurrences(of: "'", with: "'\"'\"'") + "'"
+}
+
+// MARK: - Process Management
+
+/// Kill any existing aivpn-client process
+func killExistingClient() {
+    if managedPID > 0 {
+        if kill(managedPID, 0) == 0 {
+            log("Stopping aivpn-client (PID: \(managedPID))")
+            kill(managedPID, SIGTERM)
+            for _ in 0..<10 {
+                usleep(100_000)
+                if kill(managedPID, 0) != 0 { break }
+            }
+            if kill(managedPID, 0) == 0 {
+                kill(managedPID, SIGKILL)
+            }
+        }
+        managedPID = 0
+        isConnected = false
+    }
+
+    // Check PID file for orphaned processes
+    if let pidStr = try? String(contentsOfFile: PID_PATH, encoding: .utf8) {
+        let trimmed = pidStr.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let pid = Int32(trimmed), pid > 0 {
+            if kill(pid, 0) == 0 {
+                log("Stopping orphaned aivpn-client (PID: \(pid))")
+                kill(pid, SIGTERM)
+                usleep(500_000)
+                if kill(pid, 0) == 0 {
+                    kill(pid, SIGKILL)
+                }
+            }
+        }
+    }
+
+    try? FileManager.default.removeItem(atPath: PID_PATH)
+    
+    // Restore IPv6 after stopping client
+    restoreIPv6()
+}
+
+/// Restore IPv6 routing after VPN disconnect.
+/// The Rust client's Drop impl already removes the blackhole and restores the
+/// saved interface on clean exit.  This function is a safety net for cases where
+/// the client process is killed externally (e.g. `killall`).
+/// We only remove the blackhole here — we do NOT try to add the default route
+/// back because we don't know which interface was active (that knowledge lives
+/// in the Rust process).  macOS re-discovers the IPv6 gateway automatically
+/// via ND/SLAAC once the blackhole is gone.
+func restoreIPv6() {
+    log("Clearing IPv6 blackhole (safety net)...")
+
+    // Remove the blackhole if it still exists.
+    let removed = runCommand("/sbin/route",
+                             args: ["-n", "delete", "-inet6", "-net", "::/0", "-blackhole"])
+    if removed {
+        log("IPv6 blackhole removed — macOS will auto-restore via ND/SLAAC")
+    } else {
+        log("No IPv6 blackhole found (already removed by Rust client on clean exit)")
+    }
+}
+
+/// Run a command and return success
+func runCommand(_ path: String, args: [String]) -> Bool {
+    let task = Process()
+    task.launchPath = path
+    task.arguments = args
+    do {
+        try task.run()
+        task.waitUntilExit()
+        return task.terminationStatus == 0
+    } catch {
+        log("Command failed: \(path) \(args.joined(separator: " ")) - \(error)")
+        return false
+    }
+}
+
+/// Start aivpn-client with the given configuration using posix_spawn
+func startClient(key: String, fullTunnel: Bool, binaryPath: String?, mtlsCertPath: String? = nil, excludeRoutes: String? = nil, adaptiveLevel: Int = 0, dnsProxy: String? = nil, killSwitch: Bool = false) -> HelperResponse {
+    killExistingClient()
+
+    // Resolve the requested path; fall back to default
+    let requestedPath = binaryPath ?? DEFAULT_CLIENT_PATH
+
+    // Canonicalize: resolve symlinks first, then normalize ./../ components
+    let resolvedPath = URL(fileURLWithPath: requestedPath)
+        .resolvingSymlinksInPath().standardized.path
+    let clientPath: String
+    if ALLOWED_CLIENT_PATHS.contains(resolvedPath) {
+        clientPath = resolvedPath
+    } else if ALLOWED_CLIENT_PATHS.contains(requestedPath) {
+        clientPath = requestedPath
+    } else {
+        log("ERROR: binaryPath '\(requestedPath)' not in allowlist — rejected")
+        return HelperResponse(status: "error",
+                              message: "Rejected: binary path is not permitted")
+    }
+
+    guard FileManager.default.isExecutableFile(atPath: clientPath) else {
+        log("ERROR: aivpn-client not found at \(clientPath)")
+        return HelperResponse(status: "error",
+                              message: "aivpn-client binary not found at \(clientPath)")
+    }
+
+    // Ensure directories exist
+    try? FileManager.default.createDirectory(
+        atPath: (LOG_PATH as NSString).deletingLastPathComponent,
+        withIntermediateDirectories: true
+    )
+
+    // Clear log
+    try? Data().write(to: URL(fileURLWithPath: LOG_PATH))
+
+    // Build arguments
+    var args: [String] = [clientPath, "-k", key]
+    if fullTunnel {
+        args.append("--full-tunnel")
+    }
+    if let certPath = mtlsCertPath {
+        let homeDir = NSHomeDirectory()
+        let allowedPrefixes = [homeDir, "/etc/ssl", "/usr/local/etc"]
+        let certOk = certPath.count <= 512
+            && allowedPrefixes.contains(where: { certPath.hasPrefix($0) })
+            && certPath.range(of: #"^[\w/\.\-]+\.(pem|crt|cer)$"#,
+                              options: .regularExpression) != nil
+        guard certOk else {
+            log("ERROR: invalid mtlsCertPath '\(certPath)' — rejected")
+            return HelperResponse(status: "error", message: "Invalid mTLS cert path")
+        }
+        args.append("--mtls-cert")
+        args.append(certPath)
+    }
+    if adaptiveLevel > 0 {
+        args.append("--adaptive-level")
+        args.append("\(adaptiveLevel)")
+    }
+    if killSwitch {
+        args.append("--kill-switch")
+    }
+    if let proxy = dnsProxy, !proxy.isEmpty {
+        // Validate HOST:PORT — character whitelist + port range 1–65535.
+        let proxyCharset = CharacterSet(charactersIn: "0123456789abcdefABCDEF:.[]-")
+        guard proxy.unicodeScalars.allSatisfy({ proxyCharset.contains($0) }),
+              let colonIdx = proxy.lastIndex(of: ":"),
+              let port = Int(proxy[proxy.index(after: colonIdx)...]),
+              (1...65535).contains(port) else {
+            log("ERROR: invalid dnsProxy '\(proxy)' — rejected")
+            return HelperResponse(status: "error", message: "Invalid dns-proxy value")
+        }
+        args.append("--dns-proxy")
+        args.append(proxy)
+    }
+    if let routes = excludeRoutes {
+        // Validate: each token must look like a CIDR (digits, dots, colons, slash).
+        // Reject anything containing shell-special characters or path traversal.
+        let tokens = routes.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
+        let cidrCharset = CharacterSet(charactersIn: "0123456789abcdefABCDEF:./")
+        let allValid = tokens.allSatisfy { token in
+            !token.isEmpty && token.unicodeScalars.allSatisfy { cidrCharset.contains($0) }
+        }
+        guard !tokens.isEmpty && allValid else {
+            log("ERROR: invalid excludeRoutes — rejected")
+            return HelperResponse(status: "error", message: "Invalid exclude-routes value")
+        }
+        args.append("--exclude-routes")
+        args.append(tokens.joined(separator: ","))
+    }
+
+    // Use posix_spawn for reliable process management
+    var fileActions: posix_spawn_file_actions_t?
+    posix_spawn_file_actions_init(&fileActions)
+
+    // Redirect stdout/stderr to log file (world-readable for debugging)
+    let logFd = open(LOG_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
+    if logFd >= 0 {
+        posix_spawn_file_actions_adddup2(&fileActions, logFd, STDOUT_FILENO)
+        posix_spawn_file_actions_adddup2(&fileActions, logFd, STDERR_FILENO)
+        posix_spawn_file_actions_addclose(&fileActions, logFd)
+        // Ensure log is readable
+        chmod(LOG_PATH, 0o644)
+    }
+
+    // Set RUST_LOG=info so tracing outputs info-level logs (default is ERROR only)
+    // Preserve the existing PATH so we can find system binaries like ifconfig/route
+    var envp: [UnsafeMutablePointer<CChar>?] = []
+    
+    // Copy current environment first
+    let currentEnv = ProcessInfo.processInfo.environment
+    for (key, value) in currentEnv {
+        envp.append(strdup("\(key)=\(value)"))
+    }
+    
+    // Add/override RUST_LOG=info
+    envp.append(strdup("RUST_LOG=info"))
+    envp.append(nil)
+
+    var pid: pid_t = 0
+    let argv = args.map { strdup($0) } + [nil]
+
+    let spawnResult = argv.withUnsafeBufferPointer { ptr in
+        envp.withUnsafeMutableBufferPointer { envPtr in
+            posix_spawn(&pid, clientPath, &fileActions, nil,
+                        UnsafeMutablePointer(mutating: ptr.baseAddress),
+                        UnsafeMutablePointer(mutating: envPtr.baseAddress))
+        }
+    }
+
+    // Free strdup'd strings
+    for arg in argv { free(arg) }
+    for envVar in envp {
+        if let ptr = envVar {
+            free(ptr)
+        }
+    }
+    posix_spawn_file_actions_destroy(&fileActions)
+    if logFd >= 0 { close(logFd) }
+
+    if spawnResult != 0 {
+        log("ERROR: posix_spawn failed: \(String(cString: strerror(spawnResult)))")
+        return HelperResponse(status: "error",
+                              message: "Failed to start client: \(String(cString: strerror(spawnResult)))")
+    }
+
+    managedPID = pid
+    isConnected = false
+    try? "\(pid)".write(toFile: PID_PATH, atomically: true, encoding: .utf8)
+    log("Started aivpn-client (PID: \(pid))")
+    return HelperResponse(status: "ok", message: "Client started", pid: Int(pid))
+}
+
+func runClientCommand(args: [String], binaryPath: String?) -> HelperResponse {
+    let requestedPath = binaryPath ?? DEFAULT_CLIENT_PATH
+    let resolvedPath = URL(fileURLWithPath: requestedPath)
+        .resolvingSymlinksInPath().standardized.path
+    let clientPath: String
+    if ALLOWED_CLIENT_PATHS.contains(resolvedPath) {
+        clientPath = resolvedPath
+    } else if ALLOWED_CLIENT_PATHS.contains(requestedPath) {
+        clientPath = requestedPath
+    } else {
+        log("ERROR: runClientCommand binaryPath '\(requestedPath)' not in allowlist — rejected")
+        return HelperResponse(status: "error", message: "Rejected: binary path is not permitted")
+    }
+
+    guard FileManager.default.isExecutableFile(atPath: clientPath) else {
+        return HelperResponse(status: "error", message: "aivpn-client binary not found at \(clientPath)")
+    }
+
+    let task = Process()
+    task.executableURL = URL(fileURLWithPath: clientPath)
+    task.arguments = args
+
+    let outputPipe = Pipe()
+    task.standardOutput = outputPipe
+    task.standardError = outputPipe
+
+    do {
+        try task.run()
+        task.waitUntilExit()
+    } catch {
+        return HelperResponse(status: "error", message: "Failed to run client command: \(error.localizedDescription)")
+    }
+
+    let outputData = outputPipe.fileHandleForReading.readDataToEndOfFile()
+    let output = String(data: outputData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+
+    if task.terminationStatus == 0 {
+        return HelperResponse(status: "ok", message: output.isEmpty ? "Command sent to client daemon." : output)
+    }
+
+    return HelperResponse(status: "error", message: output.isEmpty ? "Client command failed" : output)
+}
+
+/// Stop the managed aivpn-client process
+func stopClient() -> HelperResponse {
+    let wasConnected = isConnected
+    killExistingClient()
+    log("Client stopped")
+    return HelperResponse(status: "ok",
+                          message: wasConnected ? "Disconnected" : "No active connection")
+}
+
+/// Get current connection status
+func getStatus() -> HelperResponse {
+    if managedPID > 0 && kill(managedPID, 0) == 0 {
+        if isConnected {
+            return HelperResponse(status: "ok", message: "Connected",
+                                  connected: true, pid: Int(managedPID),
+                                  version: HELPER_VERSION)
+        }
+        // Check log for connection status
+        if let logContent = try? String(contentsOfFile: LOG_PATH, encoding: .utf8) {
+            if logContent.contains("Connected to server") ||
+               logContent.contains("PFS ratchet complete") ||
+               logContent.contains("forward secrecy established") {
+                isConnected = true
+                return HelperResponse(status: "ok", message: "Connected",
+                                      connected: true, pid: Int(managedPID),
+                                      version: HELPER_VERSION)
+            }
+            if logContent.contains("Created TUN device") {
+                return HelperResponse(status: "ok", message: "Establishing tunnel...",
+                                      connected: false, pid: Int(managedPID),
+                                      version: HELPER_VERSION)
+            }
+
+            // Check for repeated errors — if last non-empty line is an error, report it
+            let lines = logContent.components(separatedBy: "\n").filter { !$0.isEmpty }
+            if let lastLine = lines.last {
+                // Strip ANSI escape codes (actual \x1b byte, not literal text)
+                let cleanLine = lastLine.replacingOccurrences(
+                    of: "\u{001b}\\[[0-9;]*m", with: "", options: .regularExpression
+                )
+                if cleanLine.contains("ERROR") || cleanLine.contains("Failed") {
+                    // Extract just the error message
+                    let errorMsg: String
+                    if let range = cleanLine.range(of: "ERROR") {
+                        errorMsg = String(cleanLine[range.lowerBound...]).trimmingCharacters(
+                            in: .whitespacesAndNewlines
+                        )
+                    } else {
+                        errorMsg = cleanLine.trimmingCharacters(in: .whitespacesAndNewlines)
+                    }
+                    return HelperResponse(status: "ok", message: errorMsg,
+                                          connected: false, pid: Int(managedPID),
+                                          version: HELPER_VERSION)
+                }
+            }
+        }
+        return HelperResponse(status: "ok", message: "Connecting...",
+                              connected: false, pid: Int(managedPID),
+                              version: HELPER_VERSION)
+    }
+
+    // Process not running
+    if managedPID > 0 {
+        managedPID = 0
+        isConnected = false
+        try? FileManager.default.removeItem(atPath: PID_PATH)
+
+        var errorMsg = "Process exited"
+        if let logContent = try? String(contentsOfFile: LOG_PATH, encoding: .utf8) {
+            let lines = logContent.components(separatedBy: "\n").filter { !$0.isEmpty }
+            if let last = lines.last,
+               last.contains("ERROR") || last.contains("error") || last.contains("Failed") {
+                errorMsg = String(last.prefix(200))
+            }
+        }
+        return HelperResponse(status: "ok", message: errorMsg,
+                              connected: false, version: HELPER_VERSION)
+    }
+
+    return HelperResponse(status: "ok", message: "Idle",
+                          connected: false, version: HELPER_VERSION)
+}
+
+/// Get recent log entries
+func getLog() -> HelperResponse {
+    guard let logContent = try? String(contentsOfFile: LOG_PATH, encoding: .utf8) else {
+        return HelperResponse(status: "ok", message: "No log",
+                              connected: isConnected,
+                              pid: managedPID > 0 ? Int(managedPID) : nil, log: "")
+    }
+    let lines = logContent.components(separatedBy: "\n")
+    // Keep log file bounded so it doesn't grow unboundedly over a long session
+    if lines.count > 500 {
+        let kept = lines.suffix(500).joined(separator: "\n")
+        try? kept.write(toFile: LOG_PATH, atomically: true, encoding: .utf8)
+    }
+    let recent = lines.suffix(50).joined(separator: "\n")
+    return HelperResponse(status: "ok", message: "Log retrieved",
+                          connected: isConnected,
+                          pid: managedPID > 0 ? Int(managedPID) : nil,
+                          log: recent)
+}
+
+private func readQualityScore() -> String {
+    guard let data = try? Data(contentsOf: URL(fileURLWithPath: "/var/run/aivpn/quality.json")),
+          let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let q = json["quality"] as? Int else { return "" }
+    var result = ",quality:\(q)"
+    if let a = json["adaptive"] as? Int { result += ",adaptive:\(a)" }
+    return result
+}
+
+/// Get traffic statistics
+func getTrafficStats() -> HelperResponse {
+    // Try to read stats file first
+    let statsPath = "/var/run/aivpn/traffic.stats"
+    if let statsContent = try? String(contentsOfFile: statsPath, encoding: .utf8) {
+        // Format: "sent:X,received:Y"
+        let trimmed = statsContent.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.contains("sent:") && trimmed.contains("received:") {
+            return HelperResponse(status: "ok", message: trimmed + readQualityScore())
+        }
+    }
+    
+    // Fallback: parse last 100 lines of log
+    guard let logContent = try? String(contentsOfFile: LOG_PATH, encoding: .utf8) else {
+        return HelperResponse(status: "ok", message: "sent:0,received:0")
+    }
+    
+    let lines = logContent.components(separatedBy: "\n")
+    let recentLines = lines.suffix(100)
+    
+    var totalSent: Int64 = 0
+    var totalReceived: Int64 = 0
+    
+    for line in recentLines {
+        if line.contains("Sent") {
+            let parts = line.components(separatedBy: " ")
+            for (i, part) in parts.enumerated() {
+                if part == "Sent" && i + 1 < parts.count {
+                    if let bytes = Int64(parts[i + 1]) {
+                        totalSent += bytes
+                    }
+                }
+            }
+        }
+        if line.contains("received") || line.contains("Read") {
+            let parts = line.components(separatedBy: " ")
+            for (i, part) in parts.enumerated() {
+                if (part == "received" || part == "Read") && i + 1 < parts.count {
+                    if let bytes = Int64(parts[i + 1]) {
+                        totalReceived += bytes
+                    }
+                }
+            }
+        }
+    }
+    
+    // Trim log file if too large
+    if lines.count > 500 {
+        let trimmed = lines.suffix(500).joined(separator: "\n")
+        try? trimmed.write(toFile: LOG_PATH, atomically: true, encoding: .utf8)
+    }
+    
+    return HelperResponse(status: "ok", message: "sent:\(totalSent),received:\(totalReceived)\(readQualityScore())")
+}
+
+func getRecordingInfo() -> HelperResponse {
+    if let data = try? Data(contentsOf: URL(fileURLWithPath: RECORDING_STATUS_PATH)),
+       let json = String(data: data, encoding: .utf8) {
+        return HelperResponse(status: "ok", message: json)
+    }
+    if let data = try? Data(contentsOf: URL(fileURLWithPath: RECORDING_STATUS_FALLBACK_PATH)),
+       let json = String(data: data, encoding: .utf8) {
+        return HelperResponse(status: "ok", message: json)
+    }
+    return HelperResponse(status: "ok", message: "{\"can_record\":null,\"state\":\"idle\",\"service\":null,\"message\":\"Recording access not checked yet\",\"mask_id\":null,\"confidence\":null,\"updated_at_ms\":0}")
+}
+
+// MARK: - Socket Helpers
+
+/// Build a raw sockaddr_un buffer for the given path
+func makeSockAddr(_ path: String) -> [Int8] {
+    var buf = [Int8](repeating: 0, count: 106)
+    buf[0] = 0              // sun_len (0 = let kernel compute)
+    buf[1] = Int8(AF_UNIX)  // sun_family
+    let pathBytes = Array(path.utf8)
+    for (i, byte) in pathBytes.enumerated() where i + 2 < buf.count {
+        buf[i + 2] = Int8(bitPattern: byte)
+    }
+    return buf
+}
+
+// MARK: - Socket Server
+
+/// Create and bind the Unix domain socket
+func createSocket() -> Int32 {
+    let socketDir = (SOCKET_PATH as NSString).deletingLastPathComponent
+    do {
+        try FileManager.default.createDirectory(atPath: socketDir,
+                                                withIntermediateDirectories: true)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755],
+                                              ofItemAtPath: socketDir)
+    } catch {
+        log("WARNING: Could not create socket dir: \(error)")
+    }
+
+    // Remove stale socket
+    try? FileManager.default.removeItem(atPath: SOCKET_PATH)
+
+    let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+    guard fd >= 0 else {
+        log("ERROR: socket() failed: \(String(cString: strerror(errno)))")
+        return -1
+    }
+
+    let addrBuf = makeSockAddr(SOCKET_PATH)
+    let bindResult = addrBuf.withUnsafeBufferPointer { ptr in
+        bind(fd, UnsafeRawPointer(ptr.baseAddress!).assumingMemoryBound(to: sockaddr.self),
+             socklen_t(addrBuf.count))
+    }
+    guard bindResult == 0 else {
+        log("ERROR: bind() failed: \(String(cString: strerror(errno)))")
+        close(fd)
+        return -1
+    }
+
+    guard listen(fd, 5) == 0 else {
+        log("ERROR: listen() failed: \(String(cString: strerror(errno)))")
+        close(fd)
+        return -1
+    }
+
+    // Restrict socket to owner only; chown to the console user so the GUI app
+    // (running as the logged-in user, not root) can connect. 0o666 would expose
+    // the socket — and any connection key/PSK it carries — to all local processes.
+    try? FileManager.default.setAttributes([.posixPermissions: 0o600],
+                                            ofItemAtPath: SOCKET_PATH)
+    var consoleUID: uid_t = 0
+    var consoleGID: gid_t = 0
+    if SCDynamicStoreCopyConsoleUser(nil, &consoleUID, &consoleGID) != nil {
+        chown(SOCKET_PATH, consoleUID, consoleGID)
+    }
+
+    return fd
+}
+
+/// Read exactly `count` bytes from `fd`, returning nil on EOF/error/timeout.
+func readExact(_ fd: Int32, count: Int) -> Data? {
+    var buf = [UInt8](repeating: 0, count: count)
+    var total = 0
+    while total < count {
+        let n = buf.withUnsafeMutableBytes { bytes in
+            read(fd, bytes.baseAddress!.advanced(by: total), count - total)
+        }
+        if n <= 0 { return nil }
+        total += n
+    }
+    return Data(buf)
+}
+
+/// Handle a single client connection
+func handleConnection(_ clientFD: Int32) {
+    // 5-second read timeout
+    var timeout = timeval(tv_sec: 5, tv_usec: 0)
+    setsockopt(clientFD, SOL_SOCKET, SO_RCVTIMEO,
+               &timeout, socklen_t(MemoryLayout<timeval>.size))
+
+    // Read 4-byte big-endian length prefix
+    guard let lenBytes = readExact(clientFD, count: 4) else { return }
+    let payloadLen = Int(lenBytes[0]) << 24 | Int(lenBytes[1]) << 16
+                   | Int(lenBytes[2]) << 8  | Int(lenBytes[3])
+    guard payloadLen > 0 && payloadLen <= 65535 else {
+        sendResponse(clientFD, HelperResponse(status: "error", message: "Invalid message length"))
+        return
+    }
+
+    // Read exactly payloadLen bytes
+    guard let data = readExact(clientFD, count: payloadLen) else { return }
+
+    guard let request = try? JSONDecoder().decode(HelperRequest.self, from: data) else {
+        sendResponse(clientFD, HelperResponse(status: "error", message: "Invalid JSON"))
+        return
+    }
+
+    log("Action: \(request.action)")
+
+    let response: HelperResponse
+    switch request.action {
+    case "connect":
+        guard let key = request.key, !key.isEmpty else {
+            response = HelperResponse(status: "error", message: "Missing connection key")
+            break
+        }
+        response = startClient(key: key,
+                               fullTunnel: request.fullTunnel ?? false,
+                               binaryPath: request.binaryPath,
+                               mtlsCertPath: request.mtlsCertPath,
+                               excludeRoutes: request.excludeRoutes,
+                               adaptiveLevel: request.adaptiveLevel ?? 0,
+                               dnsProxy: request.dnsProxy,
+                               killSwitch: request.killSwitch ?? false)
+
+    case "disconnect":
+        response = stopClient()
+
+    case "status":
+        response = getStatus()
+
+    case "ping":
+        response = HelperResponse(status: "ok", message: "pong",
+                                  connected: isConnected && managedPID > 0 && kill(managedPID, 0) == 0,
+                                  version: HELPER_VERSION)
+
+    case "log":
+        response = getLog()
+
+    case "traffic":
+        response = getTrafficStats()
+
+    case "record_start":
+        guard let service = request.service, !service.isEmpty else {
+            response = HelperResponse(status: "error", message: "Missing recording service name")
+            break
+        }
+        response = runClientCommand(args: ["record", "start", "--service", service], binaryPath: request.binaryPath)
+
+    case "record_stop":
+        response = runClientCommand(args: ["record", "stop"], binaryPath: request.binaryPath)
+
+    case "device_key":
+        response = runClientCommand(args: ["--show-device-key"], binaryPath: request.binaryPath)
+
+    case "record_info":
+        response = getRecordingInfo()
+
+    default:
+        response = HelperResponse(status: "error",
+                                  message: "Unknown action: \(request.action)")
+    }
+
+    sendResponse(clientFD, response)
+}
+
+/// Send a JSON response to the client
+func sendResponse(_ clientFD: Int32, _ response: HelperResponse) {
+    guard let responseData = try? JSONEncoder().encode(response),
+          let responseStr = String(data: responseData, encoding: .utf8) else { return }
+
+    _ = responseStr.withCString { ptr in
+        write(clientFD, ptr, Int(strlen(ptr)))
+    }
+}
+
+// MARK: - Signal Handling
+
+func signalHandler(_ sig: Int32) {
+    log("Signal \(sig), shutting down...")
+    killExistingClient()
+    try? FileManager.default.removeItem(atPath: SOCKET_PATH)
+    exit(0)
+}
+
+func setupSignals() {
+    signal(SIGTERM, signalHandler)
+    signal(SIGINT, signalHandler)
+    signal(SIGHUP, SIG_IGN)
+}
+
+// MARK: - Recovery
+
+/// Recover existing aivpn-client from a previous helper instance
+func recoverExistingClient() {
+    guard let pidStr = try? String(contentsOfFile: PID_PATH, encoding: .utf8) else { return }
+    let trimmed = pidStr.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard let pid = Int32(trimmed), pid > 0 else { return }
+
+    if kill(pid, 0) == 0 {
+        managedPID = pid
+        log("Recovered aivpn-client (PID: \(pid))")
+        if let logContent = try? String(contentsOfFile: LOG_PATH, encoding: .utf8) {
+            if logContent.contains("PFS ratchet complete") ||
+               logContent.contains("forward secrecy established") {
+                isConnected = true
+            }
+        }
+    } else {
+        try? FileManager.default.removeItem(atPath: PID_PATH)
+    }
+}
+
+// MARK: - Main
+
+func main() {
+    setupSignals()
+    recoverExistingClient()
+
+    let sockFD = createSocket()
+    guard sockFD >= 0 else {
+        log("FATAL: Could not create helper socket")
+        exit(1)
+    }
+    defer {
+        close(sockFD)
+        try? FileManager.default.removeItem(atPath: SOCKET_PATH)
+    }
+
+    log("AIVPN Helper v\(HELPER_VERSION) started (socket: \(SOCKET_PATH))")
+
+    // Serial queue: keeps shared mutable state (managedPID, isConnected) thread-safe
+    // while freeing the accept loop from blocking on slow 5-second-timeout connections.
+    let connectionQueue = DispatchQueue(label: "aivpn.helper.connections")
+
+    // Main accept loop — runs forever (LaunchDaemon manages lifecycle)
+    while true {
+        var clientBuf = [Int8](repeating: 0, count: 106)
+        var clientLen = socklen_t(106)
+        let clientFD = clientBuf.withUnsafeMutableBufferPointer { ptr in
+            accept(sockFD,
+                   UnsafeMutableRawPointer(ptr.baseAddress!).assumingMemoryBound(to: sockaddr.self),
+                   &clientLen)
+        }
+
+        guard clientFD >= 0 else {
+            if errno == EINTR { continue }
+            break
+        }
+
+        connectionQueue.async {
+            handleConnection(clientFD)
+            close(clientFD)
+        }
+    }
+
+    log("AIVPN Helper exiting")
+}
+
+main()

@@ -29,16 +29,16 @@ Key technical properties:
 ### Workspace layout
 
 ```
-aivpn-common/       — shared crypto, protocol, mask profiles (no I/O)
-aivpn-server/       — Linux-only VPN gateway and management CLI
-aivpn-client/       — cross-platform VPN client (Linux / macOS / Windows)
-aivpn-android-core/ — JNI bridge for Android
-aivpn-windows/      — Windows GUI (egui/eframe)
-aivpn-android/      — Android Kotlin app
-aivpn-macos/        — macOS SwiftUI menu bar app
-aivpn-ios-core/     — iOS Rust staticlib (C FFI)
-aivpn-ios/          — iOS SwiftUI app + NEPacketTunnelProvider
-mask-assets/        — bundled traffic mimicry JSON profiles
+crates/aivpn-common/  — shared crypto, protocol, mask profiles (no I/O)
+crates/aivpn-server/  — Linux-only VPN gateway and management CLI
+crates/aivpn-client/  — cross-platform VPN client (Linux / macOS / Windows)
+crates/aivpn-android-core/ — JNI bridge for Android
+crates/aivpn-windows/ — Windows GUI (egui/eframe)
+platforms/android/    — Android Kotlin app
+platforms/macos/      — macOS SwiftUI menu bar app
+crates/aivpn-ios-core/ — iOS Rust staticlib (C FFI)
+platforms/ios/        — iOS SwiftUI app + NEPacketTunnelProvider
+assets/masks/         — bundled traffic mimicry JSON profiles
 ```
 
 ### Key modules
@@ -225,7 +225,7 @@ ssh root@router 'chmod +x /opt/bin/aivpn-client && /opt/bin/aivpn-client -k "aiv
 /ip/route/add dst-address=0.0.0.0/0 gateway=172.31.0.2
 ```
 
-See [aivpn-mikrotik/README.md](aivpn-mikrotik/README.md) for policy routing and troubleshooting.
+See [platforms/mikrotik/README.md](platforms/mikrotik/README.md) for policy routing and troubleshooting.
 
 ### SOCKS5 proxy mode (no root)
 
@@ -408,13 +408,13 @@ make test-docker    # integration test: server + client in Docker
 ```bash
 export ANDROID_SDK_ROOT=/opt/android-sdk
 export ANDROID_NDK_ROOT=/opt/android-ndk
-echo "sdk.dir=$ANDROID_SDK_ROOT" > aivpn-android/local.properties
+echo "sdk.dir=$ANDROID_SDK_ROOT" > platforms/android/local.properties
 
 cd aivpn-android
 ./build-rust-android.sh release
 ```
 
-Signed build: create `aivpn-android/keystore.properties` before running the script.
+Signed build: create `platforms/android/keystore.properties` before running the script.
 
 ### Optional Cargo features (server)
 
@@ -557,28 +557,28 @@ Detailed adversary model and threat analysis: [THREAT_MODEL.md](THREAT_MODEL.md)
 
 ```
 aivpn/
-├── aivpn-common/src/
+├── crates/aivpn-common/src/
 │   ├── crypto.rs          # X25519, ChaCha20-Poly1305, BLAKE3
 │   ├── mask.rs            # Mimicry profiles (WebRTC, QUIC, DNS)
 │   ├── protocol.rs        # Packet format and control plane
 │   └── fec.rs             # XOR Forward Error Correction
-├── aivpn-client/src/
+├── crates/aivpn-client/src/
 │   ├── client.rs          # Core state machine
 │   ├── tunnel.rs          # Cross-platform TUN interface
 │   ├── kill_switch.rs     # Kill-switch (nftables / pfctl / netsh)
 │   └── mimicry.rs         # Traffic shaping engine
-├── aivpn-server/src/
+├── crates/aivpn-server/src/
 │   ├── gateway.rs         # UDP gateway, session dispatch
 │   ├── neural.rs          # Neural Resonance module
 │   ├── nat.rs             # NAT forwarder (IPv4 + IPv6 NAT66)
 │   ├── client_db.rs       # Client database
 │   └── pool_sync.rs       # In-protocol pool synchronization
-├── aivpn-android/         # Android Kotlin app
-├── aivpn-ios/             # iOS SwiftUI app + NEPacketTunnelProvider
-├── aivpn-windows/         # Windows egui GUI
-├── aivpn-macos/           # macOS SwiftUI menu bar app
+├── platforms/android/         # Android Kotlin app
+├── platforms/ios/             # iOS SwiftUI app + NEPacketTunnelProvider
+├── crates/aivpn-windows/      # Windows egui GUI
+├── platforms/macos/           # macOS SwiftUI menu bar app
 ├── mask-assets/           # Bundled traffic mimicry profiles (JSON)
-├── docker/                # Dockerfiles and entrypoint
+├── deploy/docker/             # Dockerfiles and entrypoint
 ├── Dockerfile
 ├── docker-compose.yml
 └── THREAT_MODEL.md

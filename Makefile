@@ -191,13 +191,14 @@ define _musl
 	  printf 'ARG TARGET_TRIPLE CRATE_NAME BINARY_NAME\n'; \
 	  printf 'WORKDIR /app\n'; \
 	  printf 'COPY Cargo.toml ./\n'; \
-	  printf 'COPY aivpn-common aivpn-common/\n'; \
-	  printf 'COPY aivpn-server aivpn-server/\n'; \
-	  printf 'COPY aivpn-client aivpn-client/\n'; \
-	  printf 'COPY aivpn-windows aivpn-windows/\n'; \
-	  printf 'COPY aivpn-linux aivpn-linux/\n'; \
-	  printf 'COPY aivpn-android-core aivpn-android-core/\n'; \
-	  printf 'COPY aivpn-ios-core aivpn-ios-core/\n'; \
+	  printf 'COPY crates/aivpn-common crates/aivpn-common/\n'; \
+	  printf 'COPY crates/aivpn-server crates/aivpn-server/\n'; \
+	  printf 'COPY crates/aivpn-client crates/aivpn-client/\n'; \
+	  printf 'COPY crates/aivpn-windows crates/aivpn-windows/\n'; \
+	  printf 'COPY crates/aivpn-linux crates/aivpn-linux/\n'; \
+	  printf 'COPY crates/aivpn-android-core crates/aivpn-android-core/\n'; \
+	  printf 'COPY crates/aivpn-ios-core crates/aivpn-ios-core/\n'; \
+	  printf 'COPY assets/masks assets/masks/\n'; \
 	  printf 'RUN cargo build --release --target "$$TARGET_TRIPLE" -p "$$CRATE_NAME" --bin "$$BINARY_NAME"\n'; \
 	} > "$$TMPDF"; \
 	trap "rm -f $$TMPDF; docker rm -f $$CTR >/dev/null 2>&1 || true" EXIT; \
@@ -261,7 +262,7 @@ windows: releases/
 	    unzip -o "$$WINTUN_ZIP" "wintun/bin/amd64/wintun.dll" -d /tmp/; \
 	    cp /tmp/wintun/bin/amd64/wintun.dll "$$WINTUN_DLL"; \
 	fi; \
-	cp aivpn-windows/assets/aivpn.ico "$$PACKAGE_DIR/aivpn.ico"; \
+	cp crates/aivpn-windows/assets/aivpn.ico "$$PACKAGE_DIR/aivpn.ico"; \
 	if command -v zip >/dev/null 2>&1; then \
 	    (cd "$$PACKAGE_DIR" && zip -r "../aivpn-windows-gui.zip" ./*); \
 	else \
@@ -269,7 +270,7 @@ windows: releases/
 z=zipfile.ZipFile('$$ZIP_NAME','w',zipfile.ZIP_DEFLATED); \
 [z.write(f,f.name) for f in pkg.iterdir()]; z.close()"; \
 	fi; \
-	NSI=aivpn-windows/installer/aivpn-installer.nsi; \
+	NSI=crates/aivpn-windows/installer/aivpn-installer.nsi; \
 	INSTALLER_EXE=releases/aivpn-windows-installer.exe; \
 	if command -v makensis >/dev/null 2>&1 && [ -f "$$NSI" ]; then \
 	    echo "Building NSIS installer..."; \
@@ -299,8 +300,8 @@ ios:
 	CARGO="cargo"; \
 	echo "==> cargo: $$CARGO"; \
 	REPO_ROOT="$$(pwd)"; \
-	IOS_DIR="$$REPO_ROOT/aivpn-ios"; \
-	CORE_DIR="$$REPO_ROOT/aivpn-ios-core"; \
+	IOS_DIR="$$REPO_ROOT/platforms/ios"; \
+	CORE_DIR="$$REPO_ROOT/crates/aivpn-ios-core"; \
 	TARGET_DIR="$$REPO_ROOT/target"; \
 	LIB_DIR="$$CORE_DIR/lib"; \
 	CONFIGURATION="$${CONFIGURATION:-Release}"; \
@@ -379,9 +380,9 @@ macos:
 	cargo build --release -p aivpn-client --target aarch64-apple-darwin
 	cargo build --release -p aivpn-client --target x86_64-apple-darwin
 	@echo "==> Generating ICNS icon from brand source..."
-	@python3 aivpn-macos/generate_icon.py 2>/dev/null || true
+	@python3 platforms/macos/generate_icon.py 2>/dev/null || true
 	@echo "==> Building macOS app bundle (swiftc + universal + PKG + DMG)..."
-	@bash aivpn-macos/build.sh
+	@bash platforms/macos/build.sh
 	@echo "→ releases/aivpn-macos.pkg"
 	@echo "→ releases/aivpn-macos.dmg"
 
@@ -406,8 +407,8 @@ linux-appimage:
 	printf '[Desktop Entry]\nName=AIVPN\nComment=AI-powered VPN\nExec=aivpn-linux\nIcon=aivpn\nType=Application\nCategories=Network;\n' \
 	    > "$$APPDIR/usr/share/applications/aivpn.desktop"; \
 	cp "$$APPDIR/usr/share/applications/aivpn.desktop" "$$APPDIR/"; \
-	ICON=brand/icon-1024.png; \
-	[ -f "$$ICON" ] || ICON=aivpn-linux/assets/icon.png; \
+	ICON=assets/brand/icon-1024.png; \
+	[ -f "$$ICON" ] || ICON=crates/aivpn-linux/assets/icon.png; \
 	if [ -f "$$ICON" ]; then \
 	    cp "$$ICON" "$$APPDIR/usr/share/icons/hicolor/256x256/apps/aivpn.png"; \
 	    cp "$$ICON" "$$APPDIR/aivpn.png"; \
@@ -438,19 +439,19 @@ deploy:
 	SKIP_DL=$${AIVPN_SKIP_DOWNLOAD:-0}; \
 	ASSET=aivpn-server-linux-x86_64; \
 	ARTIFACT=releases/$$ASSET; \
-	mkdir -p releases config masks; \
-	if [ -d mask-assets ]; then \
-	    for f in mask-assets/*.json; do \
+	mkdir -p releases deploy/config masks; \
+	if [ -d assets/masks ]; then \
+	    for f in assets/masks/*.json; do \
 	        [ -f "$$f" ] || continue; \
 	        base="$$(basename $$f)"; \
 	        [ -f "masks/$$base" ] || { cp "$$f" "masks/$$base"; echo "Seeded mask: $$base"; }; \
 	    done; \
 	fi; \
-	[ -f config/server.json ] || cp config/server.json.example config/server.json; \
-	if [ ! -f config/server.key ]; then \
+	[ -f deploy/config/server.json ] || cp deploy/config/server.json.example deploy/config/server.json; \
+	if [ ! -f deploy/config/server.key ]; then \
 	    command -v openssl >/dev/null 2>&1 || { echo "ERROR: openssl required" >&2; exit 1; }; \
 	    echo "Generating config/server.key"; \
-	    openssl rand 32 > config/server.key; chmod 600 config/server.key; \
+	    openssl rand 32 > deploy/config/server.key; chmod 600 deploy/config/server.key; \
 	fi; \
 	if [ "$$SKIP_DL" = "1" ]; then \
 	    [ -x "$$ARTIFACT" ] || { echo "ERROR: SKIP_DOWNLOAD=1 but $$ARTIFACT not found" >&2; exit 1; }; \
@@ -471,7 +472,7 @@ deploy:
 	$$RUN sysctl -w net.ipv4.ip_forward=1 >/dev/null; \
 	DEFAULT_IFACE="$$(ip route show default 2>/dev/null | awk '/default/{print $$5; exit}')"; \
 	VPN_CIDR=$$(python3 -c " \
-import json,ipaddress; d=json.load(open('config/server.json')); \
+import json,ipaddress; d=json.load(open('deploy/config/server.json')); \
 n=d.get('network_config'); \
 sip=n['server_vpn_ip'] if n else d.get('tun_addr','10.0.0.1'); \
 pl=int(n['prefix_len']) if n else ipaddress.IPv4Network('0.0.0.0/'+d.get('tun_netmask','255.255.255.0')).prefixlen; \
@@ -484,7 +485,7 @@ print(ipaddress.IPv4Network(f'{sip}/{pl}',strict=False).with_prefixlen)" 2>/dev/
 	    $$RUN ufw allow 443/udp >/dev/null || true; \
 	echo "Starting server via Docker Compose..."; \
 	if docker compose version >/dev/null 2>&1; then DC="docker compose"; else DC="docker-compose"; fi; \
-	AIVPN_SERVER_DOCKERFILE=Dockerfile.prebuilt $$DC up -d --build --force-recreate aivpn-server; \
+	AIVPN_SERVER_DOCKERFILE=deploy/docker/Dockerfile.prebuilt $$DC up -d --build --force-recreate aivpn-server; \
 	echo "Server deployed."; \
 	echo "Manage clients: docker compose exec aivpn-server aivpn-server --help"
 
@@ -512,15 +513,15 @@ server-deploy:
 	SSH="$$SSH_PFX ssh $$SSHOPTS $$R"; \
 	SCP="$$SSH_PFX scp $$SSHOPTS"; \
 	echo "==> Creating remote directories on $(HOST)..."; \
-	eval "$$SSH" "mkdir -p $(REMOTE)/releases $(REMOTE)/config $(REMOTE)/docker $(REMOTE)/masks"; \
+	eval "$$SSH" "mkdir -p $(REMOTE)/releases $(REMOTE)/deploy/config $(REMOTE)/deploy/docker $(REMOTE)/masks"; \
 	echo "==> Uploading server binary..."; \
 	eval "$$SCP" "releases/aivpn-server-linux-x86_64" "$$R:$(REMOTE)/releases/"; \
 	echo "==> Uploading Docker files..."; \
 	eval "$$SCP" "docker-compose.yml" "$$R:$(REMOTE)/"; \
-	eval "$$SCP" "docker/Dockerfile.prebuilt" "docker/docker-entrypoint.sh" "$$R:$(REMOTE)/docker/"; \
-	if [ -f config/server.json ]; then \
+	eval "$$SCP" "deploy/docker/Dockerfile.prebuilt" "deploy/docker/docker-entrypoint.sh" "$$R:$(REMOTE)/deploy/docker/"; \
+	if [ -f deploy/config/server.json ]; then \
 	    echo "==> Uploading config..."; \
-	    eval "$$SCP" "config/server.json" "$$R:$(REMOTE)/config/"; \
+	    eval "$$SCP" "deploy/config/server.json" "$$R:$(REMOTE)/deploy/config/"; \
 	fi; \
 	echo "==> Installing Docker on remote (if needed)..."; \
 	eval "$$SSH" "export DEBIAN_FRONTEND=noninteractive && \
@@ -529,11 +530,11 @@ server-deploy:
 	     apt-get install -y docker.io docker-compose iptables iproute2 ca-certificates curl openssl) && \
 	    systemctl enable docker && systemctl start docker"; \
 	echo "==> Generating server key if missing..."; \
-	eval "$$SSH" "test -f $(REMOTE)/config/server.key || { openssl rand 32 > $(REMOTE)/config/server.key && chmod 600 $(REMOTE)/config/server.key; }"; \
+	eval "$$SSH" "test -f $(REMOTE)/deploy/config/server.key || { openssl rand 32 > $(REMOTE)/deploy/config/server.key && chmod 600 $(REMOTE)/deploy/config/server.key; }"; \
 	echo "==> Starting server via Docker Compose..."; \
 	eval "$$SSH" "cd $(REMOTE) && \
 	    if docker compose version >/dev/null 2>&1; then DC='docker compose'; else DC='docker-compose'; fi && \
-	    AIVPN_SERVER_DOCKERFILE=docker/Dockerfile.prebuilt \$$DC up -d --build --force-recreate aivpn-server"; \
+	    AIVPN_SERVER_DOCKERFILE=deploy/docker/Dockerfile.prebuilt \$$DC up -d --build --force-recreate aivpn-server"; \
 	echo ""; \
 	echo "==> Deploy complete. Server running at $(HOST)"
 
@@ -545,7 +546,7 @@ windows-docker: releases/
 	@set -e; \
 	IMAGE=aivpn-windows-client:build; \
 	CTR=aivpn-windows-$$RANDOM; \
-	docker build -t $$IMAGE -f docker/Dockerfile.windows-client .; \
+	docker build -t $$IMAGE -f deploy/docker/Dockerfile.windows-client .; \
 	docker create --name $$CTR $$IMAGE >/dev/null; \
 	trap "docker rm -f $$CTR >/dev/null 2>&1 || true" EXIT; \
 	docker cp $$CTR:/aivpn-client.exe releases/aivpn-client.exe; \
@@ -555,24 +556,24 @@ windows-docker: releases/
 # Integration test: server + client in Docker bridge network
 # ─────────────────────────────────────────────────────────────────────────────
 test-docker:
-	docker compose -f docker/docker-compose.test.yml up --build --abort-on-container-exit
-	docker compose -f docker/docker-compose.test.yml down
+	docker compose -f deploy/docker/docker-compose.test.yml up --build --abort-on-container-exit
+	docker compose -f deploy/docker/docker-compose.test.yml down
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Linux kernel module (requires kernel headers ≥ 6.1)
 # Usage:
-#   make kernel              → build .ko in aivpn-linux-kernel/
+#   make kernel              → build .ko in platforms/linux-kernel/
 #   make kernel KVER=6.6.0  → target a specific kernel
 #   make kernel-install      → install + depmod (root)
 # ─────────────────────────────────────────────────────────────────────────────
 kernel:
 	@echo "==> Building aivpn-linux-kernel module (kernel: $$(uname -r))..."
-	$(MAKE) -C aivpn-linux-kernel
-	@echo "→ aivpn-linux-kernel/aivpn.ko"
+	$(MAKE) -C platforms/linux-kernel
+	@echo "→ platforms/linux-kernel/aivpn.ko"
 
 kernel-install: kernel
 	@echo "==> Installing kernel module..."
-	$(MAKE) -C aivpn-linux-kernel install
+	$(MAKE) -C platforms/linux-kernel install
 	@echo "→ module installed, depmod done"
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -584,7 +585,7 @@ kernel-install: kernel
 # ─────────────────────────────────────────────────────────────────────────────
 mikrotik:
 	@echo "==> Building multi-arch MikroTik images and pushing manifest..."
-	bash aivpn-mikrotik/build-mikrotik.sh "$(IMAGE)"
+	bash platforms/mikrotik/build-mikrotik.sh "$(IMAGE)"
 
 mikrotik-local:
 	@echo "==> Building local arm64 MikroTik image (no push)..."
@@ -593,7 +594,7 @@ mikrotik-local:
 	  --build-arg MUSL_IMAGE_TAG=aarch64-musl \
 	  --build-arg TARGET_TRIPLE=aarch64-unknown-linux-musl \
 	  -t aivpn-mikrotik:local \
-	  -f aivpn-mikrotik/Dockerfile .
+	  -f platforms/mikrotik/Dockerfile .
 	@echo "→ aivpn-mikrotik:local (aarch64)"
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -631,9 +632,9 @@ android:
 	export ANDROID_NDK_ROOT="$$NDK_ROOT"; \
 	echo "SDK: $$SDK_ROOT"; \
 	echo "NDK: $$NDK_ROOT"; \
-	echo "sdk.dir=$$SDK_ROOT" > aivpn-android/local.properties; \
+	echo "sdk.dir=$$SDK_ROOT" > platforms/android/local.properties; \
 	echo "==> Building Android APK (release)..."; \
-	(cd aivpn-android && bash build-rust-android.sh release); \
+	(cd platforms/android && bash build-rust-android.sh release); \
 	if [ -f releases/aivpn-client.apk ]; then \
 	    cp releases/aivpn-client.apk releases/aivpn-android.apk; \
 	    echo "→ releases/aivpn-android.apk"; \
@@ -646,7 +647,7 @@ android:
 # ─────────────────────────────────────────────────────────────────────────────
 clean:
 	cargo clean
-	$(MAKE) -C aivpn-linux-kernel clean 2>/dev/null || true
+	$(MAKE) -C platforms/linux-kernel clean 2>/dev/null || true
 
 clean-releases:
 	rm -rf releases/
