@@ -49,7 +49,7 @@ pub struct ProxyConfig {
 
 pub struct ProxyHandle {
     pub rx_queue: Arc<Mutex<VecDeque<Vec<u8>>>>,
-    pub wake_tx: std::sync::mpsc::Sender<()>
+    pub wake_tx: std::sync::mpsc::SyncSender<()>
 }
 
 struct ManagedConn {
@@ -124,9 +124,9 @@ pub async fn spawn_proxy(
     let rx_queue: Arc<Mutex<VecDeque<Vec<u8>>>> = Arc::new(Mutex::new(VecDeque::new()));
     let tx_queue: Arc<Mutex<VecDeque<Vec<u8>>>> = Arc::new(Mutex::new(VecDeque::new()));
 
-    let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<NewConn>();
-    let (udp_cmd_tx, udp_cmd_rx) = std::sync::mpsc::channel::<UdpStackCommand>();
-    let (wake_tx, wake_rx) = std::sync::mpsc::channel::<()>();
+    let (cmd_tx, cmd_rx) = std::sync::mpsc::sync_channel::<NewConn>(1024);
+    let (udp_cmd_tx, udp_cmd_rx) = std::sync::mpsc::sync_channel::<UdpStackCommand>(1024);
+    let (wake_tx, wake_rx) = std::sync::mpsc::sync_channel::<()>(1024);
 
     let vpn_ip = config.vpn_ip;
     let gateway_ip = config.gateway_ip;
@@ -342,14 +342,6 @@ fn run_stack(
                 }
             }
         }
-        // {
-        //     let mut q = tx_queue.lock().unwrap();
-        //     while let Some(pkt) = q.pop_front() {
-        //         if tun_to_udp_tx.blocking_send(pkt).is_err() {
-        //             return;
-        //         }
-        //     }
-        // }
 
         // Обслуживаем DNS-резолв через туннель.
         if !pending_dns.is_empty() {
@@ -413,8 +405,8 @@ fn run_stack(
 }
 
 async fn resolve_via_tunnel(
-    cmd_tx: &std::sync::mpsc::Sender<UdpStackCommand>,
-    wake_tx: &std::sync::mpsc::Sender<()>,
+    cmd_tx: &std::sync::mpsc::SyncSender<UdpStackCommand>,
+    wake_tx: &std::sync::mpsc::SyncSender<()>,
     host: &str,
     port: u16,
     want_v6: bool,
@@ -428,7 +420,7 @@ async fn resolve_via_tunnel(
     for &qtype in order {
         let (tx, rx) = std::sync::mpsc::sync_channel::<Option<IpAddr>>(1);
         if cmd_tx
-            .send(UdpStackCommand::Resolve(DnsResolve {
+            .try_send(UdpStackCommand::Resolve(DnsResolve {
                 name: host.to_string(),
                 qtype,
                 reply: tx,
@@ -437,10 +429,10 @@ async fn resolve_via_tunnel(
         {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Other,
-                "stack thread gone",
+                "stack thread gone or queue full",
             ));
         }
-        let _ = wake_tx.send(()); // разбудить стек: DNS-запрос
+        let _ = wake_tx.try_send(()); // разбудить стек: DNS-запрос
         let ip = tokio::task::spawn_blocking(move || {
             rx.recv_timeout(DNS_QUERY_TIMEOUT).ok().flatten()
         })
@@ -498,18 +490,6 @@ fn service_tcp_conn(conn: &mut ManagedConn, sockets: &mut SocketSet) -> bool {
         }
     }
 
-    // if socket.can_recv() {
-    //     let mut tmp = vec![0u8; 4096];
-    //     if let Ok(n) = socket.recv_slice(&mut tmp) {
-    //         if n > 0 {
-    //             tmp.truncate(n);
-    //             if conn.outbound_tx.try_send(tmp).is_err() {
-    //                 socket.abort();
-    //                 return true;
-    //             }
-    //         }
-    //     }
-    // }
     if socket.can_recv() {
         // Сливаем всё, что smoltcp набуферил, но только под наличие места в канале.
         // Нет места → не читаем (TCP-окно придержит сервер). НЕ abort.
@@ -616,9 +596,9 @@ fn socket_addr_to_ip_endpoint(addr: SocketAddr) -> IpEndpoint {
 
 async fn handle_socks5(
     stream: tokio::net::TcpStream,
-    cmd_tx: std::sync::mpsc::Sender<NewConn>,
-    udp_cmd_tx: std::sync::mpsc::Sender<UdpStackCommand>,
-    wake_tx: std::sync::mpsc::Sender<()>,
+    cmd_tx: std::sync::mpsc::SyncSender<NewConn>,
+    udp_cmd_tx: std::sync::mpsc::SyncSender<UdpStackCommand>,
+    wake_tx: std::sync::mpsc::SyncSender<()>,
     proxy_ip: IpAddr,
 ) {
     let mut session = Socks5Session::new(stream);
@@ -634,7 +614,7 @@ async fn handle_socks5(
 
     match req {
         Socks5Command::Connect(target) => {
-            handle_connect(session, cmd_tx, udp_cmd_tx, wake_tx, target).await;  // ← +udp_cmd_tx
+            handle_connect(session, cmd_tx, udp_cmd_tx, wake_tx, target).await;
         }
         Socks5Command::UdpAssociate(_) => {
             handle_udp_associate(session, udp_cmd_tx, wake_tx, proxy_ip).await;
@@ -644,9 +624,9 @@ async fn handle_socks5(
 
 async fn handle_connect(
     mut session: Socks5Session,
-    cmd_tx: std::sync::mpsc::Sender<NewConn>,
-    udp_cmd_tx: std::sync::mpsc::Sender<UdpStackCommand>,
-    wake_tx: std::sync::mpsc::Sender<()>,
+    cmd_tx: std::sync::mpsc::SyncSender<NewConn>,
+    udp_cmd_tx: std::sync::mpsc::SyncSender<UdpStackCommand>,
+    wake_tx: std::sync::mpsc::SyncSender<()>,
     target_addr: TargetAddr,
 ) {
     let target: SocketAddr = match target_addr {
@@ -686,7 +666,7 @@ async fn handle_connect(
     let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
 
     if cmd_tx
-        .send(NewConn {
+        .try_send(NewConn {
             target: smol_target,
             src_port,
             inbound: Arc::clone(&inbound),
@@ -699,7 +679,7 @@ async fn handle_connect(
         let _ = session.send_reply(REP_GENERAL_FAILURE).await;
         return;
     }
-    let _ = wake_tx.send(()); // разбудить стек: новый CONNECT
+    let _ = wake_tx.try_send(()); // разбудить стек: новый CONNECT
 
     let connected = tokio::task::spawn_blocking(move || {
         ready_rx.recv_timeout(CONNECT_TIMEOUT).unwrap_or(false)
@@ -770,8 +750,8 @@ fn smol_ip_to_std(ip: IpAddress) -> IpAddr {
 /// 6. Получаем UDP-ответы из VPN, оборачиваем в SOCKS5 UDP Response и отправляем клиенту.
 async fn handle_udp_associate(
     mut session: Socks5Session,
-    udp_cmd_tx: std::sync::mpsc::Sender<UdpStackCommand>,
-    wake_tx: std::sync::mpsc::Sender<()>,
+    udp_cmd_tx: std::sync::mpsc::SyncSender<UdpStackCommand>,
+    wake_tx: std::sync::mpsc::SyncSender<()>,
     proxy_ip: IpAddr,
 ) {
     // Слушаем на том же IP, что и прокси (эфемерный порт).
@@ -799,7 +779,7 @@ async fn handle_udp_associate(
     let (reply_tx, mut reply_rx) = mpsc::channel::<UdpRelayResponse>(256);
 
     if udp_cmd_tx
-        .send(UdpStackCommand::CreateAssoc(NewUdpAssoc {
+        .try_send(UdpStackCommand::CreateAssoc(NewUdpAssoc {
             relay_port,
             outbound_tx: reply_tx,
             close_flag: Arc::clone(&close_flag),
@@ -810,7 +790,7 @@ async fn handle_udp_associate(
         let _ = session.send_reply(REP_GENERAL_FAILURE).await;
         return;
     }
-    let _ = wake_tx.send(()); // разбудить стек: новая UDP-ассоциация
+    let _ = wake_tx.try_send(()); // разбудить стек: новая UDP-ассоциация
 
     // Ждём, пока smoltcp-поток зарегистрирует UDP-сокет.
     let ready = tokio::task::spawn_blocking(move || {
@@ -906,17 +886,18 @@ async fn handle_udp_associate(
                 }
             };
 
-            if udp_tx
-                .send(UdpStackCommand::SendPacket(UdpPacketCommand {
-                    relay_port,
-                    target: socket_addr_to_ip_endpoint(target_sock),
-                    payload: request.data,
-                }))
-                .is_err()
-            {
-                break;
+            match udp_tx.try_send(UdpStackCommand::SendPacket(UdpPacketCommand {
+                relay_port,
+                target: socket_addr_to_ip_endpoint(target_sock),
+                payload: request.data,
+            })) {
+                Ok(_) => { let _ = wake_tx_rd.try_send(()); }
+                Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                    warn!("SOCKS5 UDP proxy queue full, dropping packet to {}", target_sock);
+                    continue;
+                }
+                Err(_) => break, // канал закрыт, завершаем
             }
-            let _ = wake_tx_rd.send(()); // разбудить стек: исходящий UDP-пакет
         }
 
         close_flag_rd.store(true, Ordering::Relaxed);

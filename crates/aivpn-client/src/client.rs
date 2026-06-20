@@ -121,7 +121,7 @@ pub struct AivpnClient {
     _send_buf: Vec<u8>,
     _recv_buf: Vec<u8>,
     proxy_rx_queue: Option<Arc<Mutex<VecDeque<Vec<u8>>>>>,
-    proxy_wake_tx: Option<std::sync::mpsc::Sender<()>>,
+    proxy_wake_tx: Option<std::sync::mpsc::SyncSender<()>>,
     // Recording tracking
     active_recording_session: Option<[u8; 16]>,
     keepalive_interval: Duration,
@@ -963,7 +963,7 @@ impl AivpnClient {
                 if let Some(q) = &self.proxy_rx_queue {
                     q.lock().unwrap().push_back(ip_payload.to_vec());
                     if let Some(wtx) = &self.proxy_wake_tx {
-                        let _ = wtx.send(()); // входящий пакет → стек poll'ит мгновенно
+                        let _ = wtx.try_send(());
                     }
                 } else {
                     self.tunnel.write_packet_async(&ip_payload).await?;
