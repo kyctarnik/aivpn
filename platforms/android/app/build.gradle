@@ -3,7 +3,7 @@ plugins {
     id 'org.jetbrains.kotlin.android'
 }
 
-def cargoToml = new File(rootProject.projectDir.parentFile, 'Cargo.toml')
+def cargoToml = new File(rootProject.projectDir.parentFile.parentFile, 'Cargo.toml')
 def cargoTomlText = cargoToml.text
 def workspaceVersionMatch = (cargoTomlText =~ /(?ms)^\[workspace\.package\].*?^version = "([^"]+)"/)
 if (!workspaceVersionMatch.find()) {

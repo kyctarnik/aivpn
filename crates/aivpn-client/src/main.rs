@@ -874,6 +874,7 @@ async fn main() {
 /// Accepts both the full `aivpn://...` URI form and a bare base64url payload.
 /// Returns an error string on any parse failure so callers can surface a
 /// human-readable message without calling `std::process::exit`.
+#[allow(dead_code)]
 fn parse_connection_key(conn_key: &str) -> Result<serde_json::Value, String> {
     let payload = conn_key
         .trim()

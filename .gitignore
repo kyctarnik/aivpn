@@ -37,15 +37,15 @@ config/*.json
 CLAUDE.md
 
 # ── Android ──────────────────────────────────────────────────────────────────
-aivpn-android/**/build/
-aivpn-android/**/bin/
-aivpn-android/.gradle/
-aivpn-android/**/.cxx/
-aivpn-android/**/captures/
-aivpn-android/**/local.properties
-aivpn-android/**/local.properties.tmp
-aivpn-android/keystore.properties
-aivpn-android/*.jks
+platforms/android/**/build/
+platforms/android/**/bin/
+platforms/android/.gradle/
+platforms/android/**/.cxx/
+platforms/android/**/captures/
+platforms/android/**/local.properties
+platforms/android/**/local.properties.tmp
+platforms/android/keystore.properties
+platforms/android/*.jks
 *.apk
 *.idsig
 *.aab
@@ -55,7 +55,7 @@ aivpn-android/*.jks
 gen/
 
 # ── macOS ────────────────────────────────────────────────────────────────────
-aivpn-macos/build/
+platforms/macos/build/
 .DS_Store
 
 # ── IDE ──────────────────────────────────────────────────────────────────────

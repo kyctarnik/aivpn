@@ -16,7 +16,7 @@ except ImportError:
     sys.exit("Pillow is required: pip install Pillow")
 
 SCRIPT_DIR = Path(__file__).parent
-BRAND_ICON = SCRIPT_DIR.parent / "brand" / "icon-1024.png"
+BRAND_ICON = SCRIPT_DIR.parent.parent / "assets" / "brand" / "icon-1024.png"
 OUT = Path("/tmp/Aivpn.icns")
 
 if not BRAND_ICON.exists():
