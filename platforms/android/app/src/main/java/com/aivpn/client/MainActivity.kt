@@ -243,6 +243,9 @@ class MainActivity : AppCompatActivity() {
             }
             container.addView(row)
         }
+        
+        // Sync the main connect button with the newly active profile
+        updateUI(isConnected, binding.textStatus.text.toString())
     }
 
     private fun showProfileDialog(existing: SecureStorage.ConnectionProfile?) {
