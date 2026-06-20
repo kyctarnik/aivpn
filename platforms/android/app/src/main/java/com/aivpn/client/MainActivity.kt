@@ -480,8 +480,15 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-        // Auto-save if the key isn't already in profiles
-        if (profiles.none { it.key == connectionKey }) {
+        // Sync active profile with the entered key, or create a new profile if it's unknown
+        val existing = profiles.find { it.key == connectionKey }
+        if (existing != null) {
+            if (activeProfileId != existing.id) {
+                activeProfileId = existing.id
+                SecureStorage.saveActiveProfileId(this, existing.id)
+                renderProfiles()
+            }
+        } else {
             val profile = SecureStorage.ConnectionProfile(
                 id = UUID.randomUUID().toString(),
                 name = extractServerName(connectionKey),
