@@ -121,6 +121,7 @@ pub struct AivpnClient {
     _send_buf: Vec<u8>,
     _recv_buf: Vec<u8>,
     proxy_rx_queue: Option<Arc<Mutex<VecDeque<Vec<u8>>>>>,
+    proxy_wake_tx: Option<std::sync::mpsc::Sender<()>>,
     // Recording tracking
     active_recording_session: Option<[u8; 16]>,
     keepalive_interval: Duration,
@@ -184,6 +185,7 @@ impl AivpnClient {
             _send_buf: Vec::with_capacity(MAX_PACKET_SIZE),
             _recv_buf: Vec::with_capacity(MAX_PACKET_SIZE),
             proxy_rx_queue: None,
+            proxy_wake_tx: None,
             active_recording_session: None,
             keepalive_interval: Duration::from_secs(DEFAULT_KEEPALIVE_SECS as u64),
             last_local_port: None,
@@ -485,6 +487,7 @@ impl AivpnClient {
                 .await
                 .map_err(Error::Io)?;
             self.proxy_rx_queue = Some(Arc::clone(&handle.rx_queue));
+            self.proxy_wake_tx = Some(handle.wake_tx.clone());
         }
 
         // Take the TUN reader for the spawned task (skipped in proxy mode)
@@ -959,6 +962,9 @@ impl AivpnClient {
                 }
                 if let Some(q) = &self.proxy_rx_queue {
                     q.lock().unwrap().push_back(ip_payload.to_vec());
+                    if let Some(wtx) = &self.proxy_wake_tx {
+                        let _ = wtx.send(()); // входящий пакет → стек poll'ит мгновенно
+                    }
                 } else {
                     self.tunnel.write_packet_async(&ip_payload).await?;
                 }

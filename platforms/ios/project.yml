@@ -63,6 +63,6 @@ targets:
         SWIFT_OBJC_BRIDGING_HEADER: Tunnel/AivpnCoreBridge.h
         GENERATE_INFOPLIST_FILE: NO
         # Static library linked by the tunnel extension (not the app)
-        OTHER_LDFLAGS: $(inherited) -force_load $(SRCROOT)/../aivpn-ios-core/lib/libaivpn_core.a
-        LIBRARY_SEARCH_PATHS: $(inherited) $(SRCROOT)/../aivpn-ios-core/lib
-        HEADER_SEARCH_PATHS: $(inherited) $(SRCROOT)/../aivpn-ios-core/include
+        OTHER_LDFLAGS: $(inherited) -force_load $(SRCROOT)/../../crates/aivpn-ios-core/lib/libaivpn_core.a
+        LIBRARY_SEARCH_PATHS: $(inherited) $(SRCROOT)/../../crates/aivpn-ios-core/lib
+        HEADER_SEARCH_PATHS: $(inherited) $(SRCROOT)/../../crates/aivpn-ios-core/include
