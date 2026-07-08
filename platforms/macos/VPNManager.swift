@@ -1,6 +1,7 @@
 import Foundation
 import Combine
 import UserNotifications
+import Network
 
 // MARK: - Helper Protocol Types
 
@@ -15,6 +16,57 @@ struct HelperRequest: Codable {
     let adaptiveLevel: Int?
     let dnsProxy: String?
     let killSwitch: Bool?
+    let preferredMask: String?
+    // §3 Polymorphic mask: per-session unique traffic-shape variant of a base
+    // preset (e.g. "webrtc_zoom_v3"). Takes precedence over preferredMask on
+    // the helper/client side when both are present.
+    let polymorphicBase: String?
+    // §2 Crowdsourced mask feedback opt-ins + region hint.
+    let shareMaskFeedback: Bool?
+    let receiveMaskHints: Bool?
+    let countryCode: String?
+    // Advanced/operator bootstrap discovery — lets a client with no working
+    // aivpn:// key yet discover a server/mask via signed multi-channel
+    // fallback (CDN/Telegram/GitHub).
+    let bootstrapCdnUrl: String?
+    let bootstrapTelegramToken: String?
+    let bootstrapTelegramChat: String?
+    let bootstrapGithub: String?
+    let serverSigningKey: String?
+
+    init(action: String, key: String?, fullTunnel: Bool?, binaryPath: String?,
+         service: String?, mtlsCertPath: String?, excludeRoutes: String?,
+         adaptiveLevel: Int?, dnsProxy: String?, killSwitch: Bool?,
+         preferredMask: String? = nil,
+         polymorphicBase: String? = nil,
+         shareMaskFeedback: Bool? = nil,
+         receiveMaskHints: Bool? = nil,
+         countryCode: String? = nil,
+         bootstrapCdnUrl: String? = nil, bootstrapTelegramToken: String? = nil,
+         bootstrapTelegramChat: String? = nil,
+         bootstrapGithub: String? = nil,
+         serverSigningKey: String? = nil) {
+        self.action = action
+        self.key = key
+        self.fullTunnel = fullTunnel
+        self.binaryPath = binaryPath
+        self.service = service
+        self.mtlsCertPath = mtlsCertPath
+        self.excludeRoutes = excludeRoutes
+        self.adaptiveLevel = adaptiveLevel
+        self.dnsProxy = dnsProxy
+        self.killSwitch = killSwitch
+        self.preferredMask = preferredMask
+        self.polymorphicBase = polymorphicBase
+        self.shareMaskFeedback = shareMaskFeedback
+        self.receiveMaskHints = receiveMaskHints
+        self.countryCode = countryCode
+        self.bootstrapCdnUrl = bootstrapCdnUrl
+        self.bootstrapTelegramToken = bootstrapTelegramToken
+        self.bootstrapTelegramChat = bootstrapTelegramChat
+        self.bootstrapGithub = bootstrapGithub
+        self.serverSigningKey = serverSigningKey
+    }
 }
 
 struct HelperResponse: Codable {
@@ -75,7 +127,6 @@ class VPNManager: ObservableObject {
     @Published var bytesReceived: Int64 = 0
     @Published var qualityScore: Int = 0
     @Published var serverAdaptiveLevel: Int = 0
-    @Published var devicePublicKey: String = ""
     @Published var savedKey: String = ""
     @Published var helperAvailable: Bool = false
     @Published var isCheckingHelper: Bool = true
@@ -98,9 +149,40 @@ class VPNManager: ObservableObject {
     private var minimumRecordingStatusTimestamp: UInt64 = 0
     private var lastRecordingNotificationTimestamp: UInt64 = 0
 
+    // MARK: - Network Path Monitoring (active reconnect trigger)
+
+    private var pathMonitor: NWPathMonitor?
+    private let pathMonitorQueue = DispatchQueue(label: "com.aivpn.pathmonitor")
+    private var lastPathStatus: NWPath.Status?
+    private var lastPathInterfaceTypes: Set<NWInterface.InterfaceType> = []
+    private var networkChangeReconnectWorkItem: DispatchWorkItem?
+
+    // Parameters from the most recent connect()/connectProxy() call, replayed by
+    // performFastReconnect() when NWPathMonitor detects a network change. Mirrors
+    // what Android's ConnectivityManager.NetworkCallback does (trigger a fast
+    // restart instead of waiting on the Rust client's passive 1s->60s backoff).
+    private var lastConnectFullTunnel: Bool = false
+    private var lastConnectMtlsCertPath: String?
+    private var lastConnectExcludeRoutes: String?
+    private var lastConnectAdaptiveLevel: Int = 0
+    private var lastConnectDnsProxy: String?
+    private var lastConnectKillSwitch: Bool = false
+    private var lastConnectPreferredMask: String?
+    private var lastConnectPolymorphicBase: String?
+    private var lastConnectShareMaskFeedback: Bool = false
+    private var lastConnectReceiveMaskHints: Bool = false
+    private var lastConnectCountryCode: String?
+    private var lastConnectProxyPort: Int?
+
     private var proxyProcess: Process?
     private var proxyPollTimer: Timer?
-    private let proxyLogPath = "/tmp/aivpn-proxy.log"
+    private var proxyPollStartTime: Date?
+    private let proxyConnectTimeout: TimeInterval = 30.0
+    private let proxyLogPath: String = {
+        let tmp = FileManager.default.temporaryDirectory
+            .appendingPathComponent("aivpn-proxy.log").path
+        return tmp
+    }()
 
     private let socketPath = "/var/run/aivpn/helper.sock"
 
@@ -109,8 +191,7 @@ class VPNManager: ObservableObject {
     private let defaults = UserDefaults.standard
 
     init() {
-        // Загрузить ключи из нового хранилища
-        KeychainStorage.shared.loadKeys()
+        // KeychainStorage.shared already calls loadKeys() in its own init
         selectedKeyId = KeychainStorage.shared.selectedKeyId
         
         // Для обратной совместимости: если есть старый ключ и нет новых, добавить его
@@ -121,13 +202,11 @@ class VPNManager: ObservableObject {
                 _ = KeychainStorage.shared.addKey(name: "Default", keyValue: keyValue)
                 selectedKeyId = KeychainStorage.shared.selectedKeyId
             }
-            savedKey = keyValue
+            defaults.removeObject(forKey: "connection_key")
+            defaults.synchronize()
         }
 
-        // Load the device public key after a short delay (helper check is done by AppDelegate).
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
-            self?.loadDeviceKey()
-        }
+        startNetworkPathMonitor()
     }
 
     /// Returns the bundled aivpn-client path that is acceptable to the privileged helper.
@@ -161,14 +240,6 @@ class VPNManager: ObservableObject {
             }
         }
         return nil
-    }
-
-    func loadDeviceKey() {
-        runBundledClientCommand(["--show-device-key"]) { [weak self] success, output in
-            if success && !output.isEmpty {
-                self?.devicePublicKey = output
-            }
-        }
     }
 
     private func runBundledClientCommand(_ args: [String], completion: ((Bool, String) -> Void)? = nil) {
@@ -222,6 +293,16 @@ class VPNManager: ObservableObject {
         lastRecordingResult = nil
     }
 
+    private func postConnectionNotification(connected: Bool) {
+        let content = UNMutableNotificationContent()
+        let loc = LocalizationManager.shared
+        content.title = connected ? loc.t("notification_connected") : loc.t("notification_disconnected")
+        content.sound = .default
+        let id = "aivpn.connection.\(connected ? "on" : "off").\(Int(Date().timeIntervalSince1970))"
+        let request = UNNotificationRequest(identifier: id, content: content, trigger: nil)
+        UNUserNotificationCenter.current().add(request)
+    }
+
     private func postRecordingResultNotification(title: String, body: String, updatedAtMs: UInt64) {
         guard updatedAtMs > lastRecordingNotificationTimestamp else {
             return
@@ -256,8 +337,16 @@ class VPNManager: ObservableObject {
     }
     
     /// Добавить новый ключ
-    func addKey(name: String, keyValue: String, mtlsCertPath: String? = nil) -> Bool {
-        if let newKey = KeychainStorage.shared.addKey(name: name, keyValue: keyValue, mtlsCertPath: mtlsCertPath) {
+    func addKey(name: String, keyValue: String, mtlsCertPath: String? = nil,
+                bootstrapCdnUrl: String? = nil, bootstrapTelegramToken: String? = nil,
+                bootstrapTelegramChat: String? = nil,
+                bootstrapGithub: String? = nil,
+                serverSigningKey: String? = nil) -> Bool {
+        if let newKey = KeychainStorage.shared.addKey(name: name, keyValue: keyValue, mtlsCertPath: mtlsCertPath,
+                                                       bootstrapCdnUrl: bootstrapCdnUrl, bootstrapTelegramToken: bootstrapTelegramToken,
+                                                       bootstrapTelegramChat: bootstrapTelegramChat,
+                                                       bootstrapGithub: bootstrapGithub,
+                                                       serverSigningKey: serverSigningKey) {
             KeychainStorage.shared.selectKey(id: newKey.id)
             selectedKeyId = newKey.id
             savedKey = newKey.keyValue
@@ -281,8 +370,16 @@ class VPNManager: ObservableObject {
     }
     
     /// Обновить ключ полностью
-    func updateKey(id: String, name: String, keyValue: String, mtlsCertPath: String? = nil) -> Bool {
-        let updated = KeychainStorage.shared.updateKey(id: id, name: name, keyValue: keyValue, mtlsCertPath: mtlsCertPath)
+    func updateKey(id: String, name: String, keyValue: String, mtlsCertPath: String? = nil,
+                   bootstrapCdnUrl: String? = nil, bootstrapTelegramToken: String? = nil,
+                   bootstrapTelegramChat: String? = nil,
+                   bootstrapGithub: String? = nil,
+                   serverSigningKey: String? = nil) -> Bool {
+        let updated = KeychainStorage.shared.updateKey(id: id, name: name, keyValue: keyValue, mtlsCertPath: mtlsCertPath,
+                                                        bootstrapCdnUrl: bootstrapCdnUrl, bootstrapTelegramToken: bootstrapTelegramToken,
+                                                        bootstrapTelegramChat: bootstrapTelegramChat,
+                                                        bootstrapGithub: bootstrapGithub,
+                                                        serverSigningKey: serverSigningKey)
         if updated, selectedKeyId == id,
            let key = KeychainStorage.shared.keys.first(where: { $0.id == id }) {
             savedKey = key.keyValue
@@ -321,17 +418,18 @@ class VPNManager: ObservableObject {
                        &timeout, socklen_t(MemoryLayout<timeval>.size))
 
             // Build sockaddr_un
-            var addrBuf = [Int8](repeating: 0, count: 106)
-            addrBuf[0] = 0
-            addrBuf[1] = Int8(AF_UNIX)
+            var addr = sockaddr_un()
+            addr.sun_family = sa_family_t(AF_UNIX)
             let pathBytes = Array(sockPath.utf8)
-            for (i, byte) in pathBytes.enumerated() where i + 2 < addrBuf.count {
-                addrBuf[i + 2] = Int8(bitPattern: byte)
+            withUnsafeMutableBytes(of: &addr.sun_path) { buf in
+                for (i, byte) in pathBytes.enumerated() where i < buf.count - 1 {
+                    buf[i] = byte
+                }
             }
+            let addrLen = socklen_t(MemoryLayout<sockaddr_un>.size)
 
-            let connectResult = addrBuf.withUnsafeBufferPointer { ptr in
-                Darwin.connect(fd, UnsafeRawPointer(ptr.baseAddress!).assumingMemoryBound(to: sockaddr.self),
-                               socklen_t(addrBuf.count))
+            let connectResult = withUnsafePointer(to: &addr) {
+                Darwin.connect(fd, UnsafeRawPointer($0).assumingMemoryBound(to: sockaddr.self), addrLen)
             }
 
             guard connectResult == 0 else {
@@ -343,41 +441,72 @@ class VPNManager: ObservableObject {
             }
 
             // Send request with 4-byte big-endian length prefix
-            if let requestData = try? JSONEncoder().encode(request) {
-                let payloadLen = requestData.count
-                var lenBuf: [UInt8] = [
-                    UInt8((payloadLen >> 24) & 0xFF),
-                    UInt8((payloadLen >> 16) & 0xFF),
-                    UInt8((payloadLen >>  8) & 0xFF),
-                    UInt8( payloadLen        & 0xFF),
-                ]
-                _ = write(fd, &lenBuf, 4)
-                _ = requestData.withUnsafeBytes { ptr in
-                    write(fd, ptr.baseAddress!, payloadLen)
-                }
-            }
-
-            // Read response
-            var buffer = [UInt8](repeating: 0, count: 65536)
-            let bytesRead = read(fd, &buffer, buffer.count)
-            close(fd)
-
-            guard bytesRead > 0 else {
-                DispatchQueue.main.async {
-                    completion(nil)
-                }
+            let requestData: Data
+            do {
+                requestData = try JSONEncoder().encode(request)
+            } catch {
+                close(fd)
+                DispatchQueue.main.async { completion(nil) }
                 return
             }
 
-            let data = Data(bytes: buffer, count: bytesRead)
-            if let response = try? JSONDecoder().decode(HelperResponse.self, from: data) {
-                DispatchQueue.main.async {
-                    completion(response)
+            let payloadLen = requestData.count
+            var lenBuf: [UInt8] = [
+                UInt8((payloadLen >> 24) & 0xFF),
+                UInt8((payloadLen >> 16) & 0xFF),
+                UInt8((payloadLen >>  8) & 0xFF),
+                UInt8( payloadLen        & 0xFF),
+            ]
+            var lenSent = 0
+            while lenSent < 4 {
+                let n = write(fd, &lenBuf[lenSent], 4 - lenSent)
+                if n <= 0 {
+                    close(fd)
+                    DispatchQueue.main.async { completion(nil) }
+                    return
                 }
+                lenSent += n
+            }
+            var payloadSent = 0
+            let sendResult = requestData.withUnsafeBytes { rawBuf -> Bool in
+                guard let base = rawBuf.baseAddress else { return false }
+                while payloadSent < payloadLen {
+                    let n = write(fd, base.advanced(by: payloadSent), payloadLen - payloadSent)
+                    if n <= 0 { return false }
+                    payloadSent += n
+                }
+                return true
+            }
+            if !sendResult {
+                close(fd)
+                DispatchQueue.main.async { completion(nil) }
+                return
+            }
+
+            // Read response — loop until EOF (server closes connection after reply).
+            // A single read() on SOCK_STREAM is not guaranteed to return the full
+            // payload; reading until n == 0 (EOF) is the correct framing strategy.
+            var accum = Data()
+            var tmpBuf = [UInt8](repeating: 0, count: 4096)
+            while true {
+                let n = read(fd, &tmpBuf, tmpBuf.count)
+                if n > 0 {
+                    accum.append(contentsOf: tmpBuf[0..<n])
+                } else {
+                    break  // n == 0: EOF; n < 0: error or SO_RCVTIMEO elapsed
+                }
+            }
+            close(fd)
+
+            guard !accum.isEmpty else {
+                DispatchQueue.main.async { completion(nil) }
+                return
+            }
+
+            if let response = try? JSONDecoder().decode(HelperResponse.self, from: accum) {
+                DispatchQueue.main.async { completion(response) }
             } else {
-                DispatchQueue.main.async {
-                    completion(nil)
-                }
+                DispatchQueue.main.async { completion(nil) }
             }
         }
     }
@@ -408,13 +537,25 @@ class VPNManager: ObservableObject {
 
     // MARK: - Connect / Disconnect
 
-    func connect(key: String, fullTunnel: Bool = false, mtlsCertPath: String? = nil, excludeRoutes: String? = nil, adaptiveLevel: Int = 0, dnsProxy: String? = nil, killSwitch: Bool = false) {
+    func connect(key: String, fullTunnel: Bool = false, mtlsCertPath: String? = nil, excludeRoutes: String? = nil, adaptiveLevel: Int = 0, dnsProxy: String? = nil, killSwitch: Bool = false, preferredMask: String? = nil, polymorphicBase: String? = nil, shareMaskFeedback: Bool = false, receiveMaskHints: Bool = false, countryCode: String? = nil, bootstrapCdnUrl: String? = nil, bootstrapTelegramToken: String? = nil, bootstrapTelegramChat: String? = nil, bootstrapGithub: String? = nil, serverSigningKey: String? = nil) {
         guard !isConnecting else { return }
+        guard !isConnected else { return }
 
         let normalizedKey = key.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
             .replacingOccurrences(of: "aivpn://", with: "")
 
         savedKey = normalizedKey
+        lastConnectFullTunnel = fullTunnel
+        lastConnectMtlsCertPath = mtlsCertPath
+        lastConnectExcludeRoutes = excludeRoutes
+        lastConnectAdaptiveLevel = adaptiveLevel
+        lastConnectDnsProxy = dnsProxy
+        lastConnectKillSwitch = killSwitch
+        lastConnectPreferredMask = preferredMask
+        lastConnectPolymorphicBase = polymorphicBase
+        lastConnectShareMaskFeedback = shareMaskFeedback
+        lastConnectReceiveMaskHints = receiveMaskHints
+        lastConnectCountryCode = countryCode
 
         connectGeneration += 1
         isConnecting = true
@@ -426,6 +567,7 @@ class VPNManager: ObservableObject {
         recordingCapabilityKnown = false
         lastRecordingResult = nil
         minimumRecordingStatusTimestamp = currentTimestampMs()
+        serverAdaptiveLevel = 0
 
         // Determine binary path — prefer the one bundled in the app
         let binaryPath = helperClientBinaryPath()
@@ -440,7 +582,17 @@ class VPNManager: ObservableObject {
             excludeRoutes: excludeRoutes,
             adaptiveLevel: adaptiveLevel > 0 ? adaptiveLevel : nil,
             dnsProxy: dnsProxy.flatMap { $0.isEmpty ? nil : $0 },
-            killSwitch: killSwitch ? true : nil
+            killSwitch: killSwitch ? true : nil,
+            preferredMask: preferredMask.flatMap { $0.isEmpty || $0 == "auto" ? nil : $0 },
+            polymorphicBase: polymorphicBase.flatMap { $0.isEmpty || $0 == "auto" ? nil : $0 },
+            shareMaskFeedback: shareMaskFeedback ? true : nil,
+            receiveMaskHints: receiveMaskHints ? true : nil,
+            countryCode: countryCode.flatMap { $0.count == 2 ? $0 : nil },
+            bootstrapCdnUrl: bootstrapCdnUrl.flatMap { $0.isEmpty ? nil : $0 },
+            bootstrapTelegramToken: bootstrapTelegramToken.flatMap { $0.isEmpty ? nil : $0 },
+            bootstrapTelegramChat: bootstrapTelegramChat.flatMap { $0.isEmpty ? nil : $0 },
+            bootstrapGithub: bootstrapGithub.flatMap { $0.isEmpty ? nil : $0 },
+            serverSigningKey: serverSigningKey.flatMap { $0.isEmpty ? nil : $0 }
         )
 
         sendToHelper(request) { [weak self] response in
@@ -466,13 +618,19 @@ class VPNManager: ObservableObject {
 
     /// Launch aivpn-client directly as current user in SOCKS5 proxy mode.
     /// Does NOT go through the privileged helper — root is not needed for high ports.
-    func connectProxy(key: String, proxyPort: Int) {
+    func connectProxy(key: String, proxyPort: Int, preferredMask: String? = nil, polymorphicBase: String? = nil, shareMaskFeedback: Bool = false, receiveMaskHints: Bool = false, countryCode: String? = nil) {
         guard !isConnecting else { return }
 
         let normalizedKey = key.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
             .replacingOccurrences(of: "aivpn://", with: "")
 
         savedKey = normalizedKey
+        lastConnectProxyPort = proxyPort
+        lastConnectPreferredMask = preferredMask
+        lastConnectPolymorphicBase = polymorphicBase
+        lastConnectShareMaskFeedback = shareMaskFeedback
+        lastConnectReceiveMaskHints = receiveMaskHints
+        lastConnectCountryCode = countryCode
 
         // Warn if an mTLS cert is configured — it is silently ignored in proxy mode
         if let certPath = selectedKey?.mtlsCertPath, !certPath.isEmpty {
@@ -492,22 +650,68 @@ class VPNManager: ObservableObject {
             return
         }
 
-        // Clear log file
-        FileManager.default.createFile(atPath: proxyLogPath, contents: nil)
+        // Clear log file with secure permissions
+        if !FileManager.default.createFile(atPath: proxyLogPath, contents: nil, attributes: [.posixPermissions: 0o600]) {
+            isConnecting = false
+            isProxyMode = false
+            lastError = "Cannot create proxy log file"
+            return
+        }
+        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: proxyLogPath)
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: binaryPath)
-        process.arguments = ["-k", normalizedKey, "--proxy-listen", "127.0.0.1:\(proxyPort)"]
+        // The connection key (contains the PSK) goes via the AIVPN_CONNECTION_KEY
+        // environment variable, NOT argv — argv is visible to every same-uid
+        // process via `ps`. The Rust client falls back to the env var when -k
+        // is absent and scrubs it from its own environment after parsing
+        // (crates/aivpn-client/src/main.rs). Mirrors the Linux/Windows GUIs.
+        var processArgs = ["--proxy-listen", "127.0.0.1:\(proxyPort)"]
+        // Polymorphic base takes precedence over preferredMask, mirroring the
+        // helper's startClient() behavior for the full-tunnel connect path.
+        // Same allow-list as aivpn-helper/main.swift's `allowedMasks` — this
+        // path has no privileged helper in front of it (SOCKS5/no-admin mode
+        // launches aivpn-client directly), so it must validate itself instead
+        // of relying on the helper to reject a bad value.
+        let allowedMasks = ["webrtc_zoom_v3", "quic_https_v2",
+                            "webrtc_yandex_telemost_v1", "webrtc_vk_teams_v1",
+                            "webrtc_sberjazz_v1"]
+        if let polyBase = polymorphicBase, !polyBase.isEmpty, polyBase != "auto", allowedMasks.contains(polyBase) {
+            processArgs += ["--polymorphic-base", polyBase]
+        } else if let mask = preferredMask, !mask.isEmpty, mask != "auto", allowedMasks.contains(mask) {
+            processArgs += ["--preferred-mask", mask]
+        }
+        if shareMaskFeedback {
+            processArgs += ["--share-mask-feedback"]
+        }
+        if receiveMaskHints {
+            processArgs += ["--receive-mask-hints"]
+        }
+        // Require exactly two ASCII A-Z letters — matches the helper's rule
+        // and the CLI's own validation (rejects Cyrillic/Greek confusables
+        // that `.count == 2` alone would let through).
+        if let cc = countryCode, !cc.isEmpty {
+            let normalizedCc = cc.uppercased()
+            if normalizedCc.count == 2, normalizedCc.allSatisfy({ $0.isASCII && $0.isLetter }) {
+                processArgs += ["--country-code", normalizedCc]
+            }
+        }
+        process.arguments = processArgs
         var env = ProcessInfo.processInfo.environment
         env["RUST_LOG"] = "info"
+        env["AIVPN_CONNECTION_KEY"] = normalizedKey
         process.environment = env
 
-        if let fh = FileHandle(forWritingAtPath: proxyLogPath) {
+        let logHandle = FileHandle(forWritingAtPath: proxyLogPath)
+        if let fh = logHandle {
             process.standardOutput = fh
             process.standardError = fh
         }
 
+        let logPath = self.proxyLogPath
         process.terminationHandler = { [weak self] _ in
+            logHandle?.closeFile()
+            try? FileManager.default.removeItem(atPath: logPath)
             DispatchQueue.main.async {
                 guard let self = self, self.isProxyMode else { return }
                 self.stopProxyPoll()
@@ -523,6 +727,8 @@ class VPNManager: ObservableObject {
             proxyProcess = process
             startProxyPoll()
         } catch {
+            logHandle?.closeFile()
+            try? FileManager.default.removeItem(atPath: proxyLogPath)
             isConnecting = false
             isProxyMode = false
             lastError = "Failed to start proxy: \(error.localizedDescription)"
@@ -543,6 +749,7 @@ class VPNManager: ObservableObject {
 
     private func startProxyPoll() {
         proxyPollTimer?.invalidate()
+        proxyPollStartTime = Date()
         proxyPollTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             self?.pollProxyLog()
         }
@@ -554,20 +761,33 @@ class VPNManager: ObservableObject {
     }
 
     private func pollProxyLog() {
-        guard let log = try? String(contentsOfFile: proxyLogPath, encoding: .utf8) else { return }
-        if log.contains("SOCKS5 proxy listening") {
+        // Timeout check is cheap and must happen on the main thread to mutate state.
+        if let start = proxyPollStartTime, Date().timeIntervalSince(start) > proxyConnectTimeout {
             stopProxyPoll()
+            isConnecting = false
+            lastError = "Proxy connection timed out"
+            return
+        }
+        // File I/O is dispatched off the main thread to avoid blocking the RunLoop.
+        let path = proxyLogPath
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let log = try? String(contentsOfFile: path, encoding: .utf8) else { return }
             DispatchQueue.main.async { [weak self] in
-                guard let self = self else { return }
-                self.isConnected = true
-                self.isConnecting = false
-            }
-        } else if log.contains("ERROR") || log.contains("error") {
-            let lines = log.components(separatedBy: "\n").filter { !$0.isEmpty }
-            if let last = lines.last {
-                let truncated = String(last.prefix(200))
-                DispatchQueue.main.async { [weak self] in
-                    self?.lastError = truncated
+                guard let self = self, self.isConnecting else { return }
+                if log.contains("SOCKS5 proxy listening") {
+                    self.stopProxyPoll()
+                    self.isConnected = true
+                    self.isConnecting = false
+                } else {
+                    // Only a real ERROR-level tracing record counts as failure —
+                    // a bare substring match ("error") would abort the connect on
+                    // ordinary INFO lines containing URLs, counters or hostnames.
+                    let lines = log.components(separatedBy: "\n").filter { !$0.isEmpty }
+                    if let errLine = lines.last(where: { Self.isErrorLogLine($0) }) {
+                        self.lastError = String(errLine.prefix(200))
+                        self.stopProxyPoll()
+                        self.isConnecting = false
+                    }
                 }
             }
         }
@@ -594,9 +814,14 @@ class VPNManager: ObservableObject {
         }
     }
 
-    func disconnect() {
+    /// - Parameter completion: optional, called on the main thread once disconnect state
+    ///   has actually settled (after the helper IPC round-trip, or immediately for proxy
+    ///   mode). Used by performFastReconnect() to sequence a reconnect without racing
+    ///   isConnected/isConnecting, which are only flipped once the helper responds.
+    func disconnect(completion: (() -> Void)? = nil) {
         if isProxyMode {
             stopProxyMode()
+            completion?()
             return
         }
 
@@ -604,6 +829,12 @@ class VPNManager: ObservableObject {
         let disconnectGen = connectGeneration
         sendToHelper(request) { [weak self] _ in
             guard let self = self else { return }
+            // Guard: skip all state resets if connect() was called again before this
+            // callback fired (stale disconnect clobbering new connection state).
+            guard self.connectGeneration == disconnectGen else {
+                completion?()
+                return
+            }
             self.stopStatusPolling()
             self.trafficTimer?.invalidate()
             self.trafficTimer = nil
@@ -612,15 +843,89 @@ class VPNManager: ObservableObject {
             self.recordingCapabilityKnown = false
             self.lastRecordingResult = nil
             self.minimumRecordingStatusTimestamp = 0
+            self.isConnecting = false
+            self.isConnected = false
+            self.serverAdaptiveLevel = 0
+            // Re-ping helper after disconnect so connectButtonEnabled stays true.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                self?.checkHelperAvailable()
+            }
+            completion?()
+        }
+    }
 
-            DispatchQueue.main.async {
-                // Guard: skip state reset if connect() was called again before this
-                // callback fired (stale disconnect clobbering new connection state).
-                guard self.connectGeneration == disconnectGen else { return }
-                self.isConnecting = false
-                self.isConnected = false
+    /// Synchronous best-effort disconnect used on app termination (Quit button /
+    /// applicationWillTerminate). The regular disconnect() is fully async — its
+    /// helper IPC runs on a background queue and its completion hops back to the
+    /// main thread — so calling it right before NSApp.terminate() races process
+    /// exit and can leave the VPN up. This variant performs the socket round-trip
+    /// inline on the calling thread with a short timeout instead. It deliberately
+    /// does NOT touch @Published state: the process is about to exit.
+    func disconnectBlocking(timeoutSeconds: Double = 1.5) {
+        if isProxyMode {
+            proxyProcess?.terminate()
+            proxyProcess = nil
+            return
+        }
+        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+        guard fd >= 0 else { return }
+        defer { close(fd) }
+        var timeout = timeval(tv_sec: Int(timeoutSeconds),
+                              tv_usec: Int32((timeoutSeconds.truncatingRemainder(dividingBy: 1)) * 1_000_000))
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+
+        var addr = sockaddr_un()
+        addr.sun_family = sa_family_t(AF_UNIX)
+        let pathBytes = Array(socketPath.utf8)
+        withUnsafeMutableBytes(of: &addr.sun_path) { buf in
+            for (i, byte) in pathBytes.enumerated() where i < buf.count - 1 {
+                buf[i] = byte
             }
         }
+        let connected = withUnsafePointer(to: &addr) {
+            Darwin.connect(fd, UnsafeRawPointer($0).assumingMemoryBound(to: sockaddr.self),
+                           socklen_t(MemoryLayout<sockaddr_un>.size)) == 0
+        }
+        guard connected else { return }
+
+        let request = HelperRequest(action: "disconnect", key: nil, fullTunnel: nil, binaryPath: nil, service: nil, mtlsCertPath: nil, excludeRoutes: nil, adaptiveLevel: nil, dnsProxy: nil, killSwitch: nil)
+        guard let requestData = try? JSONEncoder().encode(request) else { return }
+        let payloadLen = requestData.count
+        var lenBuf: [UInt8] = [
+            UInt8((payloadLen >> 24) & 0xFF),
+            UInt8((payloadLen >> 16) & 0xFF),
+            UInt8((payloadLen >>  8) & 0xFF),
+            UInt8( payloadLen        & 0xFF),
+        ]
+        guard write(fd, &lenBuf, 4) == 4 else { return }
+        let sentAll = requestData.withUnsafeBytes { rawBuf -> Bool in
+            guard let base = rawBuf.baseAddress else { return false }
+            var sent = 0
+            while sent < payloadLen {
+                let n = write(fd, base.advanced(by: sent), payloadLen - sent)
+                if n <= 0 { return false }
+                sent += n
+            }
+            return true
+        }
+        guard sentAll else { return }
+        // Wait (bounded by SO_RCVTIMEO) until the helper has processed the
+        // disconnect and closed the connection — this is the whole point of the
+        // blocking variant: the client process is down before we return.
+        var tmpBuf = [UInt8](repeating: 0, count: 1024)
+        while read(fd, &tmpBuf, tmpBuf.count) > 0 {}
+    }
+
+    /// True when an (ANSI-stripped) log line is an actual ERROR-level tracing
+    /// record — level token at/near line start — rather than any line merely
+    /// containing the substring "error".
+    static func isErrorLogLine(_ rawLine: String) -> Bool {
+        let line = rawLine.replacingOccurrences(
+            of: "\u{001b}\\[[0-9;]*m", with: "", options: .regularExpression
+        )
+        if line.hasPrefix("ERROR") { return true }
+        return line.range(of: #"^\S+\s+ERROR\s"#, options: .regularExpression) != nil
     }
 
     func startMaskRecording(serviceName: String) {
@@ -693,6 +998,11 @@ class VPNManager: ObservableObject {
         sendToHelper(HelperRequest(action: "status", key: nil, fullTunnel: nil, binaryPath: nil, service: nil, mtlsCertPath: nil, excludeRoutes: nil, adaptiveLevel: nil, dnsProxy: nil, killSwitch: nil),                     timeoutSeconds: 2.0) { [weak self] response in
             guard let self = self, let response = response else { return }
 
+            // Proxy mode has its own process + poll timer (proxyPollTimer). The helper
+            // manages no client in proxy mode, so it reports connected:false — which this
+            // handler would misread as an unexpected drop and tear down the proxy UI state.
+            guard !self.isProxyMode else { return }
+
             guard response.status == "ok" else { return }
 
             let connected = response.connected ?? false
@@ -700,43 +1010,47 @@ class VPNManager: ObservableObject {
 
             if connected && !self.isConnected {
                 // Transition: connecting → connected
-                DispatchQueue.main.async {
-                    self.isConnecting = false
-                    self.isConnected = true
-                    self.lastError = nil
-                    self.startTrafficMonitor()
-                }
+                self.isConnecting = false
+                self.isConnected = true
+                self.lastError = nil
+                self.startTrafficMonitor()
+                self.postConnectionNotification(connected: true)
             } else if !connected && self.isConnected {
-                // Transition: connected → disconnected
-                DispatchQueue.main.async {
+                // Transition: connected → disconnected (unexpected drop)
+                self.isConnecting = false
+                self.isConnected = false
+                self.lastError = message
+                self.stopStatusPolling()
+                self.trafficTimer?.invalidate()
+                self.trafficTimer = nil
+                self.serverAdaptiveLevel = 0
+                self.postConnectionNotification(connected: false)
+                // Re-ping so the Connect button is re-enabled immediately.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                    self?.checkHelperAvailable()
+                }
+            } else if !connected && self.isConnecting {
+                // Still connecting — check if process died (error message).
+                // The bare-substring "error" check is gone: helper status
+                // messages for errors either start with "ERROR" (extracted from
+                // an ERROR-level log record by getStatus) or contain the
+                // explicit words below — matching "error" anywhere misclassified
+                // benign progress lines as failures.
+                let lowerMsg = message.lowercased()
+                let isFailure = lowerMsg.contains("exited") ||
+                                lowerMsg.contains("failed") ||
+                                message.hasPrefix("ERROR") ||
+                                message.contains(" ERROR ") ||
+                                lowerMsg.contains("not found")
+
+                if isFailure {
                     self.isConnecting = false
                     self.isConnected = false
                     self.lastError = message
                     self.stopStatusPolling()
-                    self.trafficTimer?.invalidate()
-                    self.trafficTimer = nil
-                }
-            } else if !connected && self.isConnecting {
-                // Still connecting — check if process died (error message)
-                // If message contains "exited" or "Failed" or "ERROR", it's a failure
-                let lowerMsg = message.lowercased()
-                let isFailure = lowerMsg.contains("exited") ||
-                                lowerMsg.contains("failed") ||
-                                lowerMsg.contains("error") ||
-                                lowerMsg.contains("not found")
-
-                if isFailure {
-                    DispatchQueue.main.async {
-                        self.isConnecting = false
-                        self.isConnected = false
-                        self.lastError = message
-                        self.stopStatusPolling()
-                    }
                 } else {
                     // Still connecting — update status message for user
-                    DispatchQueue.main.async {
-                        self.lastError = nil
-                    }
+                    self.lastError = nil
                 }
             }
 
@@ -777,32 +1091,33 @@ class VPNManager: ObservableObject {
             recordingState = .analyzing(service: service)
         case "success":
             recordingState = .success(service: service, maskId: snapshot.mask_id)
-            let title = "Mask recorded successfully"
-            let details: String
+            let loc = LocalizationManager.shared
+            let successTitle = loc.t("recording_result_success_title")
+            let successDetails: String
             if let maskId = snapshot.mask_id, !maskId.isEmpty {
-                details = "Mask was saved. ID: \(maskId)"
+                successDetails = "ID: \(maskId)"
             } else {
-                details = "Mask was saved successfully."
+                successDetails = service
             }
             lastRecordingResult = RecordingResultSummary(
                 succeeded: true,
-                title: title,
-                details: details,
+                title: successTitle,
+                details: successDetails,
                 updatedAtMs: snapshot.updated_at_ms
             )
-            postRecordingResultNotification(title: title, body: details, updatedAtMs: snapshot.updated_at_ms)
+            postRecordingResultNotification(title: successTitle, body: successDetails, updatedAtMs: snapshot.updated_at_ms)
         case "failed":
-            recordingState = .failed(service: service, reason: snapshot.message ?? "Recording failed")
-            let reason = snapshot.message ?? "Recording failed"
-            let title = "Mask recording failed"
-            let details = "Mask was not saved. \(reason)"
+            let reason = snapshot.message ?? service
+            recordingState = .failed(service: service, reason: reason)
+            let loc = LocalizationManager.shared
+            let failTitle = loc.t("recording_result_failed_title")
             lastRecordingResult = RecordingResultSummary(
                 succeeded: false,
-                title: title,
-                details: details,
+                title: failTitle,
+                details: reason,
                 updatedAtMs: snapshot.updated_at_ms
             )
-            postRecordingResultNotification(title: title, body: details, updatedAtMs: snapshot.updated_at_ms)
+            postRecordingResultNotification(title: failTitle, body: reason, updatedAtMs: snapshot.updated_at_ms)
         default:
             recordingState = .idle
         }
@@ -837,15 +1152,118 @@ class VPNManager: ObservableObject {
                     let key = kv[0]
                     let valStr = kv[1]
                     if key == "sent", let value = Int64(valStr) {
-                        DispatchQueue.main.async { self.bytesSent = value }
+                        self.bytesSent = value
                     } else if key == "received", let value = Int64(valStr) {
-                        DispatchQueue.main.async { self.bytesReceived = value }
+                        self.bytesReceived = value
                     } else if key == "quality", let value = Int(valStr) {
-                        DispatchQueue.main.async { self.qualityScore = value }
+                        self.qualityScore = value
                     } else if key == "adaptive", let value = Int(valStr) {
-                        DispatchQueue.main.async { self.serverAdaptiveLevel = value }
+                        self.serverAdaptiveLevel = value
                     }
                 }
+            }
+        }
+    }
+
+    // MARK: - Network Path Monitoring
+
+    /// Starts watching for network path changes (wifi<->cellular switches, sleep/wake,
+    /// connectivity drops/restores). Runs for the lifetime of the app — the handler only
+    /// acts when the VPN is supposed to be connected. This is the macOS analog of
+    /// Android's ConnectivityManager.NetworkCallback-driven fast restart: instead of
+    /// waiting for the Rust client's passive reconnect backoff to notice the network
+    /// changed, we proactively cycle disconnect()/connect() (or connectProxy()) so the
+    /// tunnel re-establishes on the new path immediately.
+    private func startNetworkPathMonitor() {
+        let monitor = NWPathMonitor()
+        monitor.pathUpdateHandler = { [weak self] path in
+            DispatchQueue.main.async {
+                self?.handlePathUpdate(path)
+            }
+        }
+        monitor.start(queue: pathMonitorQueue)
+        pathMonitor = monitor
+    }
+
+    private func handlePathUpdate(_ path: NWPath) {
+        let previousStatus = lastPathStatus
+        let previousInterfaces = lastPathInterfaceTypes
+        let currentInterfaces = Set(path.availableInterfaces.map { $0.type })
+
+        lastPathStatus = path.status
+        lastPathInterfaceTypes = currentInterfaces
+
+        // First callback only establishes the baseline — nothing has changed yet.
+        guard let previousStatus = previousStatus else { return }
+
+        // Network came back after being unreachable (e.g. wifi drop -> reconnect),
+        // or the set of available interfaces changed while still online (e.g.
+        // wifi -> cellular handover, or waking from sleep on a different network).
+        let networkRestored = previousStatus != .satisfied && path.status == .satisfied
+        let interfaceSwitched = path.status == .satisfied && !previousInterfaces.isEmpty
+            && currentInterfaces != previousInterfaces
+
+        guard networkRestored || interfaceSwitched else { return }
+        guard isConnected, !isConnecting else { return }
+
+        scheduleFastReconnect()
+    }
+
+    private func scheduleFastReconnect() {
+        networkChangeReconnectWorkItem?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.performFastReconnect()
+        }
+        networkChangeReconnectWorkItem = workItem
+        // Short debounce: a real network switch (old interface down, new interface up)
+        // can fire NWPathMonitor's handler several times in quick succession.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0, execute: workItem)
+    }
+
+    /// Re-establishes the tunnel using the parameters from the most recent connect()
+    /// or connectProxy() call. Triggered by a detected network change rather than the
+    /// user; safe to call no-op if the VPN is no longer connected by the time it runs.
+    private func performFastReconnect() {
+        guard isConnected, !isConnecting else { return }
+        guard !savedKey.isEmpty else { return }
+
+        if isProxyMode {
+            let key = savedKey
+            let port = lastConnectProxyPort ?? 1080
+            let mask = lastConnectPreferredMask
+            let polymorphicBase = lastConnectPolymorphicBase
+            let shareMaskFeedback = lastConnectShareMaskFeedback
+            let receiveMaskHints = lastConnectReceiveMaskHints
+            let countryCode = lastConnectCountryCode
+            stopProxyMode()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                self?.connectProxy(key: key, proxyPort: port, preferredMask: mask,
+                                    polymorphicBase: polymorphicBase,
+                                    shareMaskFeedback: shareMaskFeedback,
+                                    receiveMaskHints: receiveMaskHints,
+                                    countryCode: countryCode)
+            }
+        } else {
+            let key = savedKey
+            let fullTunnel = lastConnectFullTunnel
+            let mtlsCertPath = lastConnectMtlsCertPath
+            let excludeRoutes = lastConnectExcludeRoutes
+            let adaptiveLevel = lastConnectAdaptiveLevel
+            let dnsProxy = lastConnectDnsProxy
+            let killSwitch = lastConnectKillSwitch
+            let preferredMask = lastConnectPreferredMask
+            let polymorphicBase = lastConnectPolymorphicBase
+            let shareMaskFeedback = lastConnectShareMaskFeedback
+            let receiveMaskHints = lastConnectReceiveMaskHints
+            let countryCode = lastConnectCountryCode
+            // Wait for disconnect's helper round-trip to actually flip isConnected/isConnecting
+            // before reconnecting — connect() no-ops while isConnected is still true.
+            disconnect { [weak self] in
+                self?.connect(key: key, fullTunnel: fullTunnel, mtlsCertPath: mtlsCertPath,
+                               excludeRoutes: excludeRoutes, adaptiveLevel: adaptiveLevel,
+                               dnsProxy: dnsProxy, killSwitch: killSwitch, preferredMask: preferredMask,
+                               polymorphicBase: polymorphicBase, shareMaskFeedback: shareMaskFeedback,
+                               receiveMaskHints: receiveMaskHints, countryCode: countryCode)
             }
         }
     }

@@ -24,6 +24,7 @@ SWIFT_SOURCES=(
     "$SCRIPT_DIR/LocalizationManager.swift"
     "$SCRIPT_DIR/KeychainHelper.swift"
     "$SCRIPT_DIR/ConnectionKey.swift"
+    "$SCRIPT_DIR/LaunchAgentManager.swift"
 )
 
 HELPER_SOURCES=(

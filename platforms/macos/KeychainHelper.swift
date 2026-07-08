@@ -19,9 +19,9 @@ class KeychainHelper {
             kSecAttrAccount as String: key,
             kSecAttrService as String: "com.aivpn.client",
             kSecValueData as String: data,
-            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlock
+            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
         ]
-        SecItemAdd(addQuery as CFDictionary, nil)
+        _ = SecItemAdd(addQuery as CFDictionary, nil)
     }
 
     func load(key: String) -> String? {

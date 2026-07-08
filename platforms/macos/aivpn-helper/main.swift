@@ -9,6 +9,7 @@
 
 import Foundation
 import Darwin
+import Security
 import SystemConfiguration
 
 // MARK: - Constants
@@ -39,6 +40,23 @@ struct HelperRequest: Codable {
     let adaptiveLevel: Int?   // 0=Off, 1=Light, 2=Aggressive, 3=Satellite; nil treated as 0
     let dnsProxy: String?      // local bind address for DNS proxy (e.g. "127.0.0.1:5300")
     let killSwitch: Bool?      // block all non-VPN traffic when true
+    let preferredMask: String? // mask profile name, e.g. "webrtc_zoom_v3"; nil/absent = auto
+    // §3 Polymorphic mask: per-session unique traffic-shape variant of a base
+    // preset. When present and valid, takes precedence over preferredMask.
+    let polymorphicBase: String?
+    // §2 Crowdsourced mask feedback opt-ins + region hint.
+    let shareMaskFeedback: Bool?
+    let receiveMaskHints: Bool?
+    let countryCode: String? // ISO 3166-1 alpha-2, e.g. "RU"; must be exactly 2 letters
+    // Advanced/operator bootstrap discovery (for connect) — forwarded verbatim
+    // to aivpn-client's --bootstrap-* / --server-signing-key flags. Only
+    // relevant when the client has no working aivpn:// key yet and needs to
+    // discover a server/mask via signed multi-channel fallback.
+    let bootstrapCdnUrl: String?
+    let bootstrapTelegramToken: String?
+    let bootstrapTelegramChat: String?
+    let bootstrapGithub: String?
+    let serverSigningKey: String?
 }
 
 struct HelperResponse: Codable {
@@ -65,6 +83,13 @@ struct HelperResponse: Codable {
 
 var managedPID: pid_t = 0
 var isConnected = false
+var childReapSources: [pid_t: DispatchSourceProcess] = [:]
+
+// Serial queue that serialises all connection state mutations (managedPID,
+// isConnected, childReapSources). Declared globally so startClient's child-reap
+// handler and the main accept loop both use the same queue, eliminating the data
+// race that existed when the child-reap handler ran on a separate private queue.
+let connectionQueue = DispatchQueue(label: "aivpn.helper.connections")
 
 // MARK: - Logging
 
@@ -100,10 +125,13 @@ func killExistingClient() {
     }
 
     // Check PID file for orphaned processes
-    if let pidStr = try? String(contentsOfFile: PID_PATH, encoding: .utf8) {
+    if let pidStr = try? String(contentsOfFile: PID_PATH, encoding: .utf8),
+       pidStr.count <= 16 {
         let trimmed = pidStr.trimmingCharacters(in: .whitespacesAndNewlines)
         if let pid = Int32(trimmed), pid > 0 {
-            if kill(pid, 0) == 0 {
+            // Same recycled-PID hazard as recoverExistingClient: never signal
+            // a disk-sourced pid without confirming it is our client binary.
+            if kill(pid, 0) == 0, pidIsAivpnClient(pid) {
                 log("Stopping orphaned aivpn-client (PID: \(pid))")
                 kill(pid, SIGTERM)
                 usleep(500_000)
@@ -156,8 +184,40 @@ func runCommand(_ path: String, args: [String]) -> Bool {
     }
 }
 
+/// Resolve the home directory of the *console* (logged-in GUI) user.
+///
+/// This helper runs as a root LaunchDaemon, so `NSHomeDirectory()` here is
+/// `/var/root` — NOT the interactive user's home. To validate a cert path the
+/// GUI app stored under the user's home we must discover the real console user
+/// via SystemConfiguration + the password database.
+///
+/// Returns nil (fail-closed) when there is no console user (login window,
+/// SSH-only session) or the lookup fails, so callers reject the path rather
+/// than widening the allow-list.
+func consoleUserHomeDirectory() -> String? {
+    var uid: uid_t = 0
+    var gid: gid_t = 0
+    guard let consoleUser = SCDynamicStoreCopyConsoleUser(nil, &uid, &gid) else {
+        return nil
+    }
+    let username = consoleUser as String
+    // "loginwindow" is the sentinel reported when nobody is logged in.
+    guard !username.isEmpty, username != "loginwindow" else {
+        return nil
+    }
+    guard let pw = getpwnam(username), let homeC = pw.pointee.pw_dir else {
+        return nil
+    }
+    let home = String(cString: homeC)
+    // Sanity: an absolute path that is not the filesystem root itself.
+    guard home.hasPrefix("/"), home != "/" else {
+        return nil
+    }
+    return home
+}
+
 /// Start aivpn-client with the given configuration using posix_spawn
-func startClient(key: String, fullTunnel: Bool, binaryPath: String?, mtlsCertPath: String? = nil, excludeRoutes: String? = nil, adaptiveLevel: Int = 0, dnsProxy: String? = nil, killSwitch: Bool = false) -> HelperResponse {
+func startClient(key: String, fullTunnel: Bool, binaryPath: String?, mtlsCertPath: String? = nil, excludeRoutes: String? = nil, adaptiveLevel: Int = 0, dnsProxy: String? = nil, killSwitch: Bool = false, preferredMask: String? = nil, polymorphicBase: String? = nil, shareMaskFeedback: Bool = false, receiveMaskHints: Bool = false, countryCode: String? = nil, bootstrapCdnUrl: String? = nil, bootstrapTelegramToken: String? = nil, bootstrapTelegramChat: String? = nil, bootstrapGithub: String? = nil, serverSigningKey: String? = nil) -> HelperResponse {
     killExistingClient()
 
     // Resolve the requested path; fall back to default
@@ -190,26 +250,67 @@ func startClient(key: String, fullTunnel: Bool, binaryPath: String?, mtlsCertPat
     )
 
     // Clear log
-    try? Data().write(to: URL(fileURLWithPath: LOG_PATH))
+    do {
+        try Data().write(to: URL(fileURLWithPath: LOG_PATH))
+    } catch {
+        log("WARNING: could not clear log: \(error)")
+    }
 
-    // Build arguments
-    var args: [String] = [clientPath, "-k", key]
+    // Build arguments. The connection key (which contains the PSK) is passed
+    // via the AIVPN_CONNECTION_KEY environment variable, NOT argv: argv of any
+    // process is visible to every local user via `ps`, while the spawned
+    // child's environment is only readable by root/same-uid. The Rust client
+    // reads the env var when -k is absent (crates/aivpn-client/src/main.rs)
+    // and removes it from its own environment immediately after parsing.
+    var args: [String] = [clientPath]
     if fullTunnel {
         args.append("--full-tunnel")
     }
     if let certPath = mtlsCertPath {
-        let homeDir = NSHomeDirectory()
-        let allowedPrefixes = [homeDir, "/etc/ssl", "/usr/local/etc"]
-        let certOk = certPath.count <= 512
-            && allowedPrefixes.contains(where: { certPath.hasPrefix($0) })
-            && certPath.range(of: #"^[\w/\.\-]+\.(pem|crt|cer)$"#,
-                              options: .regularExpression) != nil
+        // Canonicalize BEFORE validation: resolve symlinks and normalize ./..
+        // components so a path like "/Users/x/../../../etc/passwd" or a symlink
+        // pointing outside the allowed roots cannot slip through the prefix
+        // check disguised as a valid location. Mirrors the binary-path
+        // canonicalization above.
+        let resolvedCertPath = URL(fileURLWithPath: certPath)
+            .resolvingSymlinksInPath().standardized.path
+
+        // Build the allow-list of acceptable roots. The GUI app stores certs in
+        // the *console* user's home (e.g. ~/Library/Application Support/AIVPN),
+        // but this helper runs as root — NSHomeDirectory() here is /var/root,
+        // NOT the logged-in user's home. Resolve the real console user's home;
+        // if it can't be resolved (login window, SSH-only session, lookup
+        // failure) we omit it and fall back to the system roots only — fail
+        // CLOSED, never widening the allow-list to all of /Users.
+        var allowedRoots = ["/etc/ssl", "/usr/local/etc"]
+        if let consoleHome = consoleUserHomeDirectory() {
+            allowedRoots.append(consoleHome)
+        }
+        // Canonicalize the roots too, so system symlinks (e.g. /etc ->
+        // /private/etc) don't cause a false rejection of a valid cert.
+        let allowedPrefixes = allowedRoots.map {
+            URL(fileURLWithPath: $0).resolvingSymlinksInPath().standardized.path
+        }
+
+        // Match at a path-component boundary: the prefix itself or "prefix/...",
+        // so "/etc/ssl" cannot accidentally authorize "/etc/sslmalicious".
+        let withinAllowedRoot = allowedPrefixes.contains { prefix in
+            resolvedCertPath == prefix || resolvedCertPath.hasPrefix(prefix + "/")
+        }
+
+        // Regex allows spaces because the app's normal store path
+        // (~/Library/Application Support/AIVPN) contains one; spaces are safe
+        // here since posix_spawn passes argv directly with no shell.
+        let certOk = resolvedCertPath.count <= 512
+            && withinAllowedRoot
+            && resolvedCertPath.range(of: #"^[\w /\.\-]+\.(pem|crt|cer)$"#,
+                                      options: .regularExpression) != nil
         guard certOk else {
             log("ERROR: invalid mtlsCertPath '\(certPath)' — rejected")
             return HelperResponse(status: "error", message: "Invalid mTLS cert path")
         }
         args.append("--mtls-cert")
-        args.append(certPath)
+        args.append(resolvedCertPath)
     }
     if adaptiveLevel > 0 {
         args.append("--adaptive-level")
@@ -246,42 +347,136 @@ func startClient(key: String, fullTunnel: Bool, binaryPath: String?, mtlsCertPat
         args.append("--exclude-routes")
         args.append(tokens.joined(separator: ","))
     }
+    // Shared allow-list for both --preferred-mask and --polymorphic-base — the
+    // latter is a per-session variant of one of the same base presets.
+    let allowedMasks = ["webrtc_zoom_v3", "quic_https_v2",
+                        "webrtc_yandex_telemost_v1", "webrtc_vk_teams_v1",
+                        "webrtc_sberjazz_v1"]
+    if let polyBase = polymorphicBase, !polyBase.isEmpty, polyBase != "auto" {
+        guard allowedMasks.contains(polyBase) else {
+            log("ERROR: invalid polymorphicBase '\(polyBase)' — rejected")
+            return HelperResponse(status: "error", message: "Invalid polymorphic mask base")
+        }
+        // §3: polymorphic-base takes precedence over --preferred-mask.
+        args.append("--polymorphic-base")
+        args.append(polyBase)
+    } else if let mask = preferredMask, !mask.isEmpty, mask != "auto" {
+        guard allowedMasks.contains(mask) else {
+            log("ERROR: invalid preferredMask '\(mask)' — rejected")
+            return HelperResponse(status: "error", message: "Invalid mask profile name")
+        }
+        args.append("--preferred-mask")
+        args.append(mask)
+    }
+
+    // §2: crowdsourced mask feedback opt-ins (bool flags, no value).
+    if shareMaskFeedback {
+        args.append("--share-mask-feedback")
+    }
+    if receiveMaskHints {
+        args.append("--receive-mask-hints")
+    }
+    if let cc = countryCode, !cc.isEmpty {
+        let normalized = cc.uppercased()
+        // Require exactly two ASCII A–Z letters. `CharacterSet.uppercaseLetters`
+        // also matches non-ASCII uppercase (Cyrillic/Greek/…) and `.count` is by
+        // grapheme, so a 2-char non-ASCII code would slip through and reach the
+        // CLI as bytes it can't validate — match the CLI's ASCII-only rule.
+        if normalized.count == 2,
+           normalized.allSatisfy({ $0.isASCII && $0.isLetter }) {
+            args.append("--country-code")
+            args.append(normalized)
+        } else {
+            // Non-fatal: omit the flag rather than rejecting the whole connect —
+            // this is a regional hint, not a security-sensitive path/binary value.
+            log("WARNING: invalid countryCode '\(cc)' — omitted")
+        }
+    }
+
+    // Advanced/operator bootstrap discovery flags — forwarded verbatim to
+    // aivpn-client. These aren't filesystem paths or shell commands (Process
+    // passes argv directly, no shell interpretation), so we only guard
+    // against obviously-malformed input: empty-after-trim, embedded control
+    // characters, or unreasonable length.
+    func sanitizedBootstrapArg(_ raw: String?, maxLength: Int = 2048) -> String? {
+        guard let value = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty else {
+            return nil
+        }
+        guard value.count <= maxLength,
+              !value.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }) else {
+            return nil
+        }
+        return value
+    }
+
+    if let cdnUrl = sanitizedBootstrapArg(bootstrapCdnUrl) {
+        args.append("--bootstrap-cdn-url")
+        args.append(cdnUrl)
+    }
+    // The Telegram bot token is a secret — like the connection key it goes via
+    // the environment (AIVPN_BOOTSTRAP_TELEGRAM_TOKEN, declared as the clap env
+    // fallback for --bootstrap-telegram-token in the Rust client), not argv.
+    let telegramTokenEnv = sanitizedBootstrapArg(bootstrapTelegramToken, maxLength: 256)
+    if let telegramChat = sanitizedBootstrapArg(bootstrapTelegramChat, maxLength: 256) {
+        args.append("--bootstrap-telegram-chat")
+        args.append(telegramChat)
+    }
+    if let github = sanitizedBootstrapArg(bootstrapGithub, maxLength: 256) {
+        args.append("--bootstrap-github")
+        args.append(github)
+    }
+    if let signingKey = sanitizedBootstrapArg(serverSigningKey, maxLength: 128) {
+        args.append("--server-signing-key")
+        args.append(signingKey)
+    }
 
     // Use posix_spawn for reliable process management
     var fileActions: posix_spawn_file_actions_t?
-    posix_spawn_file_actions_init(&fileActions)
+    guard posix_spawn_file_actions_init(&fileActions) == 0 else {
+        log("ERROR: posix_spawn_file_actions_init failed")
+        return HelperResponse(status: "error", message: "Internal spawn setup failure")
+    }
 
-    // Redirect stdout/stderr to log file (world-readable for debugging)
-    let logFd = open(LOG_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
+    // Redirect stdout/stderr to log file (root-only for security)
+    let logFd = open(LOG_PATH, O_WRONLY | O_CREAT | O_APPEND, 0o600)
     if logFd >= 0 {
         posix_spawn_file_actions_adddup2(&fileActions, logFd, STDOUT_FILENO)
         posix_spawn_file_actions_adddup2(&fileActions, logFd, STDERR_FILENO)
         posix_spawn_file_actions_addclose(&fileActions, logFd)
-        // Ensure log is readable
-        chmod(LOG_PATH, 0o644)
+        chmod(LOG_PATH, 0o600)
     }
 
     // Set RUST_LOG=info so tracing outputs info-level logs (default is ERROR only)
     // Preserve the existing PATH so we can find system binaries like ifconfig/route
     var envp: [UnsafeMutablePointer<CChar>?] = []
     
-    // Copy current environment first
+    // Copy current environment, stripping variables we set explicitly below.
+    let reservedEnvKeys = ["RUST_LOG", "AIVPN_CONNECTION_KEY", "AIVPN_BOOTSTRAP_TELEGRAM_TOKEN"]
     let currentEnv = ProcessInfo.processInfo.environment
-    for (key, value) in currentEnv {
-        envp.append(strdup("\(key)=\(value)"))
+    for (envKey, value) in currentEnv where !reservedEnvKeys.contains(envKey) {
+        envp.append(strdup("\(envKey)=\(value)"))
     }
-    
-    // Add/override RUST_LOG=info
+
+    // Force RUST_LOG=info — prevents leaked debug/trace output to the log file
     envp.append(strdup("RUST_LOG=info"))
+    // Secrets via env, not argv (see comment at the args declaration above).
+    envp.append(strdup("AIVPN_CONNECTION_KEY=\(key)"))
+    if let telegramToken = telegramTokenEnv {
+        envp.append(strdup("AIVPN_BOOTSTRAP_TELEGRAM_TOKEN=\(telegramToken)"))
+    }
     envp.append(nil)
 
     var pid: pid_t = 0
     let argv = args.map { strdup($0) } + [nil]
+    precondition(!argv.isEmpty, "argv must not be empty")
 
     let spawnResult = argv.withUnsafeBufferPointer { ptr in
-        envp.withUnsafeMutableBufferPointer { envPtr in
+        guard let base = ptr.baseAddress else {
+            fatalError("argv buffer has no base address")
+        }
+        return envp.withUnsafeMutableBufferPointer { envPtr in
             posix_spawn(&pid, clientPath, &fileActions, nil,
-                        UnsafeMutablePointer(mutating: ptr.baseAddress),
+                        UnsafeMutablePointer(mutating: base),
                         UnsafeMutablePointer(mutating: envPtr.baseAddress))
         }
     }
@@ -306,6 +501,22 @@ func startClient(key: String, fullTunnel: Bool, binaryPath: String?, mtlsCertPat
     isConnected = false
     try? "\(pid)".write(toFile: PID_PATH, atomically: true, encoding: .utf8)
     log("Started aivpn-client (PID: \(pid))")
+
+    // Reap child on exit to prevent zombie accumulation.
+    // The source must be stored globally — a local variable would be released by ARC
+    // immediately after startClient() returns, cancelling the source before it fires.
+    // Use connectionQueue so the handler accesses childReapSources on the same serial
+    // queue as startClient / handleConnection — eliminates the previous data race.
+    let childSource = DispatchSource.makeProcessSource(identifier: pid, eventMask: .exit,
+                                                       queue: connectionQueue)
+    childSource.setEventHandler {
+        waitpid(pid, nil, WNOHANG)
+        childSource.cancel()
+        childReapSources.removeValue(forKey: pid)
+    }
+    childSource.resume()
+    childReapSources[pid] = childSource
+
     return HelperResponse(status: "ok", message: "Client started", pid: Int(pid))
 }
 
@@ -392,7 +603,7 @@ func getStatus() -> HelperResponse {
                 let cleanLine = lastLine.replacingOccurrences(
                     of: "\u{001b}\\[[0-9;]*m", with: "", options: .regularExpression
                 )
-                if cleanLine.contains("ERROR") || cleanLine.contains("Failed") {
+                if isErrorLogLine(cleanLine) {
                     // Extract just the error message
                     let errorMsg: String
                     if let range = cleanLine.range(of: "ERROR") {
@@ -422,9 +633,15 @@ func getStatus() -> HelperResponse {
         var errorMsg = "Process exited"
         if let logContent = try? String(contentsOfFile: LOG_PATH, encoding: .utf8) {
             let lines = logContent.components(separatedBy: "\n").filter { !$0.isEmpty }
-            if let last = lines.last,
-               last.contains("ERROR") || last.contains("error") || last.contains("Failed") {
-                errorMsg = String(last.prefix(200))
+            if let last = lines.last {
+                let cleanLast = last.replacingOccurrences(
+                    of: "\u{001b}\\[[0-9;]*m", with: "", options: .regularExpression
+                )
+                // Level-token match only — a plain substring "error" would
+                // misreport ordinary INFO lines (URLs, counters) as failures.
+                if isErrorLogLine(cleanLast) {
+                    errorMsg = String(cleanLast.prefix(200))
+                }
             }
         }
         return HelperResponse(status: "ok", message: errorMsg,
@@ -433,6 +650,33 @@ func getStatus() -> HelperResponse {
 
     return HelperResponse(status: "ok", message: "Idle",
                           connected: false, version: HELPER_VERSION)
+}
+
+/// True while the managed aivpn-client process is alive.
+func clientProcessAlive() -> Bool {
+    return managedPID > 0 && kill(managedPID, 0) == 0
+}
+
+/// Trim LOG_PATH to its last 500 lines — but ONLY when no client is running.
+/// The client writes through an O_APPEND fd inherited at spawn; an atomic
+/// (temp+rename) rewrite would detach that fd from the visible file, freezing
+/// status/traffic/error reporting for the rest of the session. While a client
+/// is alive the log is left alone (it is cleared in startClient before every
+/// spawn anyway); when trimming, write in place (atomically: false) so the
+/// inode is preserved as an extra safety.
+func trimLogIfSafe(_ lines: [String]) {
+    guard lines.count > 500, !clientProcessAlive() else { return }
+    let kept = lines.suffix(500).joined(separator: "\n")
+    try? kept.write(toFile: LOG_PATH, atomically: false, encoding: .utf8)
+}
+
+/// True when an (ANSI-stripped) log line is an actual ERROR-level record: the
+/// tracing level token at/near the start of the line ("2026-…Z ERROR target: …"
+/// or a line starting with "ERROR"), not merely the substring "error" anywhere
+/// in the text — URLs, "0 errors", masked hostnames etc. must not count.
+func isErrorLogLine(_ line: String) -> Bool {
+    if line.hasPrefix("ERROR") { return true }
+    return line.range(of: #"^\S+\s+ERROR\s"#, options: .regularExpression) != nil
 }
 
 /// Get recent log entries
@@ -444,10 +688,7 @@ func getLog() -> HelperResponse {
     }
     let lines = logContent.components(separatedBy: "\n")
     // Keep log file bounded so it doesn't grow unboundedly over a long session
-    if lines.count > 500 {
-        let kept = lines.suffix(500).joined(separator: "\n")
-        try? kept.write(toFile: LOG_PATH, atomically: true, encoding: .utf8)
-    }
+    trimLogIfSafe(lines)
     let recent = lines.suffix(50).joined(separator: "\n")
     return HelperResponse(status: "ok", message: "Log retrieved",
                           connected: isConnected,
@@ -510,12 +751,10 @@ func getTrafficStats() -> HelperResponse {
         }
     }
     
-    // Trim log file if too large
-    if lines.count > 500 {
-        let trimmed = lines.suffix(500).joined(separator: "\n")
-        try? trimmed.write(toFile: LOG_PATH, atomically: true, encoding: .utf8)
-    }
-    
+    // Trim log file if too large (no-op while the client holds its O_APPEND fd)
+    trimLogIfSafe(lines)
+
+
     return HelperResponse(status: "ok", message: "sent:\(totalSent),received:\(totalReceived)\(readQualityScore())")
 }
 
@@ -533,16 +772,17 @@ func getRecordingInfo() -> HelperResponse {
 
 // MARK: - Socket Helpers
 
-/// Build a raw sockaddr_un buffer for the given path
-func makeSockAddr(_ path: String) -> [Int8] {
-    var buf = [Int8](repeating: 0, count: 106)
-    buf[0] = 0              // sun_len (0 = let kernel compute)
-    buf[1] = Int8(AF_UNIX)  // sun_family
+/// Build a sockaddr_un for the given path
+func makeSockAddr(_ path: String) -> sockaddr_un {
+    var addr = sockaddr_un()
+    addr.sun_family = sa_family_t(AF_UNIX)
     let pathBytes = Array(path.utf8)
-    for (i, byte) in pathBytes.enumerated() where i + 2 < buf.count {
-        buf[i + 2] = Int8(bitPattern: byte)
+    withUnsafeMutableBytes(of: &addr.sun_path) { buf in
+        for (i, byte) in pathBytes.enumerated() where i < buf.count - 1 {
+            buf[i] = byte
+        }
     }
-    return buf
+    return addr
 }
 
 // MARK: - Socket Server
@@ -568,10 +808,10 @@ func createSocket() -> Int32 {
         return -1
     }
 
-    let addrBuf = makeSockAddr(SOCKET_PATH)
-    let bindResult = addrBuf.withUnsafeBufferPointer { ptr in
-        bind(fd, UnsafeRawPointer(ptr.baseAddress!).assumingMemoryBound(to: sockaddr.self),
-             socklen_t(addrBuf.count))
+    var addrBuf = makeSockAddr(SOCKET_PATH)
+    let bindResult = withUnsafePointer(to: &addrBuf) {
+        bind(fd, UnsafeRawPointer($0).assumingMemoryBound(to: sockaddr.self),
+             socklen_t(MemoryLayout<sockaddr_un>.size))
     }
     guard bindResult == 0 else {
         log("ERROR: bind() failed: \(String(cString: strerror(errno)))")
@@ -613,8 +853,122 @@ func readExact(_ fd: Int32, count: Int) -> Data? {
     return Data(buf)
 }
 
+// MARK: Peer code-signing verification
+//
+// The euid check in peerIsAuthorized proves only WHO the peer runs as, not
+// WHAT it is: without a code-signing check, ANY process in the console user's
+// session (malware, a script) could drive this root helper — spawn
+// aivpn-client as root against an attacker-controlled server (full MITM),
+// toggle kill-switch, etc. So we additionally pin the peer to the legitimate
+// signed AIVPN.app: fetch its audit token via getsockopt(SOL_LOCAL,
+// LOCAL_PEERTOKEN), build a SecCode for that token with
+// SecCodeCopyGuestWithAttributes(kSecGuestAttributeAudit) and evaluate a
+// code-signing requirement (bundle id + Team ID) with SecCodeCheckValidity.
+// The audit token — unlike a bare pid — is immune to pid-reuse races.
+// kSecGuestAttributeAudit is public API since macOS 10.14.
+
+// Values from <sys/un.h> (verified against apple-oss-distributions/xnu);
+// declared locally because the C macros are not reliably re-exported to Swift.
+let AIVPN_SOL_LOCAL: Int32 = 0          // SOL_LOCAL
+let AIVPN_LOCAL_PEERTOKEN: Int32 = 0x006 // LOCAL_PEERTOKEN — "retrieve peer audit token"
+
+// SECURITY(TODO): set to the REAL Apple Developer Team ID that signs
+// AIVPN.app before any production distribution. The Team ID is not
+// discoverable from this repository (the app is signed outside the repo).
+// While this is EMPTY the code-signature gate is SKIPPED — with a loud log
+// line — so unsigned/ad-hoc development builds keep working and only the
+// euid gate applies. Shipping with it empty leaves H1 (any console-user
+// process can drive the root helper) unmitigated.
+let REQUIRED_PEER_TEAM_ID = ""
+let REQUIRED_PEER_BUNDLE_ID = "com.aivpn.client" // CFBundleIdentifier of AIVPN.app
+
+/// Verifies the socket peer's code signature against a requirement pinning
+/// the AIVPN.app bundle id + Team ID. Fails closed on every error path
+/// (except the explicitly-unconfigured Team ID case documented above).
+func peerCodeSignatureIsValid(_ fd: Int32) -> Bool {
+    guard !REQUIRED_PEER_TEAM_ID.isEmpty else {
+        log("WARNING: REQUIRED_PEER_TEAM_ID is not set — peer code-signature check SKIPPED (euid gate only). Set the real Team ID before production use.")
+        return true
+    }
+
+    var token = audit_token_t()
+    var tokenLen = socklen_t(MemoryLayout<audit_token_t>.size)
+    guard getsockopt(fd, AIVPN_SOL_LOCAL, AIVPN_LOCAL_PEERTOKEN, &token, &tokenLen) == 0,
+          tokenLen == socklen_t(MemoryLayout<audit_token_t>.size) else {
+        log("WARNING: getsockopt(LOCAL_PEERTOKEN) failed (\(String(cString: strerror(errno)))) — rejecting connection")
+        return false
+    }
+    let tokenData = withUnsafeBytes(of: token) { Data($0) }
+
+    var guest: SecCode?
+    let attrs: [CFString: Any] = [kSecGuestAttributeAudit: tokenData]
+    let guestStatus = SecCodeCopyGuestWithAttributes(nil, attrs as CFDictionary,
+                                                     SecCSFlags(), &guest)
+    guard guestStatus == errSecSuccess, let code = guest else {
+        log("WARNING: SecCodeCopyGuestWithAttributes failed (\(guestStatus)) — rejecting connection")
+        return false
+    }
+
+    // Standard designated-requirement shape: Apple anchor, our bundle id, and
+    // either an App Store leaf or a Developer ID chain with our Team ID.
+    let requirementText =
+        "anchor apple generic and identifier \"\(REQUIRED_PEER_BUNDLE_ID)\" and " +
+        "(certificate leaf[field.1.2.840.113635.100.6.1.9] /* App Store */ or " +
+        "certificate 1[field.1.2.840.113635.100.6.2.6] /* Developer ID CA */ and " +
+        "certificate leaf[field.1.2.840.113635.100.6.1.13] /* Developer ID leaf */ and " +
+        "certificate leaf[subject.OU] = \"\(REQUIRED_PEER_TEAM_ID)\")"
+    var requirement: SecRequirement?
+    guard SecRequirementCreateWithString(requirementText as CFString, SecCSFlags(),
+                                         &requirement) == errSecSuccess,
+          let req = requirement else {
+        log("WARNING: SecRequirementCreateWithString failed — rejecting connection")
+        return false
+    }
+
+    let status = SecCodeCheckValidity(code, SecCSFlags(), req)
+    guard status == errSecSuccess else {
+        log("WARNING: peer code-signature check failed (\(status)) — rejecting connection")
+        return false
+    }
+    return true
+}
+
+/// Defense-in-depth peer-credential check (LOCAL_PEERCRED via getpeereid).
+/// The socket is already chmod 0600 + chown'd to the console user (see
+/// createSocket), but file permissions alone are not a complete control:
+/// an inherited/passed fd or a window where the console user changes would
+/// bypass them. Verify the actual peer euid on every accepted connection and
+/// only allow root (0) or the current console user — and for the console
+/// user, additionally require the peer to BE the signed AIVPN.app
+/// (peerCodeSignatureIsValid above). Fails closed on any error.
+func peerIsAuthorized(_ fd: Int32) -> Bool {
+    var uid: uid_t = 0
+    var gid: gid_t = 0
+    guard getpeereid(fd, &uid, &gid) == 0 else {
+        log("WARNING: getpeereid failed (\(String(cString: strerror(errno)))) — rejecting connection")
+        return false
+    }
+    if uid == 0 { return true }
+    var consoleUID: uid_t = 0
+    var consoleGID: gid_t = 0
+    guard SCDynamicStoreCopyConsoleUser(nil, &consoleUID, &consoleGID) != nil else {
+        log("WARNING: no console user — rejecting connection from uid \(uid)")
+        return false
+    }
+    guard uid == consoleUID else {
+        log("WARNING: rejected connection from uid \(uid) (console uid \(consoleUID))")
+        return false
+    }
+    // euid alone is identity, not integrity: require the legitimate app.
+    return peerCodeSignatureIsValid(fd)
+}
+
 /// Handle a single client connection
 func handleConnection(_ clientFD: Int32) {
+    // Reject peers that are neither root nor the console user before reading
+    // any request bytes. The caller closes clientFD after we return.
+    guard peerIsAuthorized(clientFD) else { return }
+
     // 5-second read timeout
     var timeout = timeval(tv_sec: 5, tv_usec: 0)
     setsockopt(clientFD, SOL_SOCKET, SO_RCVTIMEO,
@@ -653,7 +1007,17 @@ func handleConnection(_ clientFD: Int32) {
                                excludeRoutes: request.excludeRoutes,
                                adaptiveLevel: request.adaptiveLevel ?? 0,
                                dnsProxy: request.dnsProxy,
-                               killSwitch: request.killSwitch ?? false)
+                               killSwitch: request.killSwitch ?? false,
+                               preferredMask: request.preferredMask,
+                               polymorphicBase: request.polymorphicBase,
+                               shareMaskFeedback: request.shareMaskFeedback ?? false,
+                               receiveMaskHints: request.receiveMaskHints ?? false,
+                               countryCode: request.countryCode,
+                               bootstrapCdnUrl: request.bootstrapCdnUrl,
+                               bootstrapTelegramToken: request.bootstrapTelegramToken,
+                               bootstrapTelegramChat: request.bootstrapTelegramChat,
+                               bootstrapGithub: request.bootstrapGithub,
+                               serverSigningKey: request.serverSigningKey)
 
     case "disconnect":
         response = stopClient()
@@ -677,13 +1041,15 @@ func handleConnection(_ clientFD: Int32) {
             response = HelperResponse(status: "error", message: "Missing recording service name")
             break
         }
+        guard service.count <= 128,
+              service.range(of: #"^[a-zA-Z0-9 _\-]{1,128}$"#, options: .regularExpression) != nil else {
+            response = HelperResponse(status: "error", message: "Invalid recording service name")
+            break
+        }
         response = runClientCommand(args: ["record", "start", "--service", service], binaryPath: request.binaryPath)
 
     case "record_stop":
         response = runClientCommand(args: ["record", "stop"], binaryPath: request.binaryPath)
-
-    case "device_key":
-        response = runClientCommand(args: ["--show-device-key"], binaryPath: request.binaryPath)
 
     case "record_info":
         response = getRecordingInfo()
@@ -698,38 +1064,83 @@ func handleConnection(_ clientFD: Int32) {
 
 /// Send a JSON response to the client
 func sendResponse(_ clientFD: Int32, _ response: HelperResponse) {
-    guard let responseData = try? JSONEncoder().encode(response),
-          let responseStr = String(data: responseData, encoding: .utf8) else { return }
+    guard let responseData = try? JSONEncoder().encode(response) else {
+        log("ERROR: failed to encode response for action (status: \(response.status))")
+        return
+    }
 
-    _ = responseStr.withCString { ptr in
-        write(clientFD, ptr, Int(strlen(ptr)))
+    var sent = 0
+    let total = responseData.count
+    responseData.withUnsafeBytes { ptr in
+        guard let base = ptr.baseAddress else { return }
+        while sent < total {
+            let n = write(clientFD, base.advanced(by: sent), total - sent)
+            if n <= 0 { return }
+            sent += n
+        }
     }
 }
 
 // MARK: - Signal Handling
+//
+// A raw signal(2) handler may only call async-signal-safe functions — the old
+// handler called log()/FileManager/usleep and mutated managedPID from signal
+// context, all of which are undefined behaviour (e.g. deadlock inside malloc).
+// Instead: ignore the signal at the C level and turn delivery into a normal
+// DispatchSource event, whose handler runs on connectionQueue — the same serial
+// queue that owns managedPID/childReapSources — so the full cleanup path is safe.
 
-func signalHandler(_ sig: Int32) {
-    log("Signal \(sig), shutting down...")
-    killExistingClient()
-    try? FileManager.default.removeItem(atPath: SOCKET_PATH)
-    exit(0)
-}
+// Must be retained globally: a released source is cancelled and never fires.
+var signalSources: [DispatchSourceSignal] = []
 
 func setupSignals() {
-    signal(SIGTERM, signalHandler)
-    signal(SIGINT, signalHandler)
     signal(SIGHUP, SIG_IGN)
+    for sig in [SIGTERM, SIGINT] {
+        signal(sig, SIG_IGN) // required so default termination doesn't preempt the source
+        let source = DispatchSource.makeSignalSource(signal: sig, queue: connectionQueue)
+        source.setEventHandler {
+            log("Signal \(sig), shutting down...")
+            killExistingClient()
+            try? FileManager.default.removeItem(atPath: SOCKET_PATH)
+            exit(0)
+        }
+        source.resume()
+        signalSources.append(source)
+    }
 }
 
 // MARK: - Recovery
 
+/// True when the live process `pid` is actually one of our allow-listed
+/// aivpn-client binaries (checked via proc_pidpath). PIDs are recycled after
+/// an unclean shutdown/reboot, so a PID read from disk must be
+/// identity-checked before this root helper adopts it — otherwise a later
+/// "disconnect" would SIGTERM/SIGKILL an unrelated process as root.
+func pidIsAivpnClient(_ pid: pid_t) -> Bool {
+    // 4096 == PROC_PIDPATHINFO_MAXSIZE (<sys/proc_info.h>); literal because
+    // the macro is not reliably re-exported to Swift.
+    var buf = [CChar](repeating: 0, count: 4096)
+    guard proc_pidpath(pid, &buf, UInt32(buf.count)) > 0 else { return false }
+    let path = String(cString: buf)
+    let resolved = URL(fileURLWithPath: path).resolvingSymlinksInPath().standardized.path
+    return ALLOWED_CLIENT_PATHS.contains(path) || ALLOWED_CLIENT_PATHS.contains(resolved)
+}
+
 /// Recover existing aivpn-client from a previous helper instance
 func recoverExistingClient() {
-    guard let pidStr = try? String(contentsOfFile: PID_PATH, encoding: .utf8) else { return }
+    guard let pidStr = try? String(contentsOfFile: PID_PATH, encoding: .utf8),
+          pidStr.count <= 16 else { return }
     let trimmed = pidStr.trimmingCharacters(in: .whitespacesAndNewlines)
     guard let pid = Int32(trimmed), pid > 0 else { return }
 
     if kill(pid, 0) == 0 {
+        // kill(pid, 0) only proves SOME process has this pid — confirm the
+        // executable identity before adopting (see pidIsAivpnClient).
+        guard pidIsAivpnClient(pid) else {
+            log("WARNING: PID \(pid) from \(PID_PATH) is not aivpn-client (recycled pid?) — not adopting")
+            try? FileManager.default.removeItem(atPath: PID_PATH)
+            return
+        }
         managedPID = pid
         log("Recovered aivpn-client (PID: \(pid))")
         if let logContent = try? String(contentsOfFile: LOG_PATH, encoding: .utf8) {
@@ -761,17 +1172,13 @@ func main() {
 
     log("AIVPN Helper v\(HELPER_VERSION) started (socket: \(SOCKET_PATH))")
 
-    // Serial queue: keeps shared mutable state (managedPID, isConnected) thread-safe
-    // while freeing the accept loop from blocking on slow 5-second-timeout connections.
-    let connectionQueue = DispatchQueue(label: "aivpn.helper.connections")
-
     // Main accept loop — runs forever (LaunchDaemon manages lifecycle)
     while true {
-        var clientBuf = [Int8](repeating: 0, count: 106)
-        var clientLen = socklen_t(106)
-        let clientFD = clientBuf.withUnsafeMutableBufferPointer { ptr in
+        var clientAddr = sockaddr_un()
+        var clientLen = socklen_t(MemoryLayout<sockaddr_un>.size)
+        let clientFD = withUnsafeMutablePointer(to: &clientAddr) {
             accept(sockFD,
-                   UnsafeMutableRawPointer(ptr.baseAddress!).assumingMemoryBound(to: sockaddr.self),
+                   UnsafeMutableRawPointer($0).assumingMemoryBound(to: sockaddr.self),
                    &clientLen)
         }
 
