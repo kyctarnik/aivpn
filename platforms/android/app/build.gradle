@@ -91,6 +91,11 @@ android {
     sourceSets {
         main {
             jniLibs.srcDirs = ['src/main/jniLibs']
+            // Launcher icons live in the shared brand folder (single source of
+            // truth across all clients). Gradle merges this res dir with the
+            // module's own, so @drawable/ic_launcher / @mipmap/ic_launcher
+            // resolve natively from assets/brand/android — no copy, no script.
+            res.srcDirs = ['src/main/res', '../../../assets/brand/android']
         }
     }
 

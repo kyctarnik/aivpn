@@ -475,8 +475,14 @@ class AivpnService : VpnService() {
                         tunnelStartMs = System.currentTimeMillis()
                         runTunnel()
                         // runTunnel() returns normally on Rust rekey/network trigger — reconnect fast.
-                        // Do NOT close the TUN here: keeping vpnInterface open means the next runTunnel()
-                        // reuses the same fd and Android keeps VPN routes active with no routing gap.
+                        // Keep the TUN open on a plain rekey return (no routing gap, fd reuse), BUT
+                        // rebuild it on a network-trigger return: a Wi-Fi→cellular switch leaves the
+                        // reused interface tunnelling app packets with the device's real source
+                        // address, which the server drops as anti-spoof (TX up, RX 0). Rebuilding
+                        // re-binds the TUN to the VPN IP — the same reason a manual reconnect works.
+                        if (networkTrigger) {
+                            closeTunnel()
+                        }
                         //
                         // Guard: if the tunnel exited normally in under 2 s without ever establishing
                         // a session (e.g. Rust returns "" immediately on a transient error), apply
@@ -509,8 +515,19 @@ class AivpnService : VpnService() {
                         isRunning = false
                         isEstablished = false
                         if (manualDisconnect) break
-                        // Do NOT close TUN on error: reusing vpnInterface avoids establish()
-                        // race on reconnect and keeps VPN routes active during retry.
+                        // Rebuild the TUN on an error-triggered reconnect instead of
+                        // reusing it. A reused interface that survives an underlying
+                        // network change (Wi-Fi→cellular) keeps tunnelling app packets
+                        // with the device's REAL source address (e.g. a carrier-CGNAT
+                        // 10.x) instead of the VPN IP — the server then drops every
+                        // uplink packet as anti-spoof ("dropping packet src=… from
+                        // session owning vpn_ip=…"), so TX flows but RX stays 0. A
+                        // manual disconnect+reconnect worked precisely because it
+                        // rebuilds the interface; do the same here. Inline rekeys never
+                        // reach this catch (they stay in-session), so this does not add
+                        // a routing gap to the steady-state 120 s key rotation. The
+                        // kill switch keeps traffic blocked during the brief rebuild.
+                        closeTunnel()
 
                         // Network-triggered reconnects and reconnects after a genuinely
                         // healthy established session use zero delay so the switch feels
@@ -1317,6 +1334,16 @@ class AivpnService : VpnService() {
         val tunAddress4 = savedVpnIp ?: "10.0.0.2"
         val tunPrefixLen = savedVpnPrefixLen.coerceIn(1, 30)
 
+        // Diagnostic: surface the EXACT address set on the TUN. A
+        // VpnService.establish() "Cannot set address" failure is otherwise
+        // opaque — the exception names no value — so this line is the only way
+        // to tell a bad client_ip from a stale-state / device rejection.
+        Log.i(
+            TAG,
+            "Establishing TUN: addr=$tunAddress4/$tunPrefixLen mtu=$tunMtu " +
+                "serverVpnIp=$savedServerVpnIp v6=fd00::2/64",
+        )
+
         // Build TUN (must stay in Kotlin — Android API).
         // setBlocking(false): Rust uses epoll/AsyncFd on the raw fd.
         // allowBypass() is intentionally NOT called — default VpnService.Builder behaviour
@@ -1328,46 +1355,85 @@ class AivpnService : VpnService() {
         // with the device's real address, a full deanonymisation leak on any
         // dual-stack network. Add a ULA address + a ::/0 catch-all so all v6
         // traffic enters the tun and is dropped rather than leaking.
-        val builder = Builder()
-            .setSession("AIVPN")
-            .addAddress(tunAddress4, tunPrefixLen)
-            .addRoute("0.0.0.0", 0)
-            .setMtu(tunMtu)
-            .setBlocking(false)
-        try {
-            // Valid ULA (fd00::/8). The previous literal "fd00:aivpn::2" was not a
-            // numeric IPv6 address, so addAddress threw and the catch skipped BOTH
-            // the address AND the ::/0 route — leaving IPv6 to leak around the tunnel
-            // with the device's real address on any dual-stack network.
-            builder.addAddress("fd00::2", 64)
-            builder.addRoute("::", 0)
-        } catch (e: Exception) {
-            Log.w(TAG, "Failed to add IPv6 capture route: ${e.message}")
-        }
         val dnsList = savedDnsServers.ifEmpty { listOf("8.8.8.8", "1.1.1.1") }
-        for (dns in dnsList) {
-            try { builder.addDnsServer(dns) } catch (e: Exception) {
-                Log.w(TAG, "Skipping invalid DNS server: $dns")
-            }
-        }
-
         val allowedApps = SecureStorage.loadAllowedApps(this)
-        for (pkg in allowedApps) {
-            try {
-                builder.addAllowedApplication(pkg)
-            } catch (_: Exception) {
-                // Package may have been uninstalled — skip silently
+
+        // Build a fresh Builder. `includeIpv6` adds the ULA + ::/0 capture (see
+        // below); we drop it on the v4-only retry because some ROMs (observed
+        // on ColorOS) reject the IPv6 address at establish() with an opaque
+        // "Cannot set address" even though addAddress() accepted it.
+        //
+        // IPv6 rationale: we do NOT tunnel v6 (the Rust data path drops non-IPv4
+        // payloads), but we MUST still CAPTURE it. Omitting IPv6 config does not
+        // disable v6 — Android then routes v6-capable sockets over the real
+        // (non-VPN) interface with the device's real address, a deanonymisation
+        // leak on any dual-stack network. So v6 capture is preferred; v4-only is
+        // the fallback that keeps the tunnel working (v4 still fully protected).
+        fun buildTun(includeIpv6: Boolean): Builder {
+            // setBlocking(false): Rust uses epoll/AsyncFd on the raw fd.
+            // allowBypass() is intentionally NOT called — default behaviour
+            // prevents any app from bypassing the VPN tunnel.
+            val b = Builder()
+                .setSession("AIVPN")
+                .addAddress(tunAddress4, tunPrefixLen)
+                .addRoute("0.0.0.0", 0)
+                .setMtu(tunMtu)
+                .setBlocking(false)
+            if (includeIpv6) {
+                try {
+                    // Valid ULA (fd00::/8). A non-numeric literal would make
+                    // addAddress throw and skip BOTH the address AND the ::/0
+                    // route, leaking IPv6 around the tunnel.
+                    b.addAddress("fd00::2", 64)
+                    b.addRoute("::", 0)
+                } catch (e: Exception) {
+                    Log.w(TAG, "Failed to add IPv6 capture route: ${e.message}")
+                }
             }
+            for (dns in dnsList) {
+                try { b.addDnsServer(dns) } catch (e: Exception) {
+                    Log.w(TAG, "Skipping invalid DNS server: $dns")
+                }
+            }
+            for (pkg in allowedApps) {
+                try {
+                    b.addAllowedApplication(pkg)
+                } catch (_: Exception) {
+                    // Package may have been uninstalled — skip silently
+                }
+            }
+            // Domain-based split tunnel: resolve each excluded domain to IPv4
+            // addresses and add /32 exclusion routes so that traffic to those
+            // IPs bypasses the VPN. Re-resolved on every (re)connect.
+            applyDomainExclusions(b)
+            return b
         }
 
-        // Domain-based split tunnel: resolve each excluded domain to IPv4 addresses at
-        // connect time and add /32 exclusion routes so that traffic to those IPs bypasses
-        // the VPN tunnel. This is the same approach used by NordVPN and ExpressVPN on
-        // Android. Limitation: CDN IPs rotate and may differ per client, so exclusions
-        // are best-effort. The domain list is re-resolved on every tunnel (re)connect.
-        applyDomainExclusions(builder)
-
-        vpnInterface = builder.establish() ?: throw Exception("Failed to establish VPN interface")
+        vpnInterface = try {
+            buildTun(includeIpv6 = true).establish()
+                ?: throw Exception("Failed to establish VPN interface")
+        } catch (e: IllegalArgumentException) {
+            // establish() rejected the address set (kernel jniSetAddresses).
+            // Most likely the IPv6 ULA on a ROM that refuses it. Retry v4-only
+            // before giving up — a working v4 tunnel beats an infinite reconnect
+            // loop (the reported symptom). The v4 address itself is validated as
+            // an assignable host by ConnectionKeyParser, so if THIS also fails
+            // the config is genuinely unusable → stop the loop (FatalConfig)
+            // with a message naming the address, instead of retrying every 8 s.
+            Log.w(TAG, "establish() rejected addr set (${e.message}) — retrying IPv4-only")
+            try {
+                val v4only = buildTun(includeIpv6 = false).establish()
+                    ?: throw Exception("Failed to establish VPN interface (v4-only)")
+                Log.w(TAG, "Established IPv4-only TUN (IPv6 capture disabled on this device)")
+                v4only
+            } catch (e2: IllegalArgumentException) {
+                Log.e(TAG, "establish() rejected addr=$tunAddress4/$tunPrefixLen even v4-only: ${e2.message}")
+                throw FatalConfigException(
+                    "Android rejected VPN address $tunAddress4/$tunPrefixLen (${e2.message}). " +
+                        "Clear app data and re-add the connection key.",
+                )
+            }
+        }
         currentTunMtu = tunMtu
     }
 

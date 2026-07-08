@@ -24,7 +24,7 @@
     <string name="error_handshake">Ошибка рукопожатия</string>
     <string name="label_upload">Отправлено</string>
     <string name="label_download">Получено</string>
-    <string name="label_duration">Время</string>
+    <string name="label_connected_at">Подключено в</string>
     <string name="version_tagline">ИИ-обход DPI</string>
     <string name="notification_channel">Туннель AIVPN</string>
     <string name="notification_channel_desc">Статус активного VPN-туннеля</string>

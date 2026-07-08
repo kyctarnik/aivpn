@@ -98,3 +98,8 @@ docs/
 
 # ── Makefile linux-appimage tool cache ───────────────────────────────────────
 /build/
+
+# Release signing keystore — NEVER commit
+aivpn-android/
+*.jks
+*.keystore

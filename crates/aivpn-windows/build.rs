@@ -49,7 +49,11 @@ fn main() {
 
     // Build .rc that embeds the manifest (resource id 1 = CREATEPROCESS_MANIFEST_RESOURCE_ID)
     // and the icon if present.
-    let icon_path = PathBuf::from("assets/aivpn.ico").canonicalize().ok();
+    // Icon lives in the shared brand folder (single source of truth across all
+    // clients): repo-root assets/brand/win/aivpn.ico, i.e. ../../ from this crate.
+    let icon_path = PathBuf::from("../../assets/brand/win/aivpn.ico")
+        .canonicalize()
+        .ok();
     // Escape backslashes in paths for the RC file format (Windows paths contain '\')
     let esc = |p: std::path::Display| p.to_string().replace('\\', "\\\\");
     let rc_content = if let Some(ref ico) = icon_path {

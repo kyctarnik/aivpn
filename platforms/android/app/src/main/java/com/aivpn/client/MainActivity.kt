@@ -91,7 +91,8 @@ class MainActivity : AppCompatActivity() {
                 val m = (elapsed % 3600) / 60
                 val s = elapsed % 60
                 binding.textTimer.text = String.format("%02d:%02d:%02d", h, m, s)
-                binding.textDuration.text = String.format("%02d:%02d", h * 60 + m, s)
+                // textDuration shows the fixed session START time (see the connected
+                // branch), NOT a second elapsed counter — so it no longer ticks here.
                 timerHandler.postDelayed(this, 1000)
             }
         }
@@ -669,6 +670,13 @@ class MainActivity : AppCompatActivity() {
                 binding.textUpload.text = "0 B"
                 binding.textDownload.text = "0 B"
             }
+            // Stats-card third field: the wall-clock time the tunnel connected
+            // (fixed), complementing the big elapsed counter above. connectionStartTime
+            // is already synced from the ViewModel at this point.
+            if (connectionStartTime > 0) {
+                binding.textDuration.text = java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault())
+                    .format(java.util.Date(connectionStartTime))
+            }
             timerHandler.removeCallbacks(timerRunnable)
             timerHandler.post(timerRunnable)
         } else {
@@ -679,7 +687,7 @@ class MainActivity : AppCompatActivity() {
             }
             timerHandler.removeCallbacks(timerRunnable)
             binding.textTimer.text = "00:00:00"
-            binding.textDuration.text = "00:00"
+            binding.textDuration.text = "--:--"
             // RX/TX counters intentionally kept — show last known values during reconnect
         }
     }

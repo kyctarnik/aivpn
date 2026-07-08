@@ -22,6 +22,10 @@ targets:
       - path: App
         excludes:
           - "*.entitlements"
+      # App icon lives in the shared brand folder (single source of truth across
+      # all clients). ASSETCATALOG_COMPILER_APPICON_NAME=AppIcon resolves it from
+      # this externally-referenced catalog — no copy under App/.
+      - path: ../../assets/brand/ios/Assets.xcassets
     info:
       path: App/Info.plist
     entitlements:

@@ -290,7 +290,7 @@ windows: releases/
 	    unzip -o "$$WINTUN_ZIP" "wintun/bin/amd64/wintun.dll" -d /tmp/; \
 	    cp /tmp/wintun/bin/amd64/wintun.dll "$$WINTUN_DLL"; \
 	fi; \
-	cp crates/aivpn-windows/assets/aivpn.ico "$$PACKAGE_DIR/aivpn.ico"; \
+	cp assets/brand/win/aivpn.ico "$$PACKAGE_DIR/aivpn.ico"; \
 	if command -v zip >/dev/null 2>&1; then \
 	    (cd "$$PACKAGE_DIR" && zip -r "../aivpn-windows-gui.zip" ./*); \
 	else \

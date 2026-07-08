@@ -24,7 +24,7 @@
     <string name="error_handshake">Handshake failed</string>
     <string name="label_upload">Upload</string>
     <string name="label_download">Download</string>
-    <string name="label_duration">Duration</string>
+    <string name="label_connected_at">Connected at</string>
     <string name="version_tagline">AI-powered DPI evasion</string>
     <string name="notification_channel">AIVPN Tunnel</string>
     <string name="notification_channel_desc">Active VPN tunnel status</string>
