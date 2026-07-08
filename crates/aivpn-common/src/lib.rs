@@ -9,10 +9,15 @@ pub mod error;
 pub mod event_log;
 pub mod fec;
 pub mod mask;
+pub mod mimic_protocol;
 pub mod network_config;
 pub mod protocol;
 pub mod quality;
+pub mod quic_initial;
 pub mod recording;
+
+#[cfg(feature = "dpi-gate")]
+pub mod dpi_gate;
 
 #[cfg(feature = "client-upload")]
 pub mod mimicry;
@@ -27,6 +32,7 @@ pub use client_wire::*;
 pub use crypto::*;
 pub use error::*;
 pub use mask::*;
+pub use mimic_protocol::*;
 pub use network_config::*;
 pub use protocol::*;
 pub use recording::*;

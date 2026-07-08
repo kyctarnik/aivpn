@@ -149,10 +149,12 @@ impl VpnNetworkConfig {
     }
 
     fn mask_u32(&self) -> u32 {
-        if self.prefix_len == 0 {
-            0
-        } else {
-            u32::MAX << (32 - self.prefix_len)
+        // Saturate defensively: `32 - prefix_len` underflows (and the shift
+        // overflows) for prefix_len > 32, which a malformed config could carry.
+        match self.prefix_len {
+            0 => 0,
+            p if p >= 32 => u32::MAX,
+            p => u32::MAX << (32 - p),
         }
     }
 }
@@ -185,7 +187,16 @@ fn default_mdh_len() -> u16 {
 
 impl ClientNetworkConfig {
     pub const WIRE_SIZE: usize = 13;
-    const WIRE_VERSION: u8 = 1;
+    /// Wire-format / protocol-capability version.
+    ///
+    /// v2 (Variant A DPI fix) introduces **mask-defined tag offsets**: the 8-byte
+    /// resonance tag may be embedded inside a real protocol header at a
+    /// mask-specified byte offset instead of being a fixed prefix at packet
+    /// offset 0. A v1 peer always assumes tag@0 and cannot parse packets built
+    /// with a new-layout mask, so the version is bumped and `decode_wire`
+    /// rejects mismatched versions — a v2 client refuses to negotiate with a v1
+    /// server (and vice versa) rather than silently failing every packet.
+    const WIRE_VERSION: u8 = 2;
 
     pub fn validate(&self) -> Result<()> {
         VpnNetworkConfig {
@@ -236,6 +247,17 @@ impl ClientNetworkConfig {
             ));
         }
 
+        // Validate the prefix length BEFORE constructing/validating: a malicious
+        // server could send prefix_len > 32, and the netmask shift helpers
+        // (mask_u32 / prefix_len_to_netmask) compute `u32::MAX << (32 - prefix)`,
+        // which underflows and panics for prefix_len > 32. Only /1../30 yield a
+        // usable client subnet.
+        if !(1..=30).contains(&data[1]) {
+            return Err(Error::InvalidPacket(
+                "Client network config prefix length out of range",
+            ));
+        }
+
         let keepalive_secs = if data.len() >= 13 && data[12] > 0 {
             Some(data[12])
         } else {
@@ -257,11 +279,13 @@ impl ClientNetworkConfig {
 }
 
 pub fn prefix_len_to_netmask(prefix_len: u8) -> Ipv4Addr {
-    if prefix_len == 0 {
-        return Ipv4Addr::new(0, 0, 0, 0);
+    // Saturate: prefix_len > 32 would underflow `32 - prefix_len` and overflow
+    // the shift. /32 is an all-ones mask.
+    match prefix_len {
+        0 => Ipv4Addr::new(0, 0, 0, 0),
+        p if p >= 32 => Ipv4Addr::from(u32::MAX),
+        p => Ipv4Addr::from(u32::MAX << (32 - p)),
     }
-
-    Ipv4Addr::from(u32::MAX << (32 - prefix_len))
 }
 
 pub fn netmask_to_prefix_len(netmask: Ipv4Addr) -> Result<u8> {
@@ -307,7 +331,7 @@ mod tests {
         // Old 12-byte wire format must decode cleanly with keepalive_secs = None
         let old_wire: [u8; 12] = {
             let mut buf = [0u8; 12];
-            buf[0] = 1; // version
+            buf[0] = ClientNetworkConfig::WIRE_VERSION; // current wire version
             buf[1] = 24; // prefix_len
             buf[2..4].copy_from_slice(&1346u16.to_le_bytes());
             buf[4..8].copy_from_slice(&Ipv4Addr::new(10, 150, 0, 1).octets());
