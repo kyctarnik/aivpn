@@ -11,10 +11,12 @@ import android.util.Log
  * Requires Android 7+ (API 24). Registered in AndroidManifest.xml with the
  * BIND_QUICK_SETTINGS_TILE permission so only the system can bind to it.
  *
- * State sync: tile state is updated via AivpnService.tileCallback whenever
- * isRunning changes, and synced from AivpnService.isRunning each time the
- * shade is opened (onStartListening). The tile shows ACTIVE (blue) while
- * connected, INACTIVE while disconnected/connecting.
+ * State sync: tile state is updated via AivpnService.tileCallback on every
+ * connect/reconnect/terminal transition, and synced each time the shade is opened
+ * (onStartListening). Three states: ACTIVE while a session is actually established
+ * (isEstablished=true — set only after the handshake completes, unlike isRunning
+ * which is true for the whole JNI attempt), UNAVAILABLE while connecting or
+ * retrying (isServiceActive=true, isEstablished=false), INACTIVE while disconnected.
  *
  * Connect flow: loads the active profile from SecureStorage, parses the
  * connection key, then fires AivpnService.ACTION_CONNECT. If VPN permission
@@ -41,7 +43,7 @@ class AivpnTileService : TileService() {
 
     override fun onClick() {
         super.onClick()
-        if (AivpnService.isRunning) {
+        if (AivpnService.isServiceActive) {
             disconnectVpn()
         } else {
             connectVpn()
@@ -52,12 +54,19 @@ class AivpnTileService : TileService() {
 
     private fun syncTileState() {
         val tile = qsTile ?: return
-        if (AivpnService.isRunning) {
-            tile.state = Tile.STATE_ACTIVE
-            tile.contentDescription = getString(R.string.status_connected, getString(R.string.app_name))
-        } else {
-            tile.state = Tile.STATE_INACTIVE
-            tile.contentDescription = getString(R.string.status_disconnected)
+        when {
+            AivpnService.isEstablished -> {
+                tile.state = Tile.STATE_ACTIVE
+                tile.contentDescription = getString(R.string.status_connected, getString(R.string.app_name))
+            }
+            AivpnService.isServiceActive -> {
+                tile.state = Tile.STATE_UNAVAILABLE
+                tile.contentDescription = getString(R.string.status_connecting)
+            }
+            else -> {
+                tile.state = Tile.STATE_INACTIVE
+                tile.contentDescription = getString(R.string.status_disconnected)
+            }
         }
         tile.updateTile()
     }
@@ -121,6 +130,14 @@ class AivpnTileService : TileService() {
         val main = Intent(this, MainActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_NEW_TASK
         }
-        startActivityAndCollapse(main)
+        if (android.os.Build.VERSION.SDK_INT >= 34) {
+            val pending = android.app.PendingIntent.getActivity(
+                this, 0, main, android.app.PendingIntent.FLAG_IMMUTABLE
+            )
+            startActivityAndCollapse(pending)
+        } else {
+            @Suppress("DEPRECATION")
+            startActivityAndCollapse(main)
+        }
     }
 }

@@ -19,7 +19,7 @@
 #   export AIVPN_UPLOAD_KEY_PASSWORD=...
 #
 # Usage:
-#   cd aivpn-android
+#   cd platforms/android
 #   ./build-rust-android.sh            # debug build (default)
 #   ./build-rust-android.sh release    # release build
 

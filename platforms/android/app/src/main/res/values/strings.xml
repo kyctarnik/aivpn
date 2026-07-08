@@ -7,6 +7,7 @@
     <string name="status_connected">Connected to %s</string>
     <string name="status_reconnecting">Reconnecting…</string>
     <string name="status_error">Error: %s</string>
+    <string name="status_native_lib_unavailable">Error: native library unavailable — reinstall the app</string>
     <string name="btn_connect">Connect</string>
     <string name="btn_disconnect">Disconnect</string>
     <string name="hint_server">Server address</string>
@@ -32,6 +33,7 @@
     <string name="label_language">Language</string>
     <string name="label_profiles">Saved Keys</string>
     <string name="btn_add_key">+ Add</string>
+    <string name="profiles_empty">No saved keys — tap + Add to get started.</string>
     <string name="dialog_add_profile">Add Connection Key</string>
     <string name="dialog_edit_profile">Edit Connection Key</string>
     <string name="hint_profile_name">Name (e.g. Server 1)</string>
@@ -86,6 +88,8 @@
     <string name="mtls_cert">mTLS Certificate</string>
     <string name="mtls_cert_hint">Paste base64 cert (leave empty to disable)</string>
     <string name="mtls_cert_invalid">Invalid mTLS certificate (must be 104 bytes when decoded)</string>
+    <string name="label_dns_servers">DNS Servers (optional)</string>
+    <string name="hint_dns_servers">8.8.8.8, 1.1.1.1</string>
     <string name="export_logs">Export Logs</string>
     <string name="export_logs_collecting">Collecting logs…</string>
     <string name="export_logs_empty">No logs collected</string>
@@ -97,6 +101,9 @@
     <string name="recording_started">Recording started</string>
     <string name="recording_stopped">Recording stopped</string>
     <string name="recording_no_session">No active session</string>
+    <string name="recording_analyzing">Analyzing recording…</string>
+    <string name="recording_complete">Mask generated: %1$s (confidence %2$d%%)</string>
+    <string name="recording_failed">Recording failed: %1$s</string>
     <string name="os_kill_switch">OS Kill Switch Settings</string>
 
     <!-- Menu item descriptions -->
@@ -109,5 +116,94 @@
     <string name="desc_recording">Records network profile of this session. Used to create a personal mask — a traffic fingerprint that trains the DPI evasion engine.</string>
     <string name="desc_export_logs">Collects technical logs for troubleshooting connection errors.</string>
     <string name="desc_kill_switch">Opens Android VPN settings. Enable "Always-on VPN" + "Block connections without VPN" to prevent traffic leaks on disconnect.</string>
+    <string name="desc_bootstrap_discovery">Advanced: fetch fresh signed mask material for a known server via CDN/GitHub/Telegram, instead of a new full connection key.</string>
     <string name="split_tunnel_desc">Select which apps route through VPN. By default all traffic is protected.</string>
+
+    <!-- Bootstrap descriptor discovery (advanced/operator use) -->
+    <string name="bootstrap_discovery">Discover Server (Advanced)</string>
+    <string name="bootstrap_discovery_hint">For operators only. Finds fresh, signed mask material via CDN/GitHub/Telegram for a server whose address, public key, and descriptor signing key you already have from another source. This does not discover a server from nothing.</string>
+    <string name="bootstrap_server_address">Server address (host:port)</string>
+    <string name="bootstrap_server_pubkey">Server public key (hex)</string>
+    <string name="bootstrap_server_psk">Pre-shared key (hex, optional)</string>
+    <string name="bootstrap_signing_key">Descriptor signing public key (base64)</string>
+    <string name="bootstrap_cdn_url">CDN bootstrap URL</string>
+    <string name="bootstrap_github_repo">GitHub bootstrap repo (owner/repo)</string>
+    <string name="bootstrap_telegram_bot">Telegram bootstrap bot token</string>
+    <string name="bootstrap_telegram_chat">Telegram chat/channel ID (optional)</string>
+    <string name="bootstrap_discover_button">Discover</string>
+    <string name="bootstrap_discovering">Discovering…</string>
+    <string name="bootstrap_missing_fields">Server address is required.</string>
+    <string name="bootstrap_invalid_server_key">Server public key and PSK must be 64 hex characters (32 bytes).</string>
+    <string name="bootstrap_result_success">Discovered {n} descriptor(s). Saved as "{name}".</string>
+    <string name="bootstrap_result_failure">No valid descriptors found.</string>
+    <string name="bootstrap_default_key_name">Discovered</string>
+    <string name="fec_badge">FEC</string>
+
+    <!-- Boot auto-connect -->
+    <string name="auto_connect_on_startup">Auto-connect on startup</string>
+    <string name="auto_connect_state_on">ON</string>
+    <string name="auto_connect_state_off">OFF</string>
+    <string name="auto_connect_enabled">Auto-connect enabled</string>
+    <string name="auto_connect_disabled">Auto-connect disabled</string>
+    <string name="desc_auto_connect">Automatically reconnects VPN after device reboot. Requires VPN permission to remain granted.</string>
+
+    <!-- Mask profile picker -->
+    <string name="mask_profile_label">Mask Profile</string>
+    <string name="mask_auto">Auto (server default)</string>
+    <string name="mask_auto_marker"> (auto)</string>
+
+    <!-- §3 Polymorphic masks + §2 crowdsourced blocking feedback (opt-in settings) -->
+    <string name="mask_privacy">Mask Privacy</string>
+    <string name="desc_mask_privacy">Polymorphic per-session masks and crowdsourced mask-blocking feedback. All opt-in, off by default.</string>
+    <string name="mask_polymorphic">Polymorphic (per-session unique)</string>
+    <string name="desc_mask_polymorphic">Requests a unique per-session variant of the selected Mask Profile from the server, instead of reusing the same fingerprint every connection.</string>
+    <string name="mask_share_feedback">Share blocked-mask feedback</string>
+    <string name="mask_receive_hints">Receive mask hints</string>
+    <string name="mask_country_code_label">Country code (ISO 3166-1 alpha-2, e.g. DE)</string>
+    <string name="mask_country_code_hint">DE</string>
+    <string name="mask_country_code_invalid">Country code must be exactly 2 letters</string>
+
+    <!-- Event notification channel -->
+    <string name="notification_event_channel">AIVPN Events</string>
+    <string name="notification_event_channel_desc">Connection state change notifications</string>
+
+    <!-- Security alerts: unexpected VPN death (traffic no longer protected) -->
+    <string name="notification_alert_channel">AIVPN Security Alerts</string>
+    <string name="notification_alert_channel_desc">Unexpected VPN shutdown — traffic may be unprotected</string>
+    <string name="alert_vpn_stopped_title">VPN stopped — traffic is NOT protected</string>
+    <string name="alert_vpn_stopped">The VPN was stopped without your request (%s). Your traffic is now going over the regular network with your real IP.</string>
+    <string name="alert_lockdown_hint">For a real kill switch, enable Always-on VPN with “Block connections without VPN” in system settings.</string>
+    <string name="alert_open_vpn_settings">VPN settings</string>
+    <string name="status_storage_unavailable">Secure storage unavailable — please try again</string>
+
+    <!-- Background reliability & permissions health check -->
+    <string name="bg_health_title">Background health</string>
+    <string name="btn_bg_health">Background Health</string>
+    <string name="bg_health_intro">These settings decide whether Android may silently kill the VPN in the background. Fix every amber item for a reliable always-on tunnel.</string>
+    <string name="bg_health_summary_protected">Protected — background settings look good</string>
+    <string name="bg_health_summary_mostly">Almost protected — also enable “Block connections without VPN” for a real kill switch</string>
+    <string name="bg_health_summary_at_risk">At risk — Android may silently kill the VPN in the background</string>
+    <string name="bg_health_fix">Fix</string>
+    <string name="bg_health_open">Open</string>
+    <string name="bg_health_check_notifications">Notifications</string>
+    <string name="bg_health_notifications_ok">Enabled — you will see “VPN stopped” security alerts</string>
+    <string name="bg_health_notifications_bad">Disabled — disconnect and security alerts will NOT be shown</string>
+    <string name="bg_health_check_battery">Battery optimization exemption</string>
+    <string name="bg_health_battery_ok">Exempt — Doze will not kill the VPN service</string>
+    <string name="bg_health_battery_bad">Not exempt — the most common cause of the VPN dying in the background. Tap Fix and choose Allow.</string>
+    <string name="bg_health_check_bg_restriction">Background activity</string>
+    <string name="bg_health_bg_ok">Not restricted</string>
+    <string name="bg_health_bg_bad">Restricted — Android will stop the VPN soon after you leave the app. Remove the restriction: App info → Battery.</string>
+    <string name="bg_health_check_always_on">Always-on VPN</string>
+    <string name="bg_health_always_on_ok">Enabled — the system restarts the VPN automatically</string>
+    <string name="bg_health_always_on_off">Off — enable Always-on for AIVPN in system VPN settings (gear next to AIVPN)</string>
+    <string name="bg_health_check_lockdown">Block connections without VPN</string>
+    <string name="bg_health_lockdown_ok">Enabled — real kill switch: nothing leaks even if the VPN dies</string>
+    <string name="bg_health_lockdown_off">Off — if the VPN dies, traffic silently reverts to your real IP. This OS toggle is the only real kill switch.</string>
+    <string name="bg_health_unknown_service_off">Cannot verify while the VPN service is not running — check in system VPN settings</string>
+    <string name="bg_health_check_oem">Autostart (%s)</string>
+    <string name="bg_health_oem_desc">This manufacturer’s firmware may additionally require enabling Autostart / removing AIVPN from “sleeping apps”. Best effort — the screen may not exist on your device.</string>
+    <string name="bg_health_oem_generic">Some devices also require enabling “Autostart” for AIVPN in the manufacturer’s battery/security app.</string>
+    <string name="bg_health_hint_ok">Background: protected</string>
+    <string name="bg_health_hint_risk">Background: at risk — tap to fix</string>
 </resources>

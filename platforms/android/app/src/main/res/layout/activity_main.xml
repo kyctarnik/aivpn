@@ -83,15 +83,15 @@
                 android:layout_height="wrap_content"
                 android:orientation="vertical"
                 android:padding="20dp"
-                android:gravity="center_horizontal">
+                android:minHeight="100dp"
+                android:gravity="center">
 
                 <!-- Connection status -->
                 <LinearLayout
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
                     android:orientation="horizontal"
-                    android:gravity="center_vertical"
-                    android:layout_marginBottom="12dp">
+                    android:gravity="center_vertical">
 
                     <View
                         android:id="@+id/statusDot"
@@ -110,6 +110,22 @@
                         android:textColor="@color/text_primary" />
                 </LinearLayout>
 
+                <!-- FEC active badge — shown when adaptive level >= 2 -->
+                <TextView
+                    android:id="@+id/textFecBadge"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="@string/fec_badge"
+                    android:textSize="11sp"
+                    android:textColor="@color/background"
+                    android:background="@color/accent"
+                    android:paddingStart="8dp"
+                    android:paddingEnd="8dp"
+                    android:paddingTop="2dp"
+                    android:paddingBottom="2dp"
+                    android:layout_marginTop="6dp"
+                    android:visibility="gone" />
+
                 <!-- Connection timer -->
                 <TextView
                     android:id="@+id/textTimer"
@@ -119,6 +135,7 @@
                     android:textSize="32sp"
                     android:textColor="@color/accent"
                     android:fontFamily="monospace"
+                    android:layout_marginTop="12dp"
                     android:visibility="gone" />
 
                 <!-- Traffic stats row -->
@@ -268,18 +285,26 @@
                         android:paddingEnd="12dp" />
                 </LinearLayout>
 
-                <!-- Scrollable profile list (populated programmatically) -->
-                <ScrollView
+                <!-- Scrollable profile list -->
+                <androidx.recyclerview.widget.RecyclerView
+                    android:id="@+id/profileList"
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
-                    android:maxHeight="200dp">
+                    android:maxHeight="200dp"
+                    android:nestedScrollingEnabled="false" />
 
-                    <LinearLayout
-                        android:id="@+id/profileList"
-                        android:layout_width="match_parent"
-                        android:layout_height="wrap_content"
-                        android:orientation="vertical" />
-                </ScrollView>
+                <!-- Empty state shown when no profiles saved -->
+                <TextView
+                    android:id="@+id/textProfilesEmpty"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:text="@string/profiles_empty"
+                    android:textSize="13sp"
+                    android:textColor="@color/text_secondary"
+                    android:gravity="center"
+                    android:paddingTop="8dp"
+                    android:paddingBottom="4dp"
+                    android:visibility="gone" />
 
                 <!-- Connection key (manual entry) -->
                 <com.google.android.material.textfield.TextInputLayout
@@ -338,6 +363,33 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:text="@string/split_tunnel_none"
+            android:textSize="12sp"
+            android:textColor="@color/text_secondary"
+            android:gravity="center"
+            android:paddingTop="4dp" />
+
+        <!-- Background reliability & permissions health check -->
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/btnBgHealth"
+            style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+            android:layout_width="match_parent"
+            android:layout_height="44dp"
+            android:layout_marginTop="8dp"
+            android:text="@string/btn_bg_health"
+            android:textSize="14sp"
+            android:textAllCaps="false"
+            android:textColor="@color/text_secondary"
+            app:cornerRadius="12dp"
+            app:strokeColor="@color/grey"
+            app:icon="@android:drawable/ic_lock_idle_low_battery"
+            app:iconTint="@color/text_secondary"
+            app:iconGravity="textStart" />
+
+        <!-- Background health status hint (re-evaluated on resume) -->
+        <TextView
+            android:id="@+id/textBgHealthHint"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
             android:textSize="12sp"
             android:textColor="@color/text_secondary"
             android:gravity="center"

@@ -7,6 +7,7 @@
     <string name="status_connected">Подключено к %s</string>
     <string name="status_reconnecting">Повторное подключение…</string>
     <string name="status_error">Ошибка: %s</string>
+    <string name="status_native_lib_unavailable">Ошибка: нативная библиотека недоступна — переустановите приложение</string>
     <string name="btn_connect">Подключить</string>
     <string name="btn_disconnect">Отключить</string>
     <string name="hint_server">Адрес сервера</string>
@@ -32,6 +33,7 @@
     <string name="label_language">Язык</string>
     <string name="label_profiles">Сохранённые ключи</string>
     <string name="btn_add_key">+ Добавить</string>
+    <string name="profiles_empty">Нет сохранённых ключей — нажмите + Добавить.</string>
     <string name="dialog_add_profile">Добавить ключ подключения</string>
     <string name="dialog_edit_profile">Редактировать ключ</string>
     <string name="hint_profile_name">Название (напр. Сервер 1)</string>
@@ -86,6 +88,8 @@
     <string name="mtls_cert">mTLS-сертификат</string>
     <string name="mtls_cert_hint">Вставьте base64 сертификат (пусто — отключить)</string>
     <string name="mtls_cert_invalid">Неверный mTLS-сертификат (декодированный размер должен быть 104 байта)</string>
+    <string name="label_dns_servers">DNS-серверы (необязательно)</string>
+    <string name="hint_dns_servers">8.8.8.8, 1.1.1.1</string>
     <string name="export_logs">Экспорт логов</string>
     <string name="export_logs_collecting">Сбор логов…</string>
     <string name="export_logs_empty">Логи не собраны</string>
@@ -97,6 +101,9 @@
     <string name="recording_started">Запись начата</string>
     <string name="recording_stopped">Запись остановлена</string>
     <string name="recording_no_session">Нет активного сеанса</string>
+    <string name="recording_analyzing">Анализ записи…</string>
+    <string name="recording_complete">Маска создана: %1$s (уверенность %2$d%%)</string>
+    <string name="recording_failed">Ошибка записи: %1$s</string>
     <string name="os_kill_switch">Настройки Kill Switch ОС</string>
 
     <!-- Описания пунктов меню -->
@@ -109,5 +116,94 @@
     <string name="desc_recording">Записывает сетевой профиль сессии. Используется для создания персональной маски — образца трафика, обучающего систему обхода DPI.</string>
     <string name="desc_export_logs">Собирает технические логи для диагностики ошибок подключения.</string>
     <string name="desc_kill_switch">Открывает настройки VPN Android. Включите «VPN всегда включён» + «Блокировать без VPN», чтобы трафик не утекал при обрыве соединения.</string>
+    <string name="desc_bootstrap_discovery">Дополнительно: получить свежий подписанный материал маски для известного сервера через CDN/GitHub/Telegram, вместо нового полного ключа подключения.</string>
     <string name="split_tunnel_desc">Выбрать, какие приложения используют VPN. По умолчанию весь трафик защищён.</string>
+
+    <!-- Обнаружение bootstrap-дескрипторов (для операторов) -->
+    <string name="bootstrap_discovery">Найти сервер (доп.)</string>
+    <string name="bootstrap_discovery_hint">Только для операторов. Находит свежий подписанный материал маски через CDN/GitHub/Telegram для сервера, чьи адрес, публичный ключ и ключ подписи дескрипторов вы уже получили из другого источника. Это не обнаружение сервера "из ничего".</string>
+    <string name="bootstrap_server_address">Адрес сервера (host:port)</string>
+    <string name="bootstrap_server_pubkey">Публичный ключ сервера (hex)</string>
+    <string name="bootstrap_server_psk">Общий ключ PSK (hex, необязательно)</string>
+    <string name="bootstrap_signing_key">Публичный ключ подписи дескрипторов (base64)</string>
+    <string name="bootstrap_cdn_url">CDN URL для bootstrap</string>
+    <string name="bootstrap_github_repo">GitHub-репозиторий для bootstrap (owner/repo)</string>
+    <string name="bootstrap_telegram_bot">Токен Telegram-бота для bootstrap</string>
+    <string name="bootstrap_telegram_chat">ID чата/канала Telegram (необязательно)</string>
+    <string name="bootstrap_discover_button">Найти</string>
+    <string name="bootstrap_discovering">Поиск…</string>
+    <string name="bootstrap_missing_fields">Укажите адрес сервера.</string>
+    <string name="bootstrap_invalid_server_key">Публичный ключ сервера и PSK должны быть 64 hex-символа (32 байта).</string>
+    <string name="bootstrap_result_success">Найдено дескрипторов: {n}. Сохранено как «{name}».</string>
+    <string name="bootstrap_result_failure">Дескрипторы не найдены.</string>
+    <string name="bootstrap_default_key_name">Найден</string>
+    <string name="fec_badge">FEC</string>
+
+    <!-- Автоподключение при загрузке -->
+    <string name="auto_connect_on_startup">Автоподключение при запуске</string>
+    <string name="auto_connect_state_on">ВКЛ</string>
+    <string name="auto_connect_state_off">ВЫКЛ</string>
+    <string name="auto_connect_enabled">Автоподключение включено</string>
+    <string name="auto_connect_disabled">Автоподключение отключено</string>
+    <string name="desc_auto_connect">Автоматически подключает VPN после перезагрузки устройства. Требует, чтобы разрешение VPN оставалось предоставленным.</string>
+
+    <!-- Профиль маски трафика -->
+    <string name="mask_profile_label">Профиль маски</string>
+    <string name="mask_auto">Авто (выбор сервера)</string>
+    <string name="mask_auto_marker"> (авто)</string>
+
+    <!-- §3 Полиморфные маски + §2 краудсорсинговая обратная связь по блокировкам (опционально) -->
+    <string name="mask_privacy">Приватность масок</string>
+    <string name="desc_mask_privacy">Полиморфные маски для каждой сессии и краудсорсинговая обратная связь о заблокированных масках. Всё опционально, по умолчанию выключено.</string>
+    <string name="mask_polymorphic">Полиморфная (уникальна для сессии)</string>
+    <string name="desc_mask_polymorphic">Запрашивает у сервера уникальный для сессии вариант выбранного профиля маски вместо повторного использования одного и того же отпечатка при каждом подключении.</string>
+    <string name="mask_share_feedback">Делиться данными о заблокированных масках</string>
+    <string name="mask_receive_hints">Получать подсказки по маскам</string>
+    <string name="mask_country_code_label">Код страны (ISO 3166-1 alpha-2, напр. DE)</string>
+    <string name="mask_country_code_hint">DE</string>
+    <string name="mask_country_code_invalid">Код страны должен состоять ровно из 2 букв</string>
+
+    <!-- Канал уведомлений событий -->
+    <string name="notification_event_channel">События AIVPN</string>
+    <string name="notification_event_channel_desc">Уведомления об изменении состояния подключения</string>
+
+    <!-- Оповещения безопасности: неожиданная остановка VPN (трафик больше не защищён) -->
+    <string name="notification_alert_channel">Оповещения безопасности AIVPN</string>
+    <string name="notification_alert_channel_desc">Неожиданная остановка VPN — трафик может быть не защищён</string>
+    <string name="alert_vpn_stopped_title">VPN остановлен — трафик НЕ защищён</string>
+    <string name="alert_vpn_stopped">VPN был остановлен без вашего запроса (%s). Трафик сейчас идёт через обычную сеть с вашим реальным IP.</string>
+    <string name="alert_lockdown_hint">Для настоящего kill switch включите постоянный VPN с опцией «Блокировать соединения без VPN» в настройках системы.</string>
+    <string name="alert_open_vpn_settings">Настройки VPN</string>
+    <string name="status_storage_unavailable">Защищённое хранилище недоступно — повторите попытку</string>
+
+    <!-- Проверка надёжности фоновой работы и разрешений -->
+    <string name="bg_health_title">Фоновая работа</string>
+    <string name="btn_bg_health">Фоновая работа</string>
+    <string name="bg_health_intro">Эти настройки определяют, может ли Android незаметно убить VPN в фоне. Исправьте все жёлтые пункты для надёжного постоянного туннеля.</string>
+    <string name="bg_health_summary_protected">Защищено — настройки фоновой работы в порядке</string>
+    <string name="bg_health_summary_mostly">Почти защищено — включите ещё «Блокировать соединения без VPN» для настоящего kill switch</string>
+    <string name="bg_health_summary_at_risk">Под угрозой — Android может незаметно убить VPN в фоне</string>
+    <string name="bg_health_fix">Исправить</string>
+    <string name="bg_health_open">Открыть</string>
+    <string name="bg_health_check_notifications">Уведомления</string>
+    <string name="bg_health_notifications_ok">Включены — вы увидите оповещения «VPN остановлен»</string>
+    <string name="bg_health_notifications_bad">Выключены — оповещения об отключении и тревоги безопасности показаны НЕ будут</string>
+    <string name="bg_health_check_battery">Исключение из оптимизации батареи</string>
+    <string name="bg_health_battery_ok">Исключено — Doze не будет убивать службу VPN</string>
+    <string name="bg_health_battery_bad">Не исключено — самая частая причина гибели VPN в фоне. Нажмите «Исправить» и выберите «Разрешить».</string>
+    <string name="bg_health_check_bg_restriction">Фоновая активность</string>
+    <string name="bg_health_bg_ok">Не ограничена</string>
+    <string name="bg_health_bg_bad">Ограничена — Android остановит VPN вскоре после выхода из приложения. Снимите ограничение: О приложении → Батарея.</string>
+    <string name="bg_health_check_always_on">Постоянный VPN (Always-on)</string>
+    <string name="bg_health_always_on_ok">Включён — система перезапускает VPN автоматически</string>
+    <string name="bg_health_always_on_off">Выключен — включите постоянный VPN для AIVPN в системных настройках (шестерёнка рядом с AIVPN)</string>
+    <string name="bg_health_check_lockdown">Блокировать соединения без VPN</string>
+    <string name="bg_health_lockdown_ok">Включено — настоящий kill switch: ничего не утечёт, даже если VPN умрёт</string>
+    <string name="bg_health_lockdown_off">Выключено — если VPN умрёт, трафик незаметно пойдёт с вашим реальным IP. Этот системный переключатель — единственный настоящий kill switch.</string>
+    <string name="bg_health_unknown_service_off">Нельзя проверить, пока служба VPN не запущена — проверьте в системных настройках VPN</string>
+    <string name="bg_health_check_oem">Автозапуск (%s)</string>
+    <string name="bg_health_oem_desc">Прошивка этого производителя может дополнительно требовать включить автозапуск / убрать AIVPN из «спящих приложений». Не гарантируется — такого экрана может не быть на вашем устройстве.</string>
+    <string name="bg_health_oem_generic">На некоторых устройствах также нужно включить «Автозапуск» для AIVPN в фирменном приложении батареи/безопасности.</string>
+    <string name="bg_health_hint_ok">Фон: защищено</string>
+    <string name="bg_health_hint_risk">Фон: под угрозой — нажмите, чтобы исправить</string>
 </resources>
