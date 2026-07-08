@@ -1172,7 +1172,13 @@ class MainActivity : AppCompatActivity() {
         }
         val serverAddr = profiles.find { it.id == activeProfileId }
             ?.key?.let { parseConnectionKey(it)?.server } ?: ""
-        val liveScore = currentQualityScore
+        // Read the LIVE score straight from the native core, not the cached
+        // currentQualityScore — that cache is only refreshed by the traffic
+        // callback, so it can be a stale 0 captured right after connect (before
+        // the first KeepaliveAck updated the score) if no traffic has flowed
+        // since. Fall back to the cache only if the live read has no data yet.
+        val liveScore = AivpnJni.getQualityScore().takeIf { it > 0 } ?: currentQualityScore
+        if (liveScore > 0) currentQualityScore = liveScore
         val qualityLine = if (liveScore > 0)
             getString(R.string.quality_score_live, liveScore)
         else
