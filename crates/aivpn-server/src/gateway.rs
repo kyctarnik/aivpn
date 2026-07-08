@@ -3047,6 +3047,15 @@ impl Gateway {
                     let removed = self
                         .session_manager
                         .cleanup_old_sessions_for_vpn_ip(&vpn_ip, &session_id);
+                    // Re-assert the downlink mapping for the winning session.
+                    // create_session inserts vpn_ip_map BEFORE tag validation, so a
+                    // concurrent duplicate/reconnect handshake for the same static
+                    // VPN IP could have overwritten it (and its own rollback would
+                    // not restore THIS session). Without this the client uploads
+                    // fine but downlink is a permanent blackhole ("no session for
+                    // VPN IP"). Making the validated winner authoritative here
+                    // closes that race deterministically.
+                    self.session_manager.bind_vpn_ip(&vpn_ip, &session_id);
                     // Stop active recordings for removed stale sessions
                     if let Some(ref recorder) = self.recording_manager {
                         let socket = self.udp_socket.as_ref().unwrap().clone();

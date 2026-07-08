@@ -1354,10 +1354,44 @@ impl SessionManager {
         if let Some(entry) = self.vpn_ip_map.get(vpn_ip) {
             let session_id = *entry;
             drop(entry);
-            self.sessions.get(&session_id).map(|e| e.clone())
-        } else {
-            None
+            if let Some(sess) = self.sessions.get(&session_id).map(|e| e.clone()) {
+                return Some(sess);
+            }
+            // Map points at a session that no longer exists (removed without the
+            // map being cleaned). Fall through to the self-healing scan below.
         }
+        // Self-heal: the fast index missed, but a live session may still own this
+        // VPN IP (its map entry can be lost to a reconnect/duplicate-handshake
+        // race in create_session/rollback that overwrites vpn_ip_map before tag
+        // validation). Without this, downlink to that IP is a permanent
+        // blackhole — the client uploads fine (tag-matched) but receives nothing,
+        // trips its RX watchdog, and reconnects forever. The scan runs only on a
+        // miss (the cold path), so it costs nothing on the hot downlink path.
+        let repaired = self.sessions.iter().find_map(|entry| {
+            if entry.value().lock().vpn_ip == Some(*vpn_ip) {
+                Some((*entry.key(), entry.value().clone()))
+            } else {
+                None
+            }
+        });
+        if let Some((session_id, sess)) = repaired {
+            self.vpn_ip_map.insert(*vpn_ip, session_id);
+            debug!(
+                "Repaired lost vpn_ip_map entry for {} on downlink miss",
+                vpn_ip
+            );
+            return Some(sess);
+        }
+        None
+    }
+
+    /// Make `session_id` the authoritative owner of `vpn_ip` in the downlink
+    /// index. Called at the end of a successful handshake (after old-session
+    /// cleanup) so a concurrent duplicate/reconnect handshake that overwrote
+    /// `vpn_ip_map` while its own tag validation was still pending can never
+    /// leave the winning session without a downlink mapping.
+    pub fn bind_vpn_ip(&self, vpn_ip: &Ipv4Addr, session_id: &[u8; 16]) {
+        self.vpn_ip_map.insert(*vpn_ip, *session_id);
     }
 
     /// Remove session and return its ID if it existed.
@@ -2246,6 +2280,58 @@ mod tests {
         assert_ne!(
             fresh[0].1, eph1,
             "re-initiated rekey must use a brand-new keypair"
+        );
+    }
+
+    /// Regression for the downlink blackhole: a live session owns a VPN IP but
+    /// its `vpn_ip_map` entry was lost (a reconnect/duplicate-handshake race can
+    /// overwrite it before tag validation, and the loser's rollback does not
+    /// restore the winner). `get_session_by_vpn_ip` must self-heal by scanning
+    /// live sessions and repairing the map, so downlink never permanently
+    /// blackholes while uplink (tag-matched) keeps working.
+    #[test]
+    fn get_session_by_vpn_ip_self_heals_lost_mapping() {
+        let sm = make_manager();
+        let sid = [3u8; 16];
+        let vpn_ip = Ipv4Addr::new(10, 0, 0, 8);
+        let mut s = Session::new(
+            sid,
+            "127.0.0.1:6000".parse().unwrap(),
+            make_keys(2),
+            [0u8; X25519_PUBLIC_KEY_SIZE],
+        );
+        s.vpn_ip = Some(vpn_ip);
+        sm.sessions.insert(sid, Arc::new(Mutex::new(s)));
+
+        // Simulate the lost mapping: the session is live but absent from the index.
+        assert!(sm.vpn_ip_map.get(&vpn_ip).is_none());
+
+        // Lookup must still find it AND repair the map.
+        let found = sm
+            .get_session_by_vpn_ip(&vpn_ip)
+            .expect("live session must be found via self-healing scan");
+        assert_eq!(found.lock().session_id, sid);
+        assert_eq!(
+            sm.vpn_ip_map.get(&vpn_ip).map(|e| *e),
+            Some(sid),
+            "map must be repaired after the self-healing scan"
+        );
+
+        // bind_vpn_ip makes a given session authoritative for the IP.
+        let sid2 = [4u8; 16];
+        let mut s2 = Session::new(
+            sid2,
+            "127.0.0.1:6001".parse().unwrap(),
+            make_keys(5),
+            [0u8; X25519_PUBLIC_KEY_SIZE],
+        );
+        s2.vpn_ip = Some(vpn_ip);
+        sm.sessions.insert(sid2, Arc::new(Mutex::new(s2)));
+        sm.bind_vpn_ip(&vpn_ip, &sid2);
+        assert_eq!(
+            sm.get_session_by_vpn_ip(&vpn_ip).unwrap().lock().session_id,
+            sid2,
+            "bind_vpn_ip must make the named session the downlink owner"
         );
     }
 
