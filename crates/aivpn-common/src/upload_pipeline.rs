@@ -280,6 +280,11 @@ pub async fn run_upload_loop(
     let mut current_ka_ms = config.keepalive_interval.as_millis() as u64;
     let mut ka_interval = time::interval_at(tokio::time::Instant::now(), config.keepalive_interval);
     let mut data_packet_count: u64 = 0;
+    // Last time a keepalive actually went out. Bounds how long continuous data
+    // may suppress keepalives (see the data branch): keepalives are the only RTT
+    // probe, so unbounded suppression leaves connection quality stuck at 0/100 on
+    // a busy tunnel.
+    let mut last_keepalive = tokio::time::Instant::now();
 
     // Drains and sends every control payload currently queued, without
     // blocking. Called between data sends so control traffic (especially a
@@ -352,10 +357,16 @@ pub async fn run_upload_loop(
                 // Final check: pick up anything queued during the very last
                 // burst-drain packet before looping back to the outer select.
                 drain_pending_control(&mut control_rx, udp, enc).await?;
-                // Suppress the next keepalive tick: a keepalive immediately after
-                // real data wastes bandwidth and the server's ACK resets the peer's
-                // rx-silence timer anyway.
-                ka_interval.reset();
+                // Suppress the next keepalive tick ONLY when one went out
+                // recently: a keepalive right after real data wastes bandwidth and
+                // the server's ACK resets the peer's rx-silence timer anyway. But do
+                // NOT let continuous data STARVE keepalives forever — they are the
+                // only RTT probe, so a busy tunnel would otherwise never measure
+                // connection quality (score stuck at 0/100). Once a keepalive is
+                // overdue, let the tick fire so quality keeps updating under load.
+                if last_keepalive.elapsed() < Duration::from_millis(current_ka_ms) {
+                    ka_interval.reset();
+                }
             }
 
             // ── Keepalive (fires only when data path is idle) ──
@@ -370,6 +381,7 @@ pub async fn run_upload_loop(
                 }
                 let encrypted = enc.encrypt_keepalive()?;
                 send_tolerant(udp, &encrypted).await?;
+                last_keepalive = tokio::time::Instant::now();
             }
 
             // ── Control payloads ──
