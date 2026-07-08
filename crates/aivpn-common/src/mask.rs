@@ -445,6 +445,36 @@ pub fn resolve_handshake_mask(
     }
 }
 
+/// Consecutive never-connected handshake attempts after which a client
+/// abandons the descriptor-derived covert mask for a builtin preset. A cached
+/// descriptor the server cannot reproduce (server-key change, epoch outside
+/// the server's accepted window, client/server derivation skew across
+/// versions) makes EVERY handshake fail with a tag mismatch; without this net
+/// the client retries the same unmatchable mask forever. Mirrors the desktop
+/// client's `HANDSHAKE_FALLBACK_THRESHOLD` (main.rs) for the mobile cores.
+pub const HANDSHAKE_FALLBACK_THRESHOLD: u32 = 3;
+
+/// `resolve_handshake_mask` with the desktop client's resilience net: once
+/// `fail_streak` reaches `HANDSHAKE_FALLBACK_THRESHOLD`, resolve as if no
+/// descriptor were held, so the handshake uses a builtin preset every server
+/// matches via its builtin candidate set. An explicit preset in `preferred`
+/// (the user's deliberate mask-picker choice) is honored either way. The
+/// availability-over-covertness trade is deliberate and bounded: the caller
+/// resets the streak on the first real connection, and the server re-pushes
+/// fresh descriptors in-session, so subsequent handshakes are covert again.
+pub fn resolve_handshake_mask_resilient(
+    preferred: Option<&str>,
+    descriptors: &[BootstrapDescriptor],
+    preshared_key: Option<&[u8; 32]>,
+    fail_streak: u32,
+) -> MaskProfile {
+    if fail_streak >= HANDSHAKE_FALLBACK_THRESHOLD {
+        resolve_handshake_mask(preferred, &[], preshared_key)
+    } else {
+        resolve_handshake_mask(preferred, descriptors, preshared_key)
+    }
+}
+
 /// BLAKE3 derive-key context for polymorphic-mask perturbation seeds.
 const POLYMORPHIC_SEED_CONTEXT: &str = "aivpn-polymorphic-mask-v1";
 
@@ -2426,6 +2456,51 @@ mod tests {
         assert!(preset_masks::by_id(&resolved.mask_id).is_some());
         let again = resolve_handshake_mask(None, &[], Some(&psk));
         assert_eq!(resolved.mask_id, again.mask_id);
+    }
+
+    #[test]
+    fn resolve_handshake_mask_resilient_drops_descriptors_at_threshold() {
+        let descriptor = BootstrapDescriptor {
+            descriptor_id: "epoch-77".into(),
+            version: 1,
+            created_at: 0,
+            expires_at: u64::MAX,
+            base_mask_ids: vec!["webrtc_zoom_v3".into(), "quic_https_v2".into()],
+            embedded_masks: Vec::new(),
+            candidate_count: 4,
+            kdf_salt: [3u8; 32],
+            signature: [0u8; 64],
+        };
+        let psk = [6u8; 32];
+        let descriptors = std::slice::from_ref(&descriptor);
+
+        // Below the threshold the covert descriptor mask is still used.
+        let covert = resolve_handshake_mask_resilient(
+            None,
+            descriptors,
+            Some(&psk),
+            HANDSHAKE_FALLBACK_THRESHOLD - 1,
+        );
+        assert!(covert.mask_id.starts_with("bootstrap:epoch-77:"));
+
+        // At the threshold the descriptor is abandoned for a builtin preset
+        // (the unmatchable-descriptor reconnect-loop breaker).
+        let fallback = resolve_handshake_mask_resilient(
+            None,
+            descriptors,
+            Some(&psk),
+            HANDSHAKE_FALLBACK_THRESHOLD,
+        );
+        assert!(preset_masks::by_id(&fallback.mask_id).is_some());
+
+        // An explicit preset choice is honored on both sides of the threshold.
+        let chosen = resolve_handshake_mask_resilient(
+            Some("webrtc_zoom_v3"),
+            descriptors,
+            Some(&psk),
+            HANDSHAKE_FALLBACK_THRESHOLD,
+        );
+        assert_eq!(chosen.mask_id, "webrtc_zoom_v3");
     }
 
     #[test]

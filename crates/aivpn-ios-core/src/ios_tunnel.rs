@@ -32,8 +32,8 @@ use aivpn_common::client_wire::{
 use aivpn_common::crypto::{derive_session_keys, KeyPair, SessionKeys};
 use aivpn_common::error::{Error, Result};
 use aivpn_common::mask::{
-    current_unix_secs, decode_bootstrap_descriptor, resolve_handshake_mask, BootstrapDescriptor,
-    MaskProfile,
+    current_unix_secs, decode_bootstrap_descriptor, resolve_handshake_mask_resilient,
+    BootstrapDescriptor, MaskProfile, HANDSHAKE_FALLBACK_THRESHOLD,
 };
 use aivpn_common::mimicry::MimicryEncryptor;
 use aivpn_common::protocol::{ControlPayload, InnerType};
@@ -300,6 +300,16 @@ static ACTIVE_CONTROL_TX: Mutex<Option<mpsc::Sender<ControlPayload>>> = Mutex::n
 /// the platform layer attributes such attempts as a failure for the base
 /// mask family it requested (see `PacketTunnelProvider.swift`).
 pub static EVER_CONNECTED: AtomicBool = AtomicBool::new(false);
+/// Consecutive attempts that died on a handshake TIMEOUT without ever
+/// connecting, carried across `run_tunnel_ios` calls (the tunnel extension
+/// process stays alive across the Swift reconnect loop). At
+/// `HANDSHAKE_FALLBACK_THRESHOLD` the handshake mask resolution abandons the
+/// descriptor-derived covert mask for a builtin preset every server matches —
+/// a cached descriptor this server cannot reproduce otherwise fails EVERY
+/// handshake with a tag mismatch and reconnects forever (desktop main.rs has
+/// the same net via its local `handshake_fail_streak`). Reset when the PFS
+/// ratchet completes.
+pub static HANDSHAKE_FAIL_STREAK: AtomicU32 = AtomicU32::new(0);
 /// Server-pushed `FeedbackConfig.report_failure_threshold` for this session,
 /// coerced to >=1 on receipt. `0` means no `FeedbackConfig` was received this
 /// session — the platform should keep its previously persisted value.
@@ -759,10 +769,22 @@ pub async fn run_tunnel_ios(
     // handshake/control MDH from the mask's `header_spec` (FIX 3: DPI-shaped
     // opening packets instead of pure-random noise). Resolved the same way as
     // `initial_mask` below (env + PSK are stable → identical mask).
-    let handshake_mask = resolve_handshake_mask(
+    // Resilience net: after HANDSHAKE_FALLBACK_THRESHOLD consecutive handshake
+    // timeouts, resolve WITHOUT the (possibly unmatchable) cached descriptors so
+    // the attempt uses a builtin preset every server matches. Snapshot the
+    // streak once so `initial_mask` below resolves identically.
+    let handshake_fail_streak = HANDSHAKE_FAIL_STREAK.load(Ordering::Relaxed);
+    if handshake_fail_streak >= HANDSHAKE_FALLBACK_THRESHOLD {
+        log::warn!(
+            "aivpn: {} consecutive handshakes never connected — falling back to a builtin preset mask (a cached bootstrap descriptor may be unmatchable by this server)",
+            handshake_fail_streak
+        );
+    }
+    let handshake_mask = resolve_handshake_mask_resilient(
         preferred_mask.as_deref(),
         &current_bootstrap_descriptors(),
         psk.as_ref(),
+        handshake_fail_streak,
     );
     // §2 crowdsourced blocking feedback: publish the attempted mask family HERE —
     // as soon as the handshake mask is resolved and BEFORE the ServerHello wait —
@@ -827,6 +849,9 @@ pub async fn run_tunnel_ios(
     let server_network_cfg = loop {
         let now = Instant::now();
         if now >= deadline {
+            // Feed the resilience net: a timeout here is the signature of an
+            // unmatchable handshake mask (tag mismatch server-side is silent).
+            HANDSHAKE_FAIL_STREAK.fetch_add(1, Ordering::Relaxed);
             return Err(Error::Session("Handshake timeout (10 s)".into()));
         }
         let wait = std::cmp::min(
@@ -965,6 +990,7 @@ pub async fn run_tunnel_ios(
     // ratchet step). The platform polls this after `run_tunnel_ios` returns
     // to decide whether to attribute a failure to this attempt's mask family.
     EVER_CONNECTED.store(true, Ordering::Relaxed);
+    HANDSHAKE_FAIL_STREAK.store(0, Ordering::Relaxed);
 
     // Notify tunnel ready via C callback (after ClientCert so app UI opens after auth)
     if let Some(cb) = on_ready {
@@ -1140,10 +1166,11 @@ pub async fn run_tunnel_ios(
     // Initial mimicry mask: the `preferred_mask` FFI argument (mirrors Android's
     // `preferred_mask`), or the PSK-derived bootstrap mask when unset/"auto".
     // Resolved identically to `handshake_mask` above so both planes agree.
-    let initial_mask = resolve_handshake_mask(
+    let initial_mask = resolve_handshake_mask_resilient(
         preferred_mask.as_deref(),
         &current_bootstrap_descriptors(),
         psk.as_ref(),
+        handshake_fail_streak,
     );
 
     // (ATTEMPTED_MASK_FAMILY is published earlier, right after `handshake_mask`
