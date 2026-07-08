@@ -1,6 +1,5 @@
 import SwiftUI
 import NetworkExtension
-import Darwin
 
 // MARK: - Helpers
 
@@ -30,6 +29,7 @@ private struct KeyRowView: View {
     let onSelect: () -> Void
     let onEdit: () -> Void
     let onDelete: () -> Void
+    let onAddNew: () -> Void
 
     var body: some View {
         HStack(spacing: 12) {
@@ -55,7 +55,9 @@ private struct KeyRowView: View {
                     .font(.caption)
             }
             Menu {
-                Button { onEdit() }  label: { Label("Edit",   systemImage: "pencil") }
+                Button { onAddNew() } label: { Label("Add Key", systemImage: "plus.circle") }
+                Divider()
+                Button { onEdit() } label: { Label("Edit", systemImage: "pencil") }
                 Button(role: .destructive) { onDelete() } label: { Label("Delete", systemImage: "trash") }
             } label: {
                 Image(systemName: "ellipsis.circle")
@@ -65,6 +67,11 @@ private struct KeyRowView: View {
         .padding(.vertical, 4)
         .contentShape(Rectangle())
         .onTapGesture { onSelect() }
+        .contextMenu {
+            Button { onAddNew() } label: { Label("Add Key", systemImage: "plus.circle") }
+            Button { onEdit() } label: { Label("Edit", systemImage: "pencil") }
+            Button(role: .destructive) { onDelete() } label: { Label("Delete", systemImage: "trash") }
+        }
     }
 }
 
@@ -72,40 +79,51 @@ private struct KeyRowView: View {
 
 private struct KeyEditSheet: View {
     let existingKey: ConnectionKey?
-    let onSave: (String, String, String?) -> Bool
+    /// Returns nil on success, or a localized error message on failure.
+    /// Parameters: name, key value, mTLS cert, server signing key (base64).
+    let onSave: (String, String, String?, String?) -> String?
     let onCancel: () -> Void
 
     @State private var name: String
     @State private var value: String
     @State private var mtlsCert: String
+    @State private var serverSigningKey: String
     @State private var error: String?
     @EnvironmentObject private var loc: LocalizationManager
 
-    init(existingKey: ConnectionKey?, onSave: @escaping (String, String, String?) -> Bool, onCancel: @escaping () -> Void) {
+    init(existingKey: ConnectionKey?, onSave: @escaping (String, String, String?, String?) -> String?, onCancel: @escaping () -> Void) {
         self.existingKey = existingKey
         self.onSave = onSave
         self.onCancel = onCancel
         _name     = State(initialValue: existingKey?.name ?? "")
         _value    = State(initialValue: existingKey.map { "aivpn://\($0.keyValue)" } ?? "")
         _mtlsCert = State(initialValue: existingKey?.mtlsCert ?? "")
+        _serverSigningKey = State(initialValue: existingKey?.serverSigningKey ?? "")
     }
 
     var body: some View {
-        NavigationView {
+        NavigationStack {
             Form {
                 Section {
                     TextField(loc.t("key_name"), text: $name)
                         .autocorrectionDisabled()
                     TextField(loc.t("enter_key"), text: $value, axis: .vertical)
                         .autocorrectionDisabled()
-                        .autocapitalization(.none)
+                        .textInputAutocapitalization(.never)
                         .lineLimit(3...6)
                 }
                 Section(header: Text("mTLS")) {
                     TextField(loc.t("mtls_cert_hint"), text: $mtlsCert, axis: .vertical)
                         .autocorrectionDisabled()
-                        .autocapitalization(.none)
+                        .textInputAutocapitalization(.never)
                         .lineLimit(1...4)
+                        .font(.system(size: 12, design: .monospaced))
+                }
+                Section(header: Text(loc.t("server_signing_key"))) {
+                    TextField(loc.t("server_signing_key_hint"), text: $serverSigningKey, axis: .vertical)
+                        .autocorrectionDisabled()
+                        .textInputAutocapitalization(.never)
+                        .lineLimit(1...3)
                         .font(.system(size: 12, design: .monospaced))
                 }
                 if let e = error {
@@ -121,10 +139,11 @@ private struct KeyEditSheet: View {
                 ToolbarItem(placement: .confirmationAction) {
                     Button(loc.t("save_key")) {
                         let cert = mtlsCert.trimmingCharacters(in: .whitespacesAndNewlines)
-                        let ok = onSave(name.trimmingCharacters(in: .whitespaces),
-                                        value.trimmingCharacters(in: .whitespaces),
-                                        cert.isEmpty ? nil : cert)
-                        if !ok { error = loc.t("duplicate_key") }
+                        let signKey = serverSigningKey.trimmingCharacters(in: .whitespacesAndNewlines)
+                        error = onSave(name.trimmingCharacters(in: .whitespaces),
+                                       value.trimmingCharacters(in: .whitespaces),
+                                       cert.isEmpty ? nil : cert,
+                                       signKey.isEmpty ? nil : signKey)
                     }
                     .disabled(name.trimmingCharacters(in: .whitespaces).isEmpty ||
                               value.trimmingCharacters(in: .whitespaces).isEmpty)
@@ -139,29 +158,34 @@ private struct KeyEditSheet: View {
 private struct StatusRing: View {
     let isConnected: Bool
     let isConnecting: Bool
+    let isDisconnecting: Bool
+
+    private var isAnimating: Bool { isConnecting || isDisconnecting }
 
     private var color: Color {
-        isConnected ? .green : (isConnecting ? .orange : .red)
+        if isDisconnecting { return .orange }
+        return isConnected ? .green : (isConnecting ? .orange : .red)
     }
     private var symbol: String {
-        isConnected ? "lock.fill" : (isConnecting ? "arrow.triangle.2.circlepath" : "lock.open.fill")
+        if isDisconnecting { return "stop.circle" }
+        return isConnected ? "lock.fill" : (isConnecting ? "arrow.triangle.2.circlepath" : "lock.open.fill")
     }
 
     var body: some View {
         ZStack {
             Circle()
-                .stroke(color.opacity(0.2), lineWidth: 8)
-                .frame(width: 96, height: 96)
+                .stroke(color.opacity(0.2), lineWidth: 6)
+                .frame(width: 76, height: 76)
             Circle()
-                .trim(from: 0, to: isConnecting ? 0.6 : 1)
-                .stroke(color, style: StrokeStyle(lineWidth: 8, lineCap: .round))
-                .frame(width: 96, height: 96)
+                .trim(from: 0, to: isAnimating ? 0.6 : 1)
+                .stroke(color, style: StrokeStyle(lineWidth: 6, lineCap: .round))
+                .frame(width: 76, height: 76)
                 .rotationEffect(.degrees(-90))
-                .animation(isConnecting
+                .animation(isAnimating
                     ? .linear(duration: 1.2).repeatForever(autoreverses: false)
-                    : .easeInOut, value: isConnecting)
+                    : .easeInOut, value: isAnimating)
             Image(systemName: symbol)
-                .font(.system(size: 28, weight: .medium))
+                .font(.system(size: 24, weight: .medium))
                 .foregroundColor(color)
         }
     }
@@ -259,53 +283,109 @@ private struct RecordingSection: View {
     }
 }
 
+// MARK: - Card container
+
+private struct CardView<Content: View>: View {
+    @ViewBuilder let content: () -> Content
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            content()
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color(.secondarySystemBackground))
+        .cornerRadius(12)
+    }
+}
+
 // MARK: - Main ContentView
 
 struct ContentView: View {
     @EnvironmentObject var vpn: VPNManager
     @EnvironmentObject var loc: LocalizationManager
+    @Environment(\.openURL) private var openURL
 
-    @State private var fullTunnel: Bool = true
+    @AppStorage("fullTunnel") private var fullTunnel: Bool = true
     @AppStorage("adaptiveLevel") private var adaptiveLevel: Int = 0
     @AppStorage("killSwitch") private var killSwitch: Bool = false
     @State private var showDiagnostics: Bool = false
-    @State private var benchRunning: Bool = false
-    @State private var benchP50: Int = 0
-    @State private var benchQuality: Int = 0
     @State private var showAddKey: Bool = false
     @State private var editingKey: ConnectionKey?
     @State private var deleteKeyId: String?
     @State private var showDeleteConfirm: Bool = false
     @State private var showSplitTunnel: Bool = false
+    @State private var showBootstrapDiscovery: Bool = false
 
     var body: some View {
         NavigationStack {
-            ScrollView {
-                VStack(spacing: 20) {
-                    statusSection
-                    trafficSection
-                    keyListSection
-                    connectSection
-                    if vpn.isConnected && vpn.recordingCapabilityKnown && vpn.canRecordMasks {
-                        RecordingSection()
-                            .padding(.horizontal)
-                            .environmentObject(vpn)
-                            .environmentObject(loc)
+            VStack(spacing: 0) {
+                // Fixed header — status ring stays visible even when user scrolls
+                statusCard
+                    .padding(.horizontal, 16)
+                    .padding(.top, 8)
+                    .padding(.bottom, 4)
+
+                Divider()
+
+                ScrollView {
+                    VStack(spacing: 16) {
+                        if vpn.isConnected { trafficCard }
+                        keysCard
+                        if !vpn.isConnected { settingsCard }
+                        if vpn.isConnected && vpn.recordingCapabilityKnown && vpn.canRecordMasks {
+                            RecordingSection()
+                                .environmentObject(vpn)
+                                .environmentObject(loc)
+                        }
+                        footerView
                     }
-                    footerSection
+                    .padding(.horizontal, 16)
+                    .padding(.top, 8)
+                    .padding(.bottom, 16)
                 }
-                .padding(.vertical)
+            }
+            .safeAreaInset(edge: .bottom, spacing: 0) {
+                connectCard
+                    .padding(.horizontal, 16)
+                    .padding(.top, 12)
+                    .padding(.bottom, 8)
+                    .background(.ultraThinMaterial, ignoresSafeAreaEdges: .bottom)
             }
             .navigationTitle("AIVPN")
             .navigationBarTitleDisplayMode(.inline)
-            .toolbar { toolbarContent }
+            .toolbar {
+                ToolbarItem(placement: .navigationBarLeading) {
+                    Button { loc.toggleLanguage() } label: {
+                        Text(loc.language == "en" ? "RU" : "EN")
+                            .font(.caption)
+                            .padding(4)
+                            .background(Color(.secondarySystemBackground))
+                            .cornerRadius(6)
+                    }
+                }
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button { showSplitTunnel = true } label: {
+                        Image(systemName: "network")
+                    }
+                }
+            }
+            .toolbarBackground(Color(.secondarySystemBackground), for: .navigationBar)
+            .toolbarBackground(.visible, for: .navigationBar)
         }
         .sheet(isPresented: $showAddKey) {
             KeyEditSheet(existingKey: nil,
-                onSave: { name, val, cert in
-                    let ok = vpn.addKey(name: name, keyValue: val, mtlsCert: cert)
-                    if ok { showAddKey = false }
-                    return ok
+                onSave: { name, val, cert, signingKey in
+                    // Strict check (32-byte `k` in base64 or hex + non-empty `s`),
+                    // mirroring the tunnel's parser — not just "serverAddress parsed".
+                    guard ConnectionKey.isValidKeyString(val) else {
+                        return loc.t("error_invalid_key")
+                    }
+                    guard vpn.addKey(name: name, keyValue: val, mtlsCert: cert,
+                                     serverSigningKey: signingKey) else {
+                        return loc.t("duplicate_key")
+                    }
+                    showAddKey = false
+                    return nil
                 },
                 onCancel: { showAddKey = false }
             )
@@ -313,10 +393,17 @@ struct ContentView: View {
         }
         .sheet(item: $editingKey) { key in
             KeyEditSheet(existingKey: key,
-                onSave: { name, val, cert in
-                    let ok = vpn.updateKey(id: key.id, name: name, keyValue: val, mtlsCert: cert)
-                    if ok { editingKey = nil }
-                    return ok
+                onSave: { name, val, cert, signingKey in
+                    // Same strict validation as the add sheet above.
+                    guard ConnectionKey.isValidKeyString(val) else {
+                        return loc.t("error_invalid_key")
+                    }
+                    guard vpn.updateKey(id: key.id, name: name, keyValue: val, mtlsCert: cert,
+                                        serverSigningKey: signingKey) else {
+                        return loc.t("duplicate_key")
+                    }
+                    editingKey = nil
+                    return nil
                 },
                 onCancel: { editingKey = nil }
             )
@@ -334,21 +421,27 @@ struct ContentView: View {
             Text(loc.t("delete_key_message"))
         }
         .sheet(isPresented: $showSplitTunnel) {
-            SplitTunnelView()
+            SplitTunnelView().environmentObject(loc)
+        }
+        .sheet(isPresented: $showBootstrapDiscovery) {
+            BootstrapDiscoveryView()
+                .environmentObject(vpn)
                 .environmentObject(loc)
         }
         .sheet(isPresented: $showDiagnostics) {
             NavigationStack {
                 VStack(spacing: 20) {
-                    if benchRunning {
+                    if vpn.isBenchRunning {
                         ProgressView(loc.t("bench_running"))
-                    } else if benchQuality > 0 {
+                    } else if let result = vpn.benchResult {
                         VStack(spacing: 8) {
-                            Text("Quality: \(benchQuality)/100")
+                            Text("\(loc.t("bench_quality_label")): \(result.quality)/100")
                                 .font(.title2).fontWeight(.bold)
-                                .foregroundColor(benchQuality >= 80 ? .green : benchQuality >= 50 ? .orange : .red)
-                            Text("P50: \(benchP50) ms")
+                                .foregroundColor(result.quality >= 80 ? .green : result.quality >= 50 ? .orange : .red)
+                            Text("\(loc.t("bench_p50_label")): \(result.p50ms) \(loc.t("bench_ms"))")
                                 .font(.subheadline).foregroundColor(.secondary)
+                            Text(result.serverAddr)
+                                .font(.caption2).foregroundColor(.secondary)
                         }
                     } else {
                         Text(loc.t("bench_idle"))
@@ -357,25 +450,10 @@ struct ContentView: View {
                             .padding()
                     }
                     Button(loc.t("run_benchmark")) {
-                        guard let addr = vpn.selectedKey?.serverAddress, !addr.isEmpty else { return }
-                        benchRunning = true
-                        DispatchQueue.global(qos: .utility).async {
-                            runBenchPosix(serverAddr: addr) { p50, quality in
-                                DispatchQueue.main.async {
-                                    if p50 == -1 {
-                                        benchP50 = 0
-                                        benchQuality = 0
-                                    } else {
-                                        benchP50 = p50
-                                        benchQuality = quality
-                                    }
-                                    benchRunning = false
-                                }
-                            }
-                        }
+                        vpn.runBenchmark()
                     }
                     .buttonStyle(.borderedProminent)
-                    .disabled(benchRunning)
+                    .disabled(vpn.isBenchRunning || vpn.selectedKey == nil)
                 }
                 .navigationTitle(loc.t("diagnostics"))
                 .navigationBarTitleDisplayMode(.inline)
@@ -389,11 +467,11 @@ struct ContentView: View {
         }
     }
 
-    // MARK: - Status section
+    // MARK: - Status card
 
-    private var statusSection: some View {
+    private var statusCard: some View {
         VStack(spacing: 10) {
-            StatusRing(isConnected: vpn.isConnected, isConnecting: vpn.isConnecting)
+            StatusRing(isConnected: vpn.isConnected, isConnecting: vpn.isConnecting, isDisconnecting: vpn.isDisconnecting)
             Text(statusLabel)
                 .font(.headline)
                 .foregroundColor(statusColor)
@@ -402,44 +480,332 @@ struct ContentView: View {
                     .font(.caption)
                     .foregroundColor(.red)
                     .multilineTextAlignment(.center)
-                    .padding(.horizontal)
+                    .lineLimit(4)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if vpn.lastError != nil && !vpn.isConnected && !vpn.isConnecting {
+                HStack(spacing: 8) {
+                    Button {
+                        vpn.retryManagerSetup()
+                    } label: {
+                        Label(loc.t("retry"), systemImage: "arrow.clockwise")
+                            .font(.caption)
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+
+                    Button {
+                        if let url = URL(string: "prefs:root=VPN") { openURL(url) }
+                    } label: {
+                        Label(loc.t("open_settings"), systemImage: "gear")
+                            .font(.caption)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 16)
+        .padding(.horizontal, 16)
+        .background(Color(.secondarySystemBackground))
+        .cornerRadius(12)
+    }
+
+    // MARK: - Traffic card
+
+    private var trafficCard: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 0) {
+                statCell(icon: "arrow.up.circle.fill", color: .blue,
+                         label: loc.t("upload"), value: formatBytes(vpn.bytesSent))
+                Divider().frame(height: 52)
+                statCell(icon: "arrow.down.circle.fill", color: .green,
+                         label: loc.t("download"), value: formatBytes(vpn.bytesReceived))
+                Divider().frame(height: 52)
+                statCell(icon: "clock.fill", color: .orange,
+                         label: loc.t("duration"), value: formatDuration(vpn.connectionDuration))
+                Divider().frame(height: 52)
+                statCell(
+                    icon: "chart.bar.fill",
+                    color: vpn.liveQuality >= 80 ? .green : vpn.liveQuality >= 50 ? .orange : .red,
+                    label: loc.t("quality"),
+                    value: vpn.liveQuality > 0 ? "\(vpn.liveQuality)/100" : "—"
+                )
+            }
+            if vpn.serverAdaptiveLevel >= 2 {
+                Divider()
+                HStack(spacing: 6) {
+                    Image(systemName: "waveform.path")
+                        .foregroundColor(.purple)
+                        .font(.caption)
+                    Text(loc.t("fec_active"))
+                        .font(.caption)
+                        .foregroundColor(.purple)
+                    Spacer()
+                    Text("L\(vpn.serverAdaptiveLevel)")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 6)
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .background(Color(.secondarySystemBackground))
+        .cornerRadius(12)
+    }
+
+    // MARK: - Keys card
+
+    private var keysCard: some View {
+        CardView {
+            HStack {
+                Text(loc.t("connection_keys"))
+                    .font(.subheadline)
+                    .fontWeight(.semibold)
+                    .foregroundColor(.secondary)
+                Spacer()
+                Button { showAddKey = true } label: {
+                    Image(systemName: "plus.circle.fill")
+                        .font(.title3)
+                }
+            }
+            .padding(.horizontal, 16)
+            .padding(.top, 14)
+            .padding(.bottom, 10)
+
+            Divider().padding(.leading, 16)
+
+            if vpn.keys.isEmpty {
+                VStack(spacing: 8) {
+                    Text(loc.t("no_keys_yet")).foregroundColor(.secondary)
+                    Button(loc.t("add_first_key")) { showAddKey = true }
+                        .buttonStyle(.bordered)
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 16)
+            } else {
+                ForEach(vpn.keys) { key in
+                    KeyRowView(
+                        key: key,
+                        isSelected: vpn.selectedKeyId == key.id,
+                        onSelect: { vpn.selectKey(id: key.id) },
+                        onEdit: { editingKey = key },
+                        onDelete: {
+                            deleteKeyId = key.id
+                            showDeleteConfirm = true
+                        },
+                        onAddNew: { showAddKey = true }
+                    )
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 2)
+
+                    if key.id != vpn.keys.last?.id {
+                        Divider().padding(.leading, 16)
+                    }
+                }
+                .padding(.bottom, 8)
+            }
+
+            // Collapsed by default: operator-facing flow for discovering a
+            // server without an existing aivpn:// key, via signed rotating
+            // bootstrap descriptors (CDN/GitHub/Telegram). See
+            // BootstrapDiscovery.swift for the fetch/verify implementation.
+            DisclosureGroup(loc.t("advanced_section")) {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text(loc.t("advanced_hint"))
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                    Button(loc.t("bootstrap_open_discovery")) {
+                        showBootstrapDiscovery = true
+                    }
+                    .buttonStyle(.bordered)
+                }
+                .padding(.top, 4)
+            }
+            .padding(.horizontal, 16)
+            .padding(.bottom, 12)
+        }
+    }
+
+    // MARK: - Settings card
+
+    private var settingsCard: some View {
+        CardView {
+            Text(loc.t("settings"))
+                .font(.subheadline)
+                .fontWeight(.semibold)
+                .foregroundColor(.secondary)
+                .padding(.horizontal, 16)
+                .padding(.top, 14)
+                .padding(.bottom, 10)
+
+            Divider().padding(.leading, 16)
+
+            VStack(spacing: 0) {
+                Toggle(loc.t("full_tunnel"), isOn: $fullTunnel)
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 12)
+
+                Divider().padding(.leading, 16)
+
+                Toggle(loc.t("kill_switch"), isOn: $killSwitch)
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 12)
+
+                Divider().padding(.leading, 16)
+
+                HStack {
+                    Text(loc.t("adaptive_mode"))
+                    Spacer()
+                    Picker("", selection: $adaptiveLevel) {
+                        Text(loc.t("adaptive_off")).tag(0)
+                        Text(loc.t("adaptive_light")).tag(1)
+                        Text(loc.t("adaptive_aggressive")).tag(2)
+                        Text(loc.t("adaptive_satellite")).tag(3)
+                    }
+                    .pickerStyle(.menu)
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 12)
+
+                Divider().padding(.leading, 16)
+
+                HStack {
+                    Text(loc.t("mask_profile"))
+                    Spacer()
+                    Picker("", selection: $vpn.preferredMask) {
+                        Text(loc.t("mask_auto")).tag("auto")
+                        if vpn.maskCatalog.isEmpty {
+                            // Fallback until the server catalog has been received.
+                            Text("WebRTC Zoom").tag("webrtc_zoom_v3")
+                            Text("QUIC/HTTPS").tag("quic_https_v2")
+                            Text("Yandex Telemost").tag("webrtc_yandex_telemost_v1")
+                            Text("VK Teams").tag("webrtc_vk_teams_v1")
+                            Text("SberJazz").tag("webrtc_sberjazz_v1")
+                        } else {
+                            ForEach(vpn.maskCatalog.filter { $0.mask_id != "auto" }) { item in
+                                Text(item.label + (item.generated ? loc.t("mask_auto_marker") : ""))
+                                    .tag(item.mask_id)
+                            }
+                        }
+                    }
+                    .pickerStyle(.menu)
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 12)
+
+                Divider().padding(.leading, 16)
+
+                // §3 Polymorphic masks: no effect while `preferredMask == "auto"`
+                // since there is no concrete base mask id to perturb (see
+                // VPNManager.connect()).
+                Toggle(loc.t("polymorphic_mode"), isOn: $vpn.polymorphicEnabled)
+                    .disabled(vpn.preferredMask == "auto")
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 12)
+
+                Divider().padding(.leading, 16)
+
+                // §2 crowdsourced blocking feedback — opt-in, OFF by default.
+                Toggle(loc.t("share_mask_feedback"), isOn: $vpn.shareMaskFeedback)
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 12)
+
+                Divider().padding(.leading, 16)
+
+                Toggle(loc.t("receive_mask_hints"), isOn: $vpn.receiveMaskHints)
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 12)
+
+                Divider().padding(.leading, 16)
+
+                HStack {
+                    Text(loc.t("country_code"))
+                    Spacer()
+                    TextField(loc.t("country_code_placeholder"), text: $vpn.countryCode)
+                        .multilineTextAlignment(.trailing)
+                        .autocapitalization(.allCharacters)
+                        .disableAutocorrection(true)
+                        .frame(width: 60)
+                        .onChange(of: vpn.countryCode) { newValue in
+                            let filtered = String(newValue.uppercased().prefix(2).filter { $0.isLetter })
+                            if filtered != newValue { vpn.countryCode = filtered }
+                        }
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 12)
             }
         }
     }
 
+    // MARK: - Connect card
+
+    private var connectCard: some View {
+        VStack(spacing: 8) {
+            HStack(spacing: 8) {
+                Button {
+                    showDiagnostics = true
+                } label: {
+                    Label(loc.t("diagnostics"), systemImage: "chart.bar.xaxis")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .disabled(vpn.selectedKey == nil)
+
+                Button {
+                    showSplitTunnel = true
+                } label: {
+                    Label(loc.t("split_tunnel_title"), systemImage: "network")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+            }
+
+            Button {
+                if vpn.isConnected {
+                    vpn.disconnect()
+                } else {
+                    guard let key = vpn.selectedKey else { return }
+                    vpn.connect(key: key, fullTunnel: fullTunnel,
+                                adaptiveLevel: adaptiveLevel, killSwitch: killSwitch)
+                }
+            } label: {
+                Label(
+                    vpn.isConnected ? loc.t("disconnect") : loc.t("connect"),
+                    systemImage: vpn.isConnected ? "stop.circle.fill" : "play.circle.fill"
+                )
+                .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(vpn.isConnected ? .red : .accentColor)
+            .disabled(vpn.isConnecting || vpn.isDisconnecting || (!vpn.isConnected && vpn.selectedKey == nil))
+            .controlSize(.large)
+        }
+    }
+
+    // MARK: - Footer
+
+    private var footerView: some View {
+        Text(loc.t("version_footer"))
+            .font(.caption2)
+            .foregroundColor(.secondary)
+            .frame(maxWidth: .infinity, alignment: .center)
+            .padding(.top, 8)
+    }
+
+    // MARK: - Computed helpers
+
     private var statusLabel: String {
+        if vpn.isDisconnecting { return loc.t("status_disconnecting") }
         if vpn.isConnecting { return loc.t("status_connecting") }
         return vpn.isConnected ? loc.t("status_connected") : loc.t("status_disconnected")
     }
 
     private var statusColor: Color {
-        vpn.isConnected ? .green : (vpn.isConnecting ? .orange : .secondary)
-    }
-
-    // MARK: - Traffic stats
-
-    @ViewBuilder
-    private var trafficSection: some View {
-        if vpn.isConnected {
-            HStack(spacing: 0) {
-                statCell(icon: "arrow.up.circle.fill", color: .blue,
-                         label: loc.t("upload"), value: formatBytes(vpn.bytesSent))
-                Divider().frame(height: 44)
-                statCell(icon: "arrow.down.circle.fill", color: .green,
-                         label: loc.t("download"), value: formatBytes(vpn.bytesReceived))
-                Divider().frame(height: 44)
-                statCell(icon: "clock.fill", color: .orange,
-                         label: loc.t("duration"), value: formatDuration(vpn.connectionDuration))
-                Divider().frame(height: 44)
-                statCell(icon: "chart.bar.fill",
-                         color: vpn.liveQuality >= 80 ? .green : vpn.liveQuality >= 50 ? .orange : .red,
-                         label: loc.t("quality"), value: vpn.liveQuality > 0 ? "\(vpn.liveQuality)/100" : "—")
-            }
-            .padding(.horizontal)
-            .background(Color(.secondarySystemBackground))
-            .cornerRadius(12)
-            .padding(.horizontal)
-        }
+        if vpn.isDisconnecting { return .orange }
+        return vpn.isConnected ? .green : (vpn.isConnecting ? .orange : .secondary)
     }
 
     private func statCell(icon: String, color: Color, label: String, value: String) -> some View {
@@ -449,221 +815,8 @@ struct ContentView: View {
             Text(label).font(.caption2).foregroundColor(.secondary)
         }
         .frame(maxWidth: .infinity)
-        .padding(.vertical, 8)
+        .padding(.vertical, 10)
     }
 
-    // MARK: - Keys list
-
-    private var keyListSection: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Text(loc.t("connection_keys"))
-                    .font(.headline)
-                Spacer()
-                Button { showAddKey = true } label: {
-                    Image(systemName: "plus.circle.fill")
-                        .font(.title3)
-                }
-            }
-            .padding(.horizontal)
-
-            if vpn.keys.isEmpty {
-                VStack(spacing: 8) {
-                    Text(loc.t("no_keys_yet")).foregroundColor(.secondary)
-                    Button(loc.t("add_first_key")) { showAddKey = true }
-                        .buttonStyle(.bordered)
-                }
-                .frame(maxWidth: .infinity)
-                .padding()
-            } else {
-                VStack(spacing: 0) {
-                    ForEach(vpn.keys) { key in
-                        KeyRowView(
-                            key: key,
-                            isSelected: vpn.selectedKeyId == key.id,
-                            onSelect: { vpn.selectKey(id: key.id) },
-                            onEdit: { editingKey = key },
-                            onDelete: {
-                                deleteKeyId = key.id
-                                showDeleteConfirm = true
-                            }
-                        )
-                        .padding(.horizontal)
-                        if key.id != vpn.keys.last?.id { Divider().padding(.leading) }
-                    }
-                }
-                .background(Color(.secondarySystemBackground))
-                .cornerRadius(12)
-                .padding(.horizontal)
-            }
-        }
-    }
-
-    // MARK: - Connect / disconnect
-
-    private var connectSection: some View {
-        VStack(spacing: 10) {
-            if !vpn.isConnected {
-                Toggle(loc.t("full_tunnel"), isOn: $fullTunnel)
-                    .padding(.horizontal)
-                Picker(loc.t("adaptive_mode"), selection: $adaptiveLevel) {
-                    Text(loc.t("adaptive_off")).tag(0)
-                    Text(loc.t("adaptive_light")).tag(1)
-                    Text(loc.t("adaptive_aggressive")).tag(2)
-                    Text(loc.t("adaptive_satellite")).tag(3)
-                }
-                .pickerStyle(.menu)
-                .padding(.horizontal)
-                .help(loc.t("adaptive_mode_help"))
-                Toggle(loc.t("kill_switch"), isOn: $killSwitch)
-                    .padding(.horizontal)
-            }
-            if vpn.isConnected {
-                Button {
-                    showDiagnostics = true
-                } label: {
-                    Label(loc.t("diagnostics"), systemImage: "chart.bar.xaxis")
-                        .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.bordered)
-                .padding(.horizontal)
-            }
-            HStack(spacing: 12) {
-                Button {
-                    if vpn.isConnected {
-                        vpn.disconnect()
-                    } else {
-                        guard let key = vpn.selectedKey else { return }
-                        vpn.connect(key: key, fullTunnel: fullTunnel, adaptiveLevel: adaptiveLevel, killSwitch: killSwitch)
-                    }
-                } label: {
-                    Label(
-                        vpn.isConnected ? loc.t("disconnect") : loc.t("connect"),
-                        systemImage: vpn.isConnected ? "stop.circle.fill" : "play.circle.fill"
-                    )
-                    .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.borderedProminent)
-                .tint(vpn.isConnected ? .red : .accentColor)
-                .disabled(vpn.isConnecting || (!vpn.isConnected && vpn.selectedKey == nil))
-                .padding(.horizontal)
-
-                if vpn.isConnected {
-                    Button {
-                        showSplitTunnel = true
-                    } label: {
-                        Image(systemName: "network")
-                    }
-                    .buttonStyle(.bordered)
-                    .padding(.trailing)
-                }
-            }
-        }
-    }
-
-    // MARK: - Footer
-
-    private var footerSection: some View {
-        Text(loc.t("version_footer"))
-            .font(.caption2)
-            .foregroundColor(.secondary)
-            .padding(.top, 8)
-    }
-
-    // MARK: - Toolbar
-
-    @ToolbarContentBuilder
-    private var toolbarContent: some ToolbarContent {
-        ToolbarItem(placement: .navigationBarLeading) {
-            Button {
-                loc.toggleLanguage()
-            } label: {
-                Text(loc.language == "en" ? "RU" : "EN")
-                    .font(.caption)
-                    .padding(4)
-                    .background(Color(.secondarySystemBackground))
-                    .cornerRadius(6)
-            }
-        }
-        ToolbarItem(placement: .navigationBarTrailing) {
-            Button {
-                showSplitTunnel = true
-            } label: {
-                Image(systemName: "network")
-            }
-        }
-    }
 }
 
-// MARK: - UDP Bench (POSIX, no subprocess — iOS sandbox forbids Process)
-
-/// Sends UDP probes to `serverAddr` (host:port) for 5 seconds and calls
-/// completion with (p50ms, qualityScore 0-100) on the calling thread.
-func runBenchPosix(serverAddr: String, completion: (Int, Int) -> Void) {
-    // Detect IPv6 literal addresses (e.g. [::1]:443)
-    let isIPv6Bracket = serverAddr.hasPrefix("[")
-    if isIPv6Bracket {
-        // IPv6 bench not yet supported — return sentinel so caller can show a message
-        completion(-1, 0)
-        return
-    }
-
-    let colonIdx = serverAddr.lastIndex(of: ":")
-    guard let idx = colonIdx else { completion(0, 0); return }
-    let host = String(serverAddr[serverAddr.startIndex..<idx])
-    let portStr = String(serverAddr[serverAddr.index(after: idx)...])
-    guard let portNum = UInt16(portStr) else { completion(0, 0); return }
-
-    var sin = sockaddr_in()
-    sin.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
-    sin.sin_family = sa_family_t(AF_INET)
-    sin.sin_port = portNum.bigEndian
-    guard inet_pton(AF_INET, host, &sin.sin_addr) == 1 else { completion(0, 0); return }
-
-    let fd = socket(AF_INET, SOCK_DGRAM, 0)
-    guard fd >= 0 else { completion(0, 0); return }
-    defer { Darwin.close(fd) }
-
-    var tv = timeval(tv_sec: 0, tv_usec: 500_000)
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
-
-    let probeData = Array("aivpn-bench-probe-v1".utf8)
-    var recvBuf = [UInt8](repeating: 0, count: 256)
-    let deadline = Date().addingTimeInterval(5.0)
-    var rtts: [Double] = []
-    var sent = 0
-
-    while Date() < deadline {
-        let t0 = Date()
-        sent += 1
-        withUnsafePointer(to: sin) { sinPtr in
-            sinPtr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
-                probeData.withUnsafeBytes { bp in
-                    _ = sendto(fd, bp.baseAddress, probeData.count, 0, sa,
-                               socklen_t(MemoryLayout<sockaddr_in>.size))
-                }
-            }
-        }
-        let n = recv(fd, &recvBuf, recvBuf.count, 0)
-        let elapsed = -t0.timeIntervalSinceNow * 1000.0
-        if n > 0 {
-            rtts.append(elapsed)
-        } else if elapsed < 490 {
-            rtts.append(elapsed * 2)
-        }
-        Thread.sleep(forTimeInterval: 0.1)
-    }
-
-    guard !rtts.isEmpty else { completion(0, 0); return }
-    let sorted = rtts.sorted()
-    let p50 = sorted[max(0, Int(Double(sorted.count) * 0.5) - 1)]
-    let lossPct = Double(max(0, sent - rtts.count)) / Double(sent) * 100.0
-    let quality: Int
-    switch (p50, lossPct) {
-    case _ where p50 < 50 && lossPct < 1:  quality = 95
-    case _ where p50 < 100 && lossPct < 3: quality = 80
-    case _ where p50 < 200 && lossPct < 10: quality = 60
-    default: quality = 30
-    }
-    completion(Int(p50), quality)
-}
