@@ -16,7 +16,7 @@ use std::time::Duration;
 use tokio::net::UdpSocket;
 use tracing::{debug, warn};
 
-const DNS_BUF: usize = 512;
+const DNS_BUF: usize = 4096;
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Configuration for the embedded DNS proxy.

@@ -48,7 +48,10 @@ impl TxToken for VpnTxToken {
     {
         let mut buf = vec![0u8; len];
         let result = f(&mut buf);
-        self.tx_queue.lock().unwrap().push_back(buf);
+        self.tx_queue
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push_back(buf);
         result
     }
 }
@@ -64,7 +67,11 @@ impl Device for VpnDevice {
         Self: 'a;
 
     fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        let packet = self.rx_queue.lock().unwrap().pop_front()?;
+        let packet = self
+            .rx_queue
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pop_front()?;
         Some((
             VpnRxToken { packet },
             VpnTxToken {
