@@ -12,6 +12,7 @@
 //! - Passive Mask Distribution
 //! - Prometheus Metrics
 
+pub mod batch_io;
 pub mod client_db;
 pub mod gateway;
 pub mod nat;
@@ -22,13 +23,20 @@ pub mod session;
 pub mod management_api;
 
 // Phase 3-5 modules
+// The inline ML-DPI gate was moved to aivpn-common (shared with the client
+// self-gate); re-export it here so `crate::dpi_gate::…` keeps resolving.
+#[cfg(feature = "neural")]
+pub use aivpn_common::dpi_gate;
 pub mod key_rotation;
+pub mod mask_feedback;
 pub mod metrics;
 pub mod neural;
 pub mod passive_distribution;
 
 // Auto Mask Recording modules
+pub mod gmm;
 pub mod mask_gen;
+pub mod mask_repair;
 pub mod mask_store;
 pub mod recording;
 
@@ -47,6 +55,8 @@ pub mod dns_proxy;
 pub mod mtls;
 pub mod site_sync;
 
+pub mod bootstrap_publish;
+
 pub use client_db::ClientDatabase;
 pub use gateway::{Gateway, GatewayConfig};
 pub use nat::NatForwarder;
@@ -56,6 +66,7 @@ pub use session::SessionManager;
 
 // Phase 3-5 exports
 pub use key_rotation::{KeyRotationConfig, KeyRotator};
+pub use mask_feedback::MaskFeedbackStore;
 pub use metrics::MetricsCollector;
 pub use neural::{NeuralConfig, NeuralResonanceModule, ResonanceResult, ResonanceStatus};
 pub use passive_distribution::{PassiveDistributionConfig, PassiveMaskReceiver};

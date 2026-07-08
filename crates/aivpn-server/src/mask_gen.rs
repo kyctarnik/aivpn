@@ -6,13 +6,18 @@
 //! 3. Self-test via Kolmogorov-Smirnov test
 //! 4. Store and broadcast
 
-// Generated masks carry all-zero ed25519 signatures until a dedicated
-// signing key is plumbed through. Reject the build in production-secure mode
-// to prevent unsigned masks from reaching end users.
+// R2 Phase B: generated masks ARE now signed with the operator Ed25519 key
+// (`--mask-signing-key` / server.json `mask_signing_key`) after the KS
+// self-test passes — see `generate_and_store_mask`. However the key is still
+// OPTIONAL: without it, masks are generated with signature=[0u8;64] exactly as
+// before. production-secure stays a compile error until the remaining step
+// lands: make the signing key mandatory (refuse to generate unsigned) and
+// default `mask_verify_mode` to `enforce` in production-secure builds.
 #[cfg(feature = "production-secure")]
 compile_error!(
-    "mask_gen produces MaskProfile with signature=[0u8;64]. \
-    Wire up a real Ed25519 signing key before enabling production-secure."
+    "mask_gen can still produce MaskProfile with signature=[0u8;64] when no \
+    --mask-signing-key is configured. Make the operator signing key mandatory \
+    (and default mask_verify_mode to enforce) before enabling production-secure."
 );
 
 use std::sync::Arc;
@@ -23,7 +28,26 @@ use aivpn_common::error::{Error, Result};
 use aivpn_common::mask::*;
 use aivpn_common::recording::{Direction, PacketMetadata};
 
+use crate::gmm;
 use crate::mask_store::{MaskEntry, MaskStats, MaskStore};
+
+// ─── GMM distribution tuning (design-doc §4 R&D bridge) ──────────────────────
+//
+// When a recording's size / IAT marginal is multimodal, emit a compact
+// BIC-selected Gaussian mixture instead of the empirical bin/quantile table.
+// The phase2b study (research/mask-generation/phase2b) showed this cuts the
+// KS distance to real held-out traffic by 43–89 %. Flip `USE_GMM_DISTRIBUTIONS`
+// to false to fall back to the pure-empirical generator (clean rollback).
+
+/// Master switch for GMM-based distributions in generated masks.
+const USE_GMM_DISTRIBUTIONS: bool = true;
+/// Max mixture components to sweep (BIC picks the best k in 1..=MAX).
+const GMM_MAX_COMPONENTS: usize = 8;
+/// Minimum samples before a GMM fit is trustworthy; below this keep empirical.
+const GMM_MIN_SAMPLES: usize = 40;
+/// Drop mixture components lighter than this and renormalise (phase2b's 2 %
+/// effective-K filter). If <2 survive, the marginal is treated as unimodal.
+const GMM_MIN_COMPONENT_WEIGHT: f64 = 0.02;
 
 // ─── Analysis Result ─────────────────────────────────────────────────────────
 
@@ -35,6 +59,8 @@ struct AnalysisResult {
     header: HeaderObservation,
     fsm_states: Vec<FSMState>,
     fsm_initial_state: u16,
+    /// R3: joint size↔IAT 2-D GMM for the uplink, when correlation is material.
+    size_iat_joint: Option<SizeIatGmm2d>,
     mean_entropy: f32,
     total_packets: u64,
     duration_secs: u64,
@@ -138,7 +164,7 @@ pub async fn generate_and_store_mask(
     );
 
     // 2. Build MaskProfile
-    let profile = build_mask_profile(service, &analysis)?;
+    let mut profile = build_mask_profile(service, &analysis)?;
 
     // 3. Self-test
     let test = self_test(&profile, packets)?;
@@ -165,6 +191,23 @@ pub async fn generate_and_store_mask(
         test.fsm_score,
         test.confidence
     );
+
+    // 3b. R2 Phase B: sign with the operator key — ONLY after the self-test
+    // gate passed, so a signature attests "this mask went through the gates".
+    // Sign the reverse profile first: `signing_message()` serializes the whole
+    // struct, so the outer signature then also covers the (already signed)
+    // reverse profile, and the reverse profile stays independently verifiable
+    // if it is ever extracted standalone.
+    if let Some(key) = store.operator_signing_key() {
+        if let Some(rev) = profile.reverse_profile.as_mut() {
+            rev.sign(key);
+        }
+        profile.sign(key);
+        info!(
+            "Mask '{}' signed with operator Ed25519 key",
+            profile.mask_id
+        );
+    }
 
     // 4. Store
     let mask_id = profile.mask_id.clone();
@@ -214,9 +257,14 @@ fn analyze_traffic(_service: &str, packets: &[PacketMetadata]) -> Result<Analysi
     let headers: Vec<Vec<u8>> = packets.iter().map(|p| p.header_prefix.clone()).collect();
     let header = analyze_headers(&headers);
 
-    // FSM from size change-point detection
+    // R4: temporal FSM — a Markov chain over the size GMM's components with
+    // per-mode size/IAT emission, so the generated stream reproduces the real
+    // traffic's autocorrelation instead of drawing each packet i.i.d.
     let uplink_sizes: Vec<u16> = uplink.iter().map(|p| p.size).collect();
-    let (fsm_states, fsm_initial) = build_fsm_from_sizes(&uplink_sizes);
+    let uplink_iats: Vec<f64> = uplink.iter().map(|p| p.iat_ms).collect();
+    let (fsm_states, fsm_initial) = build_temporal_fsm(&uplink_sizes, &uplink_iats);
+    // R3: joint size↔IAT model (Some only when correlation is material).
+    let size_iat_joint = build_size_iat_joint(&uplink_sizes, &uplink_iats);
 
     // Entropy
     let entropies: Vec<f32> = packets.iter().map(|p| p.entropy).collect();
@@ -247,6 +295,7 @@ fn analyze_traffic(_service: &str, packets: &[PacketMetadata]) -> Result<Analysi
         header,
         fsm_states,
         fsm_initial_state: fsm_initial,
+        size_iat_joint,
         mean_entropy,
         total_packets: packets.len() as u64,
         duration_secs,
@@ -509,6 +558,189 @@ fn build_fsm_from_sizes(sizes: &[u16]) -> (Vec<FSMState>, u16) {
         .collect();
 
     (fsm_states, 0)
+}
+
+/// Local Gaussian pdf (gmm::gaussian_pdf is private to that module).
+fn gauss_pdf(x: f64, mean: f64, var: f64) -> f64 {
+    let v = var.max(1e-9);
+    let d = x - mean;
+    (-(d * d) / (2.0 * v)).exp() / (2.0 * std::f64::consts::PI * v).sqrt()
+}
+
+/// A single-component GMM `SizeDistribution` centred on (mean, var): an FSM
+/// state's per-mode size emission. Flat layout `[k, w, mu, sigma]` per
+/// `sample_gaussian_mixture` (sigma = std dev).
+fn single_gmm_size(mean: f64, var: f64) -> SizeDistribution {
+    SizeDistribution {
+        dist_type: SizeDistType::Parametric,
+        bins: Vec::new(),
+        parametric_type: Some(ParametricType::Gmm),
+        parametric_params: Some(vec![1.0, 1.0, mean.max(1.0), var.max(1.0).sqrt()]),
+    }
+}
+
+/// A single-component GMM `IATDistribution` from one state's inter-arrival
+/// samples (ms). `None` when too few samples to estimate — the mask's global
+/// IAT distribution then applies.
+fn single_gmm_iat(iats: &[f64]) -> Option<IATDistribution> {
+    if iats.len() < 5 {
+        return None;
+    }
+    let n = iats.len() as f64;
+    let mean = iats.iter().sum::<f64>() / n;
+    let var = iats.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n;
+    Some(IATDistribution {
+        dist_type: IATDistType::Gmm,
+        params: vec![1.0, 1.0, mean.max(0.0), var.max(1e-6).sqrt()],
+        jitter_range_ms: (0.0, 0.0),
+    })
+}
+
+/// R4 — temporal FSM: a first-order Markov chain over the size GMM's components.
+/// Each component becomes an FSM state whose emission is that component's size /
+/// IAT distribution; the transition probabilities are counted from the REAL
+/// consecutive-packet component sequence, so the generated stream reproduces the
+/// traffic's autocorrelation (bursts, request/response) instead of the i.i.d.
+/// draw a bare marginal GMM yields. The transition's overrides carry the
+/// DESTINATION mode's emission (applied on entry). Falls back to the size
+/// change-point FSM when the sample is too small or unimodal for a mixture.
+pub fn build_temporal_fsm(sizes: &[u16], iats: &[f64]) -> (Vec<FSMState>, u16) {
+    if sizes.len() < GMM_MIN_SAMPLES {
+        return build_fsm_from_sizes(sizes);
+    }
+    let data: Vec<f64> = sizes.iter().map(|&s| s as f64).collect();
+    let fit = match gmm::select_best_bic(&data, GMM_MAX_COMPONENTS) {
+        Some(f) if f.k() >= 2 => f,
+        _ => return build_fsm_from_sizes(sizes),
+    };
+    let k = fit.k();
+
+    // Assign each packet to its most-likely component (by size).
+    let assign: Vec<usize> = data
+        .iter()
+        .map(|&x| {
+            (0..k)
+                .map(|c| (c, fit.weights[c] * gauss_pdf(x, fit.means[c], fit.vars[c])))
+                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(c, _)| c)
+                .unwrap_or(0)
+        })
+        .collect();
+
+    // First-order transition counts + per-component IAT samples.
+    let mut trans = vec![vec![0u32; k]; k];
+    for w in assign.windows(2) {
+        trans[w[0]][w[1]] += 1;
+    }
+    let mut comp_iats: Vec<Vec<f64>> = vec![Vec::new(); k];
+    for (i, &c) in assign.iter().enumerate() {
+        if let Some(&iat) = iats.get(i) {
+            comp_iats[c].push(iat);
+        }
+    }
+
+    let states: Vec<FSMState> = (0..k)
+        .map(|i| {
+            let total: u32 = trans[i].iter().sum::<u32>();
+            let transitions: Vec<FSMTransition> = (0..k)
+                .filter(|&j| trans[i][j] > 0)
+                .map(|j| FSMTransition {
+                    condition: TransitionCondition::Random(
+                        trans[i][j] as f32 / total.max(1) as f32,
+                    ),
+                    next_state: j as u16,
+                    size_override: Some(single_gmm_size(fit.means[j], fit.vars[j])),
+                    iat_override: single_gmm_iat(&comp_iats[j]),
+                    padding_override: None,
+                })
+                .collect();
+            FSMState {
+                state_id: i as u16,
+                transitions,
+            }
+        })
+        .collect();
+
+    let initial = assign.first().copied().unwrap_or(0) as u16;
+    (states, initial)
+}
+
+/// R3 — fit a JOINT 2-D (size, IAT) Gaussian mixture. Reuses the size GMM's
+/// component assignment and estimates each component's full 2×2 covariance from
+/// the assigned (size, iat) pairs, then stores the lower-triangular Cholesky
+/// factor. Returns `Some` ONLY when at least one component shows a meaningful
+/// size↔IAT correlation (the handle the two independent 1-D marginals miss);
+/// otherwise `None`, so the marginals remain the model and nothing is spent on
+/// covariance a DPI classifier could not exploit anyway.
+pub fn build_size_iat_joint(sizes: &[u16], iats: &[f64]) -> Option<SizeIatGmm2d> {
+    // Correlation magnitude below which the joint model is not worth emitting.
+    const MIN_ABS_CORR: f64 = 0.15;
+    if sizes.len() < GMM_MIN_SAMPLES || sizes.len() != iats.len() {
+        return None;
+    }
+    let data: Vec<f64> = sizes.iter().map(|&s| s as f64).collect();
+    let fit = match gmm::select_best_bic(&data, GMM_MAX_COMPONENTS) {
+        Some(f) if f.k() >= 2 => f,
+        _ => return None,
+    };
+    let k = fit.k();
+    let assign: Vec<usize> = data
+        .iter()
+        .map(|&x| {
+            (0..k)
+                .map(|c| (c, fit.weights[c] * gauss_pdf(x, fit.means[c], fit.vars[c])))
+                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(c, _)| c)
+                .unwrap_or(0)
+        })
+        .collect();
+
+    let mut params: Vec<f64> = Vec::with_capacity(1 + k * 6);
+    params.push(k as f64);
+    let mut any_correlated = false;
+    for c in 0..k {
+        let pts: Vec<(f64, f64)> = assign
+            .iter()
+            .enumerate()
+            .filter(|(_, &a)| a == c)
+            .map(|(i, _)| (data[i], iats[i]))
+            .collect();
+        let n = pts.len() as f64;
+        // A component with too few points can't give a stable covariance — fall
+        // back to its marginal mean + the mixture's variance, zero correlation.
+        if pts.len() < 8 {
+            params.extend_from_slice(&[
+                fit.weights[c],
+                fit.means[c],
+                iats.iter().sum::<f64>() / iats.len() as f64,
+                fit.vars[c].max(1.0).sqrt(),
+                0.0,
+                1.0,
+            ]);
+            continue;
+        }
+        let mu_s = pts.iter().map(|p| p.0).sum::<f64>() / n;
+        let mu_i = pts.iter().map(|p| p.1).sum::<f64>() / n;
+        let var_s = pts.iter().map(|p| (p.0 - mu_s).powi(2)).sum::<f64>() / n;
+        let var_i = pts.iter().map(|p| (p.1 - mu_i).powi(2)).sum::<f64>() / n;
+        let cov = pts.iter().map(|p| (p.0 - mu_s) * (p.1 - mu_i)).sum::<f64>() / n;
+        let sd_s = var_s.max(1e-9).sqrt();
+        let sd_i = var_i.max(1e-9).sqrt();
+        let corr = cov / (sd_s * sd_i);
+        if corr.abs() >= MIN_ABS_CORR {
+            any_correlated = true;
+        }
+        // Cholesky of [[var_s, cov],[cov, var_i]] = [[l00,0],[l10,l11]].
+        let l00 = sd_s;
+        let l10 = cov / l00;
+        let l11 = (var_i - l10 * l10).max(1e-9).sqrt();
+        params.extend_from_slice(&[fit.weights[c], mu_s, mu_i, l00, l10, l11]);
+    }
+    if !any_correlated {
+        return None;
+    }
+    let dist = SizeIatGmm2d { params };
+    dist.is_valid().then_some(dist)
 }
 
 // ─── Header Consensus ────────────────────────────────────────────────────────
@@ -891,53 +1123,144 @@ fn compute_confidence(
 
 // ─── MaskProfile Builder ─────────────────────────────────────────────────────
 
+/// Sanitise a recording service label into a filesystem-safe slug.
+///
+/// The generated `mask_id` becomes a filename in the mask store
+/// (`<mask_dir>/<mask_id>.json` / `.stats`). The `service` string arrives over
+/// the control plane from a recording-admin client, so an unsanitised value
+/// containing `/` or `..` would let the resulting write escape the mask
+/// directory — an arbitrary file write as root. Map every non-alphanumeric
+/// character to `_`, lowercase the rest, bound the length, and never return an
+/// empty slug.
+fn sanitize_service_slug(service: &str) -> String {
+    let slug: String = service
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .take(48)
+        .collect();
+    if slug.trim_matches('_').is_empty() {
+        "unnamed".to_string()
+    } else {
+        slug
+    }
+}
+
+/// Derive the 64-float `signature_vector` for a generated mask by running the
+/// SAME feature encoder the live neural detector uses (`neural::encode_features`)
+/// over the recorded traffic of one direction. Auto-masks previously shipped an
+/// all-zero vector, which bakes a degenerate all-zero MLP so the detector cannot
+/// distinguish the mask's own traffic from a DPI-fingerprinted anomaly (the mask
+/// was effectively invisible to Neural Resonance).
+///
+/// The recording only retains SORTED raw samples (`raw_sizes_sorted`,
+/// `raw_iats_sorted`), so feeding them in order would give artificially
+/// monotonic temporal features (lag-1 autocorrelation ≈ 1, a strong trend) that
+/// live, unsorted traffic never exhibits — the baked MLP would then flag normal
+/// traffic. We deterministically shuffle a copy first (fixed seed → reproducible
+/// builds) so the distributional features (size histogram, IAT/entropy
+/// percentiles, means, fractions) stay exact while the order-dependent features
+/// reflect a stationary, de-trended stream, much closer to what the live encoder
+/// actually sees. `rx`/`tx` and `pps`/`bps` come from the whole session so the
+/// direction-ratio and throughput features are representative.
+fn derive_signature_vector(
+    dir: &DirectionalAnalysis,
+    mean_entropy: f32,
+    pps: f64,
+    bps: f64,
+    rx: u64,
+    tx: u64,
+) -> Vec<f32> {
+    use rand::seq::SliceRandom;
+    use rand::SeedableRng;
+
+    // Fixed seed: identical recordings must yield identical signatures so a
+    // rebuilt mask bakes the same encoder (matches the self-test RNG convention).
+    let mut rng = rand::rngs::StdRng::seed_from_u64(0x51_6E_A7_04_5E_ED_00_01);
+    let mut sizes = dir.raw_sizes_sorted.clone();
+    let mut iats = dir.raw_iats_sorted.clone();
+    sizes.shuffle(&mut rng);
+    iats.shuffle(&mut rng);
+
+    let mut stats = crate::neural::TrafficStats::new();
+    stats.pps = pps;
+    stats.bps = bps;
+    stats.rx_packets = rx;
+    stats.tx_packets = tx;
+    // TrafficStats keeps its last 256 samples; feed the newest 256 so the
+    // signature reflects the same window size the live encoder operates on.
+    let take = sizes.len().min(iats.len());
+    let skip = take.saturating_sub(256);
+    for i in skip..take {
+        stats.packet_sizes.push_back(sizes[i]);
+        stats.inter_arrivals.push_back(iats[i]);
+        // Only the mean entropy is retained by the recording; use it for every
+        // sample so the entropy block reflects the recorded average (variance 0).
+        stats.entropy_samples.push_back(mean_entropy as f64);
+    }
+
+    crate::neural::encode_features(&stats).to_vec()
+}
+
 fn build_mask_profile(service: &str, analysis: &AnalysisResult) -> Result<MaskProfile> {
-    let mask_id = format!("auto_{}_v1", service.replace(' ', "_").to_lowercase());
-    let header_template = analysis
-        .header
-        .header_spec
-        .as_ref()
-        .map(HeaderSpec::generate_static)
-        .unwrap_or_else(|| analysis.header.template.clone());
+    let mask_id = format!("auto_{}_v1", sanitize_service_slug(service));
+
+    // Recorded traffic matching a known DPI-classifiable protocol (STUN,
+    // QUIC) gets the new embedded-tag wire layout with a canonical header for
+    // that protocol; everything else keeps the legacy tag-prefix layout.
+    let mimic = derive_mimic_fields(&analysis.header);
 
     let size_distribution = build_size_distribution(&analysis.uplink);
     let iat_distribution = build_iat_distribution(&analysis.uplink);
 
-    // Determine eph_pub_offset based on header_spec or header_template
-    let eph_pub_offset = if let Some(ref spec) = analysis.header.header_spec {
-        spec.min_length() as u16
-    } else {
-        header_template.len().min(4) as u16
-    };
-
-    // Determine spoof_protocol based on header_spec
-    let spoof_protocol = analysis
-        .header
-        .header_spec
-        .as_ref()
-        .map(header_spec_protocol)
-        .unwrap_or(SpoofProtocol::QUIC);
-
     let reverse_profile = build_reverse_profile(&mask_id, analysis);
+
+    // Neural signature: encode the uplink traffic through the live detector's
+    // feature extractor so Neural Resonance can actually watch this mask.
+    let pps = if analysis.duration_secs > 0 {
+        analysis.total_packets as f64 / analysis.duration_secs as f64
+    } else {
+        0.0
+    };
+    let bps = pps * analysis.uplink.size_mean as f64;
+    let signature_vector = derive_signature_vector(
+        &analysis.uplink,
+        analysis.mean_entropy,
+        pps,
+        bps,
+        analysis.uplink.packet_count as u64,
+        analysis.downlink.packet_count as u64,
+    );
 
     Ok(MaskProfile {
         mask_id,
         version: 2, // Version 2 for HeaderSpec support
         created_at: current_unix_secs(),
         expires_at: current_unix_secs() + 365 * 24 * 3600, // 1 year
-        spoof_protocol,
-        header_template,
-        eph_pub_offset,
+        spoof_protocol: mimic.spoof_protocol,
+        header_template: mimic.header_template,
+        eph_pub_offset: mimic.eph_pub_offset,
         eph_pub_length: 32,
         size_distribution,
         iat_distribution,
+        size_iat_joint: analysis.size_iat_joint.clone(),
         padding_strategy: PaddingStrategy::RandomUniform { min: 0, max: 64 },
         fsm_states: analysis.fsm_states.clone(),
         fsm_initial_state: analysis.fsm_initial_state,
-        signature_vector: vec![0.0; 64], // TODO: generate from neural model
+        signature_vector,
         reverse_profile,
-        signature: [0u8; 64], // TODO: sign with Ed25519
-        header_spec: analysis.header.header_spec.clone(),
+        // Signed post-self-test in generate_and_store_mask when an operator
+        // key is configured (R2 Phase B); zeros = unsigned/legacy otherwise.
+        signature: [0u8; 64],
+        header_spec: mimic.header_spec,
+        perturbation_bounds: None,
+        tag_offset: mimic.tag_offset,
+        generated: true,
     })
 }
 
@@ -946,40 +1269,52 @@ fn build_reverse_profile(mask_id: &str, analysis: &AnalysisResult) -> Option<Box
         return None;
     }
 
+    let mimic = derive_mimic_fields(&analysis.header);
     let size_distribution = build_size_distribution(&analysis.downlink);
     let iat_distribution = build_iat_distribution(&analysis.downlink);
+
+    let pps = if analysis.duration_secs > 0 {
+        analysis.total_packets as f64 / analysis.duration_secs as f64
+    } else {
+        0.0
+    };
+    let bps = pps * analysis.downlink.size_mean as f64;
+    let signature_vector = derive_signature_vector(
+        &analysis.downlink,
+        analysis.mean_entropy,
+        pps,
+        bps,
+        analysis.uplink.packet_count as u64,
+        analysis.downlink.packet_count as u64,
+    );
 
     Some(Box::new(MaskProfile {
         mask_id: format!("{}_reverse", mask_id),
         version: 2,
         created_at: current_unix_secs(),
         expires_at: current_unix_secs() + 365 * 24 * 3600,
-        spoof_protocol: analysis
-            .header
-            .header_spec
-            .as_ref()
-            .map(header_spec_protocol)
-            .unwrap_or(SpoofProtocol::QUIC),
-        header_template: analysis.header.template.clone(),
-        eph_pub_offset: analysis
-            .header
-            .header_spec
-            .as_ref()
-            .map(|spec| spec.min_length() as u16)
-            .unwrap_or(analysis.header.template.len().min(4) as u16),
+        spoof_protocol: mimic.spoof_protocol,
+        header_template: mimic.header_template,
+        eph_pub_offset: mimic.eph_pub_offset,
         eph_pub_length: 32,
         size_distribution,
         iat_distribution,
+        // Downlink is server-shaped (A7); the joint model is applied to uplink
+        // client shaping, so the reverse profile keeps the 1-D marginals.
+        size_iat_joint: None,
         padding_strategy: PaddingStrategy::RandomUniform { min: 0, max: 64 },
         fsm_states: vec![FSMState {
             state_id: 0,
             transitions: vec![],
         }],
         fsm_initial_state: 0,
-        signature_vector: vec![0.0; 64],
+        signature_vector,
         reverse_profile: None,
         signature: [0u8; 64],
-        header_spec: analysis.header.header_spec.clone(),
+        header_spec: mimic.header_spec,
+        perturbation_bounds: None,
+        tag_offset: mimic.tag_offset,
+        generated: true,
     }))
 }
 
@@ -997,6 +1332,25 @@ fn build_size_distribution(direction: &DirectionalAnalysis) -> SizeDistribution 
             parametric_type: None,
             parametric_params: None,
         };
+    }
+
+    // Prefer a compact multimodal GMM when the marginal is clearly multimodal
+    // (design-doc §4 bridge). Falls through to the faithful empirical point-bin
+    // histogram for unimodal or small-sample recordings.
+    if USE_GMM_DISTRIBUTIONS && sorted.len() >= GMM_MIN_SAMPLES {
+        let data: Vec<f64> = sorted.iter().map(|&s| s as f64).collect();
+        if let Some(fit) = gmm::select_best_bic(&data, GMM_MAX_COMPONENTS) {
+            if fit.k() >= 2 {
+                if let Some(flat) = fit.to_flat_params(GMM_MIN_COMPONENT_WEIGHT) {
+                    return SizeDistribution {
+                        dist_type: SizeDistType::Parametric,
+                        bins: Vec::new(),
+                        parametric_type: Some(ParametricType::Gmm),
+                        parametric_params: Some(flat),
+                    };
+                }
+            }
+        }
     }
 
     let total = sorted.len() as f32;
@@ -1038,6 +1392,24 @@ fn build_iat_distribution(direction: &DirectionalAnalysis) -> IATDistribution {
         };
     }
 
+    // Prefer a compact multimodal GMM when the IAT marginal is multimodal
+    // (audio cadence + control tail, DNS req/resp asymmetry, QUIC ACK-vs-data).
+    // Falls through to the empirical quantile sampler otherwise.
+    if USE_GMM_DISTRIBUTIONS && sorted.len() >= GMM_MIN_SAMPLES {
+        if let Some(fit) = gmm::select_best_bic(sorted, GMM_MAX_COMPONENTS) {
+            if fit.k() >= 2 {
+                if let Some(flat) = fit.to_flat_params(GMM_MIN_COMPONENT_WEIGHT) {
+                    let jitter = (direction.iat_std_ms.max(0.1) as f64) * 0.02;
+                    return IATDistribution {
+                        dist_type: IATDistType::Gmm,
+                        params: flat,
+                        jitter_range_ms: symmetric_jitter_range(jitter),
+                    };
+                }
+            }
+        }
+    }
+
     let num_quantiles = 200usize.min(sorted.len());
     let mut quantile_values: Vec<f64> = Vec::with_capacity(num_quantiles);
     for i in 0..num_quantiles {
@@ -1064,8 +1436,12 @@ fn symmetric_jitter_range(amplitude_ms: f64) -> (f64, f64) {
 // ─── Self-Test (Kolmogorov-Smirnov) ─────────────────────────────────────────
 
 fn self_test(profile: &MaskProfile, packets: &[PacketMetadata]) -> Result<SelfTestResult> {
-    // Generate synthetic samples from the mask profile
-    let mut rng = rand::thread_rng();
+    // Generate synthetic samples from the mask profile. Use a FIXED seed so mask
+    // acceptance/confidence is reproducible: a mask whose true KS sits near the
+    // 0.45 gate must not pass on one run and fail on the next (masks may be
+    // signed and are distributed, so acceptance must be deterministic).
+    use rand::SeedableRng;
+    let mut rng = rand::rngs::StdRng::seed_from_u64(0xA1_5E_1F_7E);
     let uplink_count = packets
         .iter()
         .filter(|p| p.direction == Direction::Uplink)
@@ -1329,6 +1705,146 @@ fn header_matches_spec(spec: &HeaderSpec, header: &[u8]) -> bool {
     true
 }
 
+// ─── DPI-Plausible Mimic-Protocol Detection ─────────────────────────────────
+
+/// Detect whether a recorded header prefix carries a byte-exact fingerprint
+/// of a protocol aivpn has a working DPI-mimicry path for today (see
+/// `crates/aivpn-common/src/mimic_protocol.rs`), returning the protocol to
+/// spoof and the byte offset at which the 8-byte resonance tag should be
+/// embedded in the mask's header (Variant A embedded-tag wire layout —
+/// [`MaskProfile::tag_offset`]).
+///
+/// Deliberately narrower and cheaper than [`infer_header_spec`]'s scored,
+/// multi-candidate inference: it only recognizes the two protocols with a
+/// real DPI fixup implemented (STUN's message-length patch, QUIC's
+/// constructed RFC 9001 Initial), and only on the single byte range that is
+/// actually load-bearing for each protocol's real-DPI classifier
+/// (nDPI's `is_stun` / `ndpi_search_quic`). Returns `None` for anything else,
+/// leaving the caller to fall back to the legacy tag-prefix layout.
+fn detect_mimic_protocol(recorded_header_prefix: &[u8]) -> Option<(SpoofProtocol, u16)> {
+    // STUN (RFC 5389): magic cookie 0x2112A442 at offset 4..8. This is the
+    // byte range nDPI's STUN dissector keys off; a recording whose header
+    // consistently carries it at this offset is almost certainly STUN.
+    if recorded_header_prefix.len() >= 8 && recorded_header_prefix[4..8] == [0x21, 0x12, 0xA4, 0x42]
+    {
+        return Some((SpoofProtocol::WebRTC_STUN, 8));
+    }
+
+    // QUIC v1 (RFC 9000): long-header form (high bit of the first byte set)
+    // with version 1 at offset 1..5.
+    if recorded_header_prefix.len() >= 5
+        && recorded_header_prefix[0] & 0x80 != 0
+        && recorded_header_prefix[1..5] == [0x00, 0x00, 0x00, 0x01]
+    {
+        return Some((SpoofProtocol::QUIC, 6));
+    }
+
+    None
+}
+
+/// Canonical STUN `HeaderSpec` for detected-protocol masks: mirrors the
+/// hand-authored `webrtc_zoom_v3` preset's structure exactly — binding
+/// request type@0 (2 bytes), STUN message-length@2 (a `Length` field, 2
+/// bytes big-endian), magic cookie@4 (4 bytes), an 8-byte tag-carrier slot@8,
+/// and the remaining 4-byte transaction-id tail@16 (20 bytes total).
+///
+/// A raw recorded header cannot be trusted as-is: `MimicProtocol::Stun`'s
+/// post-assembly fixup (`MaskProfile::patch_stun_length`) needs a `Length`
+/// field at a known offset to satisfy nDPI's `is_stun` invariant
+/// (`msg_len + 20 == udp_payload_len`), which recorded bytes have no reason
+/// to expose correctly. The empirical value of the recording (size/IAT/FSM
+/// distributions) is kept; only the header structure is replaced with this
+/// known-valid one.
+fn canonical_stun_header_spec() -> HeaderSpec {
+    HeaderSpec::structured(vec![
+        HeaderField::Fixed {
+            bytes: vec![0x00, 0x01],
+        },
+        HeaderField::Length {
+            len: 2,
+            endian: HeaderEndian::Big,
+        },
+        HeaderField::Fixed {
+            bytes: vec![0x21, 0x12, 0xA4, 0x42],
+        },
+        HeaderField::Id {
+            len: 8,
+            mode: IdFieldMode::Random,
+        },
+        HeaderField::Id {
+            len: 4,
+            mode: IdFieldMode::Random,
+        },
+    ])
+}
+
+/// Header/protocol/tag-layout fields derived for a generated `MaskProfile`.
+struct MimicFields {
+    spoof_protocol: SpoofProtocol,
+    header_spec: Option<HeaderSpec>,
+    header_template: Vec<u8>,
+    eph_pub_offset: u16,
+    tag_offset: u16,
+}
+
+/// Derive the `spoof_protocol` / `header_spec` / `header_template` /
+/// `eph_pub_offset` / `tag_offset` fields for a mask built from `header`.
+///
+/// If [`detect_mimic_protocol`] recognizes the recorded header as a known
+/// DPI-classifiable protocol, the mask switches to the new embedded-tag wire
+/// layout (Variant A) with a CANONICAL header for that protocol — not the
+/// raw recorded bytes — so the mask's traffic actually passes that
+/// protocol's real DPI validation. Otherwise the legacy tag-prefix layout
+/// (`tag_offset == u16::MAX`) is kept exactly as before, using whatever
+/// [`infer_header_spec`] produced during analysis.
+fn derive_mimic_fields(header: &HeaderObservation) -> MimicFields {
+    if let Some((spoof_protocol, tag_offset)) = detect_mimic_protocol(&header.template) {
+        let header_spec = match spoof_protocol {
+            SpoofProtocol::WebRTC_STUN => canonical_stun_header_spec(),
+            // QUIC's mimicry is fully CONSTRUCTED at packet-build time by
+            // `MimicProtocol::Quic::emit` (the header below is only used for
+            // eph_pub_offset bookkeeping and the handshake-packet fallback
+            // layout — see mimicry.rs), so the hand-authored canonical
+            // constructor is all that's needed here.
+            _ => HeaderSpec::quic_initial(0x0000_0001, 8),
+        };
+        let header_template = header_spec.generate_static();
+        let eph_pub_offset = header_spec.min_length() as u16;
+        return MimicFields {
+            spoof_protocol,
+            header_spec: Some(header_spec),
+            header_template,
+            eph_pub_offset,
+            tag_offset,
+        };
+    }
+
+    // No recognized protocol: legacy tag-prefix layout, unchanged behavior.
+    let header_template = header
+        .header_spec
+        .as_ref()
+        .map(HeaderSpec::generate_static)
+        .unwrap_or_else(|| header.template.clone());
+    let eph_pub_offset = if let Some(ref spec) = header.header_spec {
+        spec.min_length() as u16
+    } else {
+        header_template.len().min(4) as u16
+    };
+    let spoof_protocol = header
+        .header_spec
+        .as_ref()
+        .map(header_spec_protocol)
+        .unwrap_or(SpoofProtocol::QUIC);
+
+    MimicFields {
+        spoof_protocol,
+        header_spec: header.header_spec.clone(),
+        header_template,
+        eph_pub_offset,
+        tag_offset: u16::MAX,
+    }
+}
+
 fn header_spec_protocol(spec: &HeaderSpec) -> SpoofProtocol {
     match spec {
         HeaderSpec::RawPrefix { .. } => SpoofProtocol::QUIC,
@@ -1457,10 +1973,15 @@ fn current_unix_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_iat_distribution, entropy_penalty, header_consensus, header_match_rate,
-        infer_header_spec, ks_test, self_test_passes, DirectionalAnalysis, Period,
+        analyze_traffic, build_iat_distribution, build_mask_profile, detect_mimic_protocol,
+        entropy_penalty, header_consensus, header_match_rate, infer_header_spec, ks_test,
+        sanitize_service_slug, self_test_passes, DirectionalAnalysis, Period,
     };
-    use aivpn_common::mask::{HeaderSpec, IATDistType};
+    use aivpn_common::mask::{HeaderSpec, IATDistType, SpoofProtocol};
+    use aivpn_common::mimic_protocol::MimicProtocol;
+    use aivpn_common::recording::{Direction, PacketMetadata};
+    use rand::rngs::StdRng;
+    use rand::SeedableRng;
 
     #[test]
     fn entropy_penalty_accepts_short_encrypted_packets() {
@@ -1507,11 +2028,149 @@ mod tests {
         };
 
         let dist = build_iat_distribution(&direction);
-        assert_eq!(dist.dist_type, IATDistType::Empirical);
-        assert!(dist.params.iter().any(|&value| value < 20.0));
-        assert!(dist.params.iter().any(|&value| value > 100.0));
+        // With enough multimodal samples the builder now emits a BIC-selected
+        // GMM (design-doc §4 bridge) instead of the empirical quantile table.
+        assert_eq!(dist.dist_type, IATDistType::Gmm);
+        let k = dist.params[0] as usize;
+        assert!(k >= 2, "expected multimodal GMM, got k={k}");
+        // Component means (params[2 + c*3]) must straddle the two real modes.
+        let means: Vec<f64> = (0..k).map(|c| dist.params[2 + c * 3]).collect();
+        assert!(
+            means.iter().any(|&m| m < 30.0),
+            "no fast (~20ms) mode in {means:?}"
+        );
+        assert!(
+            means.iter().any(|&m| m > 60.0),
+            "no slow (~100ms) mode in {means:?}"
+        );
+        // No positive bias: sampled mean should sit near the true mean (~52ms),
+        // not be inflated. Both modes must be populated.
+        let mut rng = rand::rngs::StdRng::seed_from_u64(11);
+        let samples: Vec<f64> = (0..5000).map(|_| dist.sample(&mut rng)).collect();
+        let sample_mean = samples.iter().sum::<f64>() / samples.len() as f64;
+        assert!(
+            (30.0..75.0).contains(&sample_mean),
+            "sampled mean {sample_mean:.1} unexpectedly biased"
+        );
+        assert!(samples.iter().any(|&v| v < 30.0), "fast mode unpopulated");
+        assert!(samples.iter().any(|&v| v > 60.0), "slow mode unpopulated");
         assert!(dist.jitter_range_ms.0 < 0.0);
         assert!(dist.jitter_range_ms.1 > 0.0);
+    }
+
+    /// End-to-end product-path validation on the design-doc §4 R&D corpus:
+    /// real recorded protocol traffic → `analyze_traffic` → `build_mask_profile`
+    /// → the generated mask emits a GMM and resamples close to the real IAT
+    /// marginal, and the whole MaskProfile survives JSON round-trip (masks are
+    /// distributed as JSON). Sudo-free: no TUN/tunnel needed. SKIPS when the
+    /// git-ignored corpus is absent (CI).
+    #[test]
+    fn end_to_end_generates_and_validates_gmm_mask_from_real_corpus() {
+        use super::{analyze_traffic, build_mask_profile, ks_test};
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../research/mask-generation/phase2b/corpus/features.json");
+        let Ok(bytes) = std::fs::read(&path) else {
+            eprintln!("SKIP end_to_end: corpus absent at {}", path.display());
+            return;
+        };
+        let features: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        // DNS has the most packets and a strongly multimodal IAT marginal.
+        let proto = "dns";
+        let mut pairs: Vec<(f64, f64)> = Vec::new();
+        for key in ["train", "test"] {
+            if let Some(arr) = features[proto][key].as_array() {
+                for p in arr {
+                    if let Some(a) = p.as_array() {
+                        if a.len() >= 2 {
+                            pairs
+                                .push((a[0].as_f64().unwrap_or(0.0), a[1].as_f64().unwrap_or(0.0)));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            pairs.len() >= 100,
+            "need >=100 packets, got {}",
+            pairs.len()
+        );
+
+        // Synthesize an uplink recording from the real (size, iat) pairs.
+        let mut ts: u64 = 0;
+        let packets: Vec<PacketMetadata> = pairs
+            .iter()
+            .map(|&(size, iat)| {
+                ts = ts.saturating_add((iat.max(0.0) * 1_000_000.0) as u64);
+                PacketMetadata {
+                    direction: Direction::Uplink,
+                    size: size.round().clamp(1.0, u16::MAX as f64) as u16,
+                    iat_ms: iat.max(0.0),
+                    entropy: 7.6, // encrypted-looking payload
+                    header_prefix: vec![0u8; 16],
+                    timestamp_ns: ts,
+                }
+            })
+            .collect();
+
+        let analysis = analyze_traffic(proto, &packets).expect("analysis");
+        let profile = build_mask_profile(proto, &analysis).expect("profile");
+
+        // The generated mask must use the GMM IAT distribution (multimodal).
+        assert_eq!(
+            profile.iat_distribution.dist_type,
+            IATDistType::Gmm,
+            "expected GMM IAT distribution from multimodal real corpus"
+        );
+
+        // Resample and confirm the mask reproduces the real IAT marginal well.
+        let mut rng = StdRng::seed_from_u64(7);
+        let real_iats: Vec<f64> = pairs.iter().map(|&(_, i)| i.max(0.0)).collect();
+        let sampled: Vec<f64> = (0..4000)
+            .map(|_| profile.iat_distribution.sample(&mut rng))
+            .collect();
+        let ks = ks_test(&sampled, &real_iats);
+        assert!(
+            ks < 0.2,
+            "generated GMM mask IAT KS vs real = {ks:.3} (too far)"
+        );
+
+        // Full MaskProfile JSON round-trip (masks ship as JSON).
+        let json = serde_json::to_string(&profile).unwrap();
+        let back: aivpn_common::mask::MaskProfile = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.iat_distribution.dist_type, IATDistType::Gmm);
+        assert_eq!(
+            back.iat_distribution.params,
+            profile.iat_distribution.params
+        );
+        eprintln!("end_to_end dns: generated GMM mask, resample KS vs real IAT = {ks:.3}");
+    }
+
+    #[test]
+    fn small_multimodal_sample_keeps_empirical_path() {
+        // Below GMM_MIN_SAMPLES the builder must stay on the faithful empirical
+        // quantile sampler (a GMM fit is untrustworthy at tiny N).
+        let mut raw_iats: Vec<f64> = Vec::new();
+        for i in 0..12 {
+            raw_iats.push(15.0 + (i as f64 % 5.0));
+        }
+        for i in 0..8 {
+            raw_iats.push(90.0 + (i as f64 % 20.0));
+        }
+        raw_iats.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let direction = DirectionalAnalysis {
+            size_modes: vec![],
+            size_mean: 800.0,
+            size_std: 100.0,
+            iat_mean_ms: 45.0,
+            iat_std_ms: 30.0,
+            periods: vec![],
+            packet_count: 20,
+            raw_sizes_sorted: vec![],
+            raw_iats_sorted: raw_iats,
+        };
+        let dist = build_iat_distribution(&direction);
+        assert_eq!(dist.dist_type, IATDistType::Empirical);
     }
 
     #[test]
@@ -1627,5 +2286,409 @@ mod tests {
         assert!(confidence > 0.6);
         assert!(matches!(spec, HeaderSpec::Structured { .. }));
         assert!(header_match_rate(&spec, &headers) > 0.9);
+    }
+
+    #[test]
+    fn service_slug_blocks_path_traversal() {
+        // A malicious/mistyped recording service name must never escape the
+        // mask directory when it is turned into a `<mask_id>.json` filename.
+        for evil in [
+            "../../etc/cron.d/evil",
+            "/etc/passwd",
+            "..\\..\\windows",
+            "a/b/c",
+            "..",
+        ] {
+            let slug = sanitize_service_slug(evil);
+            let mask_id = format!("auto_{}_v1", slug);
+            assert!(
+                mask_id
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_'),
+                "mask_id '{mask_id}' from '{evil}' contains unsafe chars"
+            );
+            assert!(!mask_id.contains(".."));
+            assert!(!mask_id.contains('/'));
+        }
+    }
+
+    #[test]
+    fn service_slug_preserves_normal_names() {
+        assert_eq!(sanitize_service_slug("Zoom"), "zoom");
+        assert_eq!(sanitize_service_slug("youtube 4k"), "youtube_4k");
+    }
+
+    // ─── detect_mimic_protocol / DPI-plausible recorded masks ───────────────
+
+    #[test]
+    fn detect_mimic_protocol_recognizes_stun_cookie() {
+        let mut header = vec![0u8; 16];
+        header[0..2].copy_from_slice(&[0x00, 0x01]);
+        header[4..8].copy_from_slice(&[0x21, 0x12, 0xA4, 0x42]);
+        assert_eq!(
+            detect_mimic_protocol(&header),
+            Some((SpoofProtocol::WebRTC_STUN, 8))
+        );
+    }
+
+    #[test]
+    fn detect_mimic_protocol_recognizes_quic_v1_long_header() {
+        let mut header = vec![0u8; 16];
+        header[0] = 0xC0; // long header form, fixed bit set
+        header[1..5].copy_from_slice(&[0x00, 0x00, 0x00, 0x01]); // QUIC v1
+        assert_eq!(
+            detect_mimic_protocol(&header),
+            Some((SpoofProtocol::QUIC, 6))
+        );
+    }
+
+    #[test]
+    fn detect_mimic_protocol_returns_none_for_random_bytes() {
+        let header = vec![
+            0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66,
+            0x77, 0x88,
+        ];
+        assert_eq!(detect_mimic_protocol(&header), None);
+    }
+
+    #[test]
+    fn detect_mimic_protocol_handles_short_headers_without_panicking() {
+        assert_eq!(detect_mimic_protocol(&[]), None);
+        assert_eq!(detect_mimic_protocol(&[0xC0, 0x00]), None);
+        assert_eq!(detect_mimic_protocol(&[0x00, 0x01, 0x00, 0x00]), None);
+    }
+
+    fn fake_packet(
+        direction: Direction,
+        header_prefix: Vec<u8>,
+        size: u16,
+        iat_ms: f64,
+        timestamp_ns: u64,
+    ) -> PacketMetadata {
+        PacketMetadata {
+            direction,
+            size,
+            iat_ms,
+            entropy: 7.5,
+            header_prefix,
+            timestamp_ns,
+        }
+    }
+
+    /// A synthetic recording (150 uplink + 80 downlink packets, all sharing
+    /// `header_prefix`) large enough for `analyze_traffic` to accept.
+    fn recording_with_header(header_prefix: [u8; 16]) -> Vec<PacketMetadata> {
+        let mut packets = Vec::new();
+        let mut ts = 0u64;
+        for i in 0..150u32 {
+            ts += 5_000_000;
+            let size = 200 + (i % 40) as u16;
+            packets.push(fake_packet(
+                Direction::Uplink,
+                header_prefix.to_vec(),
+                size,
+                5.0,
+                ts,
+            ));
+        }
+        for i in 0..80u32 {
+            ts += 5_000_000;
+            let size = 300 + (i % 40) as u16;
+            packets.push(fake_packet(
+                Direction::Downlink,
+                header_prefix.to_vec(),
+                size,
+                5.0,
+                ts,
+            ));
+        }
+        packets
+    }
+
+    /// A recording that PASSES the generation self-test gate — required by the
+    /// Phase B signing tests, which need `generate_and_store_mask` to succeed.
+    /// Mirrors the proven-passing `recording_tests::generate_video_call_packets`
+    /// shape but deterministically: a QUIC-like header (reproduces faithfully,
+    /// unlike an embedded-tag STUN header whose tag bytes break header_match), a
+    /// bimodal control/media size distribution, and size-correlated varied IAT
+    /// (a constant IAT fits a spread distribution and fails the IAT KS test).
+    fn signable_recording() -> Vec<PacketMetadata> {
+        let mut header = vec![0xC0u8; 16];
+        header[1] = 0x00;
+        header[2] = 0x00;
+        header[3] = 0x01;
+        let mut packets = Vec::with_capacity(300);
+        let mut ts: u64 = 1_000_000_000_000;
+        for i in 0..300u32 {
+            let dir = if i % 3 == 0 {
+                Direction::Uplink
+            } else {
+                Direction::Downlink
+            };
+            // Deterministic ~30% control / ~70% media split.
+            let control = (i.wrapping_mul(2_654_435_761) >> 28) % 10 < 3;
+            let size: u16 = if control {
+                80 + (i % 70) as u16
+            } else {
+                800 + (i % 500) as u16
+            };
+            let iat_ms: f64 = if size > 500 {
+                18.0 + (i % 9) as f64
+            } else {
+                80.0 + (i % 40) as f64
+            };
+            ts += (iat_ms * 1_000_000.0) as u64;
+            let entropy: f32 = 7.1 + (i % 5) as f32 * 0.1;
+            packets.push(PacketMetadata {
+                direction: dir,
+                size,
+                iat_ms,
+                entropy,
+                header_prefix: header.clone(),
+                timestamp_ns: ts,
+            });
+        }
+        packets
+    }
+
+    #[test]
+    fn generated_mask_has_nonzero_neural_signature() {
+        // Regression: auto-masks used to ship signature_vector = [0.0; 64],
+        // which bakes a degenerate all-zero MLP so Neural Resonance is blind to
+        // the mask. The signature must now be the encoded fingerprint of the
+        // recorded traffic — 64 floats, not all zero — for both the mask and
+        // its reverse (downlink) profile.
+        let mut header = [0u8; 16];
+        header[0..2].copy_from_slice(&[0x00, 0x01]);
+        header[4..8].copy_from_slice(&[0x21, 0x12, 0xA4, 0x42]);
+        let packets = recording_with_header(header);
+        let analysis = analyze_traffic("sig_test", &packets).expect("analysis");
+        let mask = build_mask_profile("sig_test", &analysis).expect("mask");
+
+        assert_eq!(mask.signature_vector.len(), 64);
+        assert!(
+            mask.signature_vector.iter().any(|&f| f != 0.0),
+            "signature_vector must not be all-zero"
+        );
+        let reverse = mask.reverse_profile.expect("reverse profile present");
+        assert_eq!(reverse.signature_vector.len(), 64);
+        assert!(
+            reverse.signature_vector.iter().any(|&f| f != 0.0),
+            "reverse signature_vector must not be all-zero"
+        );
+    }
+
+    #[tokio::test]
+    async fn phase_b_generated_mask_is_signed_when_key_configured() {
+        // R2 Phase B: with an operator signing key on the store, the generated
+        // mask (and its reverse profile) must carry a real, verifiable
+        // Ed25519 signature — applied only after the self-test gate passed.
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[11u8; 32]);
+        let pk = sk.verifying_key().to_bytes();
+        let dir = std::env::temp_dir().join(format!(
+            "aivpn-maskgen-signed-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let store = std::sync::Arc::new(crate::mask_store::MaskStore::new(
+            std::sync::Arc::new(crate::gateway::MaskCatalog::new()),
+            dir.clone(),
+            Some(sk),
+            Some(pk),
+            aivpn_common::mask::MaskVerifyMode::Warn,
+        ));
+
+        let packets = signable_recording();
+        let mask_id = super::generate_and_store_mask("phaseb_sig", &packets, &store)
+            .await
+            .expect("generation must succeed");
+
+        let entry = store.get_mask(&mask_id).expect("mask stored");
+        assert!(!entry.profile.is_unsigned(), "mask must be signed");
+        assert!(
+            entry.profile.verify_signature(&pk).unwrap(),
+            "outer signature must verify against the operator pubkey"
+        );
+        let rev = entry.profile.reverse_profile.as_ref().expect("reverse");
+        assert!(
+            rev.verify_signature(&pk).unwrap(),
+            "reverse profile must be independently verifiable"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn phase_b_generated_mask_unsigned_without_key() {
+        // No operator key configured → exactly the legacy behavior: all-zero
+        // signature, generation still succeeds.
+        let dir = std::env::temp_dir().join(format!(
+            "aivpn-maskgen-unsigned-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let store = std::sync::Arc::new(crate::mask_store::MaskStore::new(
+            std::sync::Arc::new(crate::gateway::MaskCatalog::new()),
+            dir.clone(),
+            None,
+            None,
+            aivpn_common::mask::MaskVerifyMode::Warn,
+        ));
+        let packets = signable_recording();
+        let mask_id = super::generate_and_store_mask("phaseb_unsig", &packets, &store)
+            .await
+            .expect("generation must succeed");
+        let entry = store.get_mask(&mask_id).expect("mask stored");
+        assert!(entry.profile.is_unsigned());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn generated_signature_is_deterministic() {
+        // A rebuilt mask from the same recording must bake an identical encoder,
+        // so builds are reproducible (fixed-seed shuffle).
+        let mut header = [0u8; 16];
+        header[0..2].copy_from_slice(&[0x00, 0x01]);
+        header[4..8].copy_from_slice(&[0x21, 0x12, 0xA4, 0x42]);
+        let packets = recording_with_header(header);
+        let a1 = analyze_traffic("det", &packets).expect("analysis");
+        let m1 = build_mask_profile("det", &a1).expect("mask");
+        let a2 = analyze_traffic("det", &packets).expect("analysis");
+        let m2 = build_mask_profile("det", &a2).expect("mask");
+        assert_eq!(m1.signature_vector, m2.signature_vector);
+    }
+
+    #[test]
+    fn baked_signature_discriminates_own_traffic_from_shape_anomaly() {
+        // End-to-end: bake the generated mask's signature into the encoder and
+        // confirm the mask's OWN feature vector reconstructs with lower error
+        // than a shape-anomalous stream (all tiny packets, no jitter — a crude
+        // DPI-visible tunnel signature). This is the property a zero signature
+        // could never provide: with [0.0; 64] every input reconstructs to zero,
+        // so anomalies are invisible.
+        use crate::neural::{encode_features, BakedMaskEncoder, TrafficStats};
+        use std::collections::VecDeque;
+
+        let mut header = [0u8; 16];
+        header[0..2].copy_from_slice(&[0x00, 0x01]);
+        header[4..8].copy_from_slice(&[0x21, 0x12, 0xA4, 0x42]);
+        let packets = recording_with_header(header);
+        let analysis = analyze_traffic("disc", &packets).expect("analysis");
+        let mask = build_mask_profile("disc", &analysis).expect("mask");
+
+        let encoder = BakedMaskEncoder::from_signature(&mask.signature_vector, 128);
+
+        // The mask's own feature vector (its signature) should reconstruct well.
+        let own_sig: [f32; 64] = mask.signature_vector[..64]
+            .try_into()
+            .expect("signature is 64 floats");
+        let own_mse = encoder.reconstruction_error(&own_sig);
+
+        // A shape anomaly: uniform 40-byte packets at a fixed 1 ms cadence.
+        let mut anomaly = TrafficStats {
+            packet_sizes: VecDeque::from(vec![40u16; 200]),
+            inter_arrivals: VecDeque::from(vec![1.0f64; 200]),
+            entropy_samples: VecDeque::from(vec![7.5f64; 200]),
+            ..TrafficStats::new()
+        };
+        anomaly.rx_packets = 200;
+        let anomaly_feats = encode_features(&anomaly);
+        let anomaly_mse = encoder.reconstruction_error(&anomaly_feats);
+
+        assert!(
+            anomaly_mse > own_mse,
+            "shape anomaly MSE ({anomaly_mse}) must exceed own-traffic MSE ({own_mse})"
+        );
+    }
+
+    #[test]
+    fn recorded_stun_traffic_produces_dpi_plausible_mask() {
+        let mut header = [0u8; 16];
+        header[0..2].copy_from_slice(&[0x00, 0x01]);
+        header[4..8].copy_from_slice(&[0x21, 0x12, 0xA4, 0x42]);
+        let packets = recording_with_header(header);
+
+        let analysis = analyze_traffic("zoom_stun", &packets).expect("analysis should succeed");
+        let mask = build_mask_profile("zoom_stun", &analysis).expect("mask should build");
+
+        assert_eq!(mask.spoof_protocol, SpoofProtocol::WebRTC_STUN);
+        assert_eq!(mask.tag_offset, 8);
+        assert_eq!(mask.embedded_tag_offset(), Some(8));
+
+        let spec = mask
+            .header_spec
+            .as_ref()
+            .expect("STUN mask must carry a header_spec");
+        let generated = spec.generate_static();
+        assert_eq!(
+            generated.len(),
+            20,
+            "canonical STUN header must be exactly 20 bytes"
+        );
+        assert_eq!(
+            &generated[4..8],
+            &[0x21, 0x12, 0xA4, 0x42],
+            "magic cookie must sit at offset 4"
+        );
+
+        // Run the real post-assembly STUN fixup (`MimicProtocol::Stun::finalize`)
+        // on a simulated [mdh][ciphertext] packet and verify nDPI's is_stun
+        // invariant (msg_len + 20 == udp_payload_len).
+        let proto = MimicProtocol::for_spoof(mask.spoof_protocol);
+        assert_eq!(proto, MimicProtocol::Stun);
+
+        let mut packet = generated.clone();
+        packet.extend_from_slice(&[0xABu8; 137]); // stand-in ciphertext tail
+        proto.finalize(&mut packet, &mask);
+
+        let msg_len = u16::from_be_bytes([packet[2], packet[3]]) as usize;
+        assert_eq!(
+            msg_len + 20,
+            packet.len(),
+            "nDPI is_stun invariant must hold after finalize"
+        );
+    }
+
+    #[test]
+    fn recorded_quic_traffic_gets_embedded_tag_layout() {
+        let mut header = [0u8; 16];
+        header[0] = 0xC0;
+        header[1..5].copy_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+        let packets = recording_with_header(header);
+
+        let analysis = analyze_traffic("game_quic", &packets).expect("analysis should succeed");
+        let mask = build_mask_profile("game_quic", &analysis).expect("mask should build");
+
+        assert_eq!(mask.spoof_protocol, SpoofProtocol::QUIC);
+        assert_eq!(mask.tag_offset, 6);
+        assert_eq!(mask.embedded_tag_offset(), Some(6));
+
+        let proto = MimicProtocol::for_spoof(mask.spoof_protocol);
+        assert_eq!(proto, MimicProtocol::Quic);
+        // QUIC is fully constructed at build time (RFC 9001 Initial); the
+        // detector only needs to route the mask to that path.
+        assert!(proto.is_constructed());
+    }
+
+    #[test]
+    fn recorded_unrecognized_traffic_stays_legacy_layout() {
+        let header = [
+            0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66,
+            0x77, 0x88,
+        ];
+        let packets = recording_with_header(header);
+
+        let analysis = analyze_traffic("mystery_udp", &packets).expect("analysis should succeed");
+        let mask = build_mask_profile("mystery_udp", &analysis).expect("mask should build");
+
+        assert_eq!(mask.tag_offset, u16::MAX);
+        assert_eq!(mask.embedded_tag_offset(), None);
     }
 }
