@@ -88,6 +88,17 @@ Section "Uninstall"
   SetShellVarContext all
   SetRegView 64
 
+  ; Clean up kill-switch firewall rules BEFORE deleting the client binary.
+  ; If the user uninstalls while kill-switch is active the netsh blockoutbound
+  ; policy and allow rules would otherwise survive reboot with no way to remove them.
+  ExecWait '"$INSTDIR\aivpn-client.exe" kill-switch clear'
+  ; Belt-and-suspenders: remove rules and restore policy directly via netsh
+  ; in case the binary above already failed or was deleted manually.
+  nsExec::ExecToLog 'netsh advfirewall firewall delete rule name="AIVPN_KS_ALLOW_VPN"'
+  nsExec::ExecToLog 'netsh advfirewall firewall delete rule name="AIVPN_KS_ALLOW_SERVER"'
+  nsExec::ExecToLog 'netsh advfirewall firewall delete rule name="AIVPN_KS_ALLOW_LOCAL"'
+  nsExec::ExecToLog 'netsh advfirewall set currentprofile firewallpolicy allowinbound,allowoutbound'
+
   Delete "$DESKTOP\AIVPN.lnk"
   Delete "${START_MENU_DIR}\AIVPN.lnk"
   Delete "${START_MENU_DIR}\Uninstall AIVPN.lnk"

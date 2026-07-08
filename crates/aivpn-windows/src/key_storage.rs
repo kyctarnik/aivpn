@@ -79,34 +79,36 @@ mod dpapi {
 }
 
 /// Encrypt a connection-key string for storage.
-/// On Windows uses DPAPI; on other platforms returns the plaintext unchanged
-/// (compilation for non-Windows targets is only for `cargo check` purposes).
-fn protect_key(key: &str) -> String {
+/// On Windows uses DPAPI; returns Err if DPAPI is unavailable so callers never
+/// silently write a plaintext PSK to disk. Non-Windows builds (cargo check only)
+/// return the value unchanged.
+fn protect_key(key: &str) -> Result<String, String> {
     #[cfg(windows)]
     {
-        if let Some(encrypted) = dpapi::encrypt(key.as_bytes()) {
-            return base64::engine::general_purpose::STANDARD.encode(&encrypted);
-        }
+        return dpapi::encrypt(key.as_bytes())
+            .map(|blob| base64::engine::general_purpose::STANDARD.encode(&blob))
+            .ok_or_else(|| "DPAPI encryption failed — key not saved".to_string());
     }
-    key.to_string()
+    #[cfg(not(windows))]
+    Ok(key.to_string())
 }
 
 /// Decrypt a stored connection-key string.
-/// Handles both encrypted (base64 DPAPI blob) and legacy plaintext values so
-/// existing key files are migrated transparently on first load.
-fn unprotect_key(stored: &str) -> String {
+/// Returns Ok(plaintext) on success, Ok(stored) for legacy plaintext (base64 decode fails,
+/// meaning it was never encrypted), or Err if DPAPI decryption fails (encrypted blob that
+/// could not be decrypted — corrupted or from a different user/machine).
+fn unprotect_key(stored: &str) -> Result<String, String> {
     #[cfg(windows)]
     {
         if let Ok(blob) = base64::engine::general_purpose::STANDARD.decode(stored) {
-            if let Some(plaintext) = dpapi::decrypt(&blob) {
-                if let Ok(s) = String::from_utf8(plaintext) {
-                    return s;
-                }
-            }
+            // It decoded as base64 → it was encrypted; DPAPI must succeed.
+            return dpapi::decrypt(&blob)
+                .and_then(|pt| String::from_utf8(pt).ok())
+                .ok_or_else(|| "DPAPI decryption failed".to_string());
         }
     }
-    // Not an encrypted blob (legacy plaintext) — return as-is.
-    stored.to_string()
+    // Base64 decode failed → legacy plaintext key; return as-is.
+    Ok(stored.to_string())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -127,6 +129,9 @@ pub struct ConnectionKey {
     /// CIDRs to exclude from the VPN tunnel (split-tunnel bypass list).
     #[serde(default)]
     pub exclude_routes: Vec<String>,
+    /// CIDRs to route exclusively through the VPN tunnel (split-tunnel allowlist).
+    #[serde(default)]
+    pub include_routes: Vec<String>,
 }
 
 impl ConnectionKey {
@@ -134,6 +139,9 @@ impl ConnectionKey {
         let payload = key.trim().strip_prefix("aivpn://").unwrap_or(key.trim());
         let json_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(payload)
+            .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(payload))
+            .or_else(|_| base64::engine::general_purpose::STANDARD.decode(payload))
+            .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(payload))
             .ok()?;
         let json: serde_json::Value = serde_json::from_slice(&json_bytes).ok()?;
         let server_addr = json["s"].as_str().unwrap_or("").to_string();
@@ -148,6 +156,7 @@ impl ConnectionKey {
             proxy_listen: None,
             mtls_cert_path: None,
             exclude_routes: Vec::new(),
+            include_routes: Vec::new(),
         })
     }
 }
@@ -165,15 +174,41 @@ impl KeyStorage {
         if path.exists() {
             if let Ok(data) = std::fs::read_to_string(&path) {
                 if let Ok(mut storage) = serde_json::from_str::<KeyStorage>(&data) {
-                    // Decrypt keys from disk (transparent migration of legacy plaintext)
-                    for k in &mut storage.keys {
-                        k.key = unprotect_key(&k.key);
+                    // Decrypt keys from disk (transparent migration of legacy plaintext).
+                    // Track whether any key was stored in plaintext so we can re-encrypt now.
+                    let mut needs_save = false;
+                    let mut bad_keys: Vec<usize> = Vec::new();
+                    for (i, k) in storage.keys.iter_mut().enumerate() {
+                        match unprotect_key(&k.key) {
+                            Ok(decrypted) => {
+                                if decrypted == k.key {
+                                    // Legacy plaintext — mark for immediate re-encryption.
+                                    needs_save = true;
+                                }
+                                k.key = decrypted;
+                            }
+                            Err(e) => {
+                                // DPAPI decryption failed — key is corrupted or from a
+                                // different user/machine. Skip it to avoid treating the
+                                // ciphertext blob as a plaintext connection key.
+                                eprintln!("aivpn: skipping corrupt key {:?}: {}", k.name, e);
+                                bad_keys.push(i);
+                            }
+                        }
+                    }
+                    // Remove corrupt keys in reverse order to preserve indices.
+                    for i in bad_keys.into_iter().rev() {
+                        storage.keys.remove(i);
+                        needs_save = true;
                     }
                     // Validate selected index
                     if let Some(idx) = storage.selected {
                         if idx >= storage.keys.len() {
                             storage.selected = None;
                         }
+                    }
+                    if needs_save {
+                        let _ = storage.save();
                     }
                     return storage;
                 }
@@ -185,27 +220,31 @@ impl KeyStorage {
         }
     }
 
-    pub fn save(&self) {
+    pub fn save(&self) -> Result<(), String> {
         let path = Self::storage_path();
         if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("Cannot create directory {:?}: {}", parent, e))?;
         }
-        // Encrypt keys before writing to disk
+        let mut encrypted_keys = Vec::with_capacity(self.keys.len());
+        for k in &self.keys {
+            let mut k2 = k.clone();
+            k2.key = protect_key(&k.key)?;
+            encrypted_keys.push(k2);
+        }
         let on_disk = KeyStorage {
-            keys: self
-                .keys
-                .iter()
-                .map(|k| {
-                    let mut k2 = k.clone();
-                    k2.key = protect_key(&k.key);
-                    k2
-                })
-                .collect(),
+            keys: encrypted_keys,
             selected: self.selected,
         };
-        if let Ok(json) = serde_json::to_string_pretty(&on_disk) {
-            let _ = std::fs::write(&path, json);
-        }
+        let json = serde_json::to_string_pretty(&on_disk)
+            .map_err(|e| format!("Serialization error: {}", e))?;
+        // Atomic write: tmp file + rename to avoid corrupt keys.json on crash
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, &json).map_err(|e| format!("Cannot write {:?}: {}", tmp, e))?;
+        std::fs::rename(&tmp, &path).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            format!("Cannot rename {:?} → {:?}: {}", tmp, path, e)
+        })
     }
 
     pub fn add_key(
@@ -216,6 +255,7 @@ impl KeyStorage {
         proxy_listen: Option<String>,
         mtls_cert_path: Option<String>,
         exclude_routes: Vec<String>,
+        include_routes: Vec<String>,
     ) -> Result<(), String> {
         // Validate key format
         let mut ck = ConnectionKey::from_key_string(name, key)
@@ -224,17 +264,24 @@ impl KeyStorage {
         ck.proxy_listen = proxy_listen;
         ck.mtls_cert_path = mtls_cert_path;
         ck.exclude_routes = exclude_routes;
+        ck.include_routes = include_routes;
 
         // Check for duplicates
         if self.keys.iter().any(|k| k.key == ck.key) {
             return Err("This key already exists".to_string());
         }
 
+        let prev_selected = self.selected;
         self.keys.push(ck);
         if self.selected.is_none() {
             self.selected = Some(self.keys.len() - 1);
         }
-        self.save();
+        if let Err(e) = self.save() {
+            // Rollback: disk write failed, undo the in-memory mutation
+            self.keys.pop();
+            self.selected = prev_selected;
+            return Err(e);
+        }
         Ok(())
     }
 
@@ -247,6 +294,7 @@ impl KeyStorage {
         proxy_listen: Option<String>,
         mtls_cert_path: Option<String>,
         exclude_routes: Vec<String>,
+        include_routes: Vec<String>,
     ) -> Result<(), String> {
         if idx >= self.keys.len() {
             return Err("Invalid key index".to_string());
@@ -257,14 +305,31 @@ impl KeyStorage {
         ck.proxy_listen = proxy_listen;
         ck.mtls_cert_path = mtls_cert_path;
         ck.exclude_routes = exclude_routes;
-        self.keys[idx] = ck;
-        self.save();
+        ck.include_routes = include_routes;
+
+        // Reject if the new key string duplicates a different existing profile.
+        if self
+            .keys
+            .iter()
+            .enumerate()
+            .any(|(i, k)| i != idx && k.key == ck.key)
+        {
+            return Err("This key already exists".to_string());
+        }
+
+        let old = std::mem::replace(&mut self.keys[idx], ck);
+        if let Err(e) = self.save() {
+            // Rollback: restore old key on disk write failure
+            self.keys[idx] = old;
+            return Err(e);
+        }
         Ok(())
     }
 
     pub fn remove_key(&mut self, idx: usize) {
         if idx < self.keys.len() {
-            self.keys.remove(idx);
+            let removed = self.keys.remove(idx);
+            let old_selected = self.selected;
             match self.selected {
                 Some(sel) if sel == idx => {
                     self.selected = if self.keys.is_empty() {
@@ -278,7 +343,11 @@ impl KeyStorage {
                 }
                 _ => {}
             }
-            self.save();
+            if self.save().is_err() {
+                // Rollback: restore the key so it doesn't silently reappear on next load
+                self.keys.insert(idx, removed);
+                self.selected = old_selected;
+            }
         }
     }
 
