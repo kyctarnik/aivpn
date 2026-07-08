@@ -23,8 +23,11 @@ COPY crates/aivpn-ios-core crates/aivpn-ios-core/
 COPY crates/aivpn-linux crates/aivpn-linux/
 COPY assets/masks assets/masks/
 
-# Build in release mode (Cargo.lock is auto-generated if missing)
-RUN cargo build --release --bin aivpn-server
+# Build in release mode (Cargo.lock is auto-generated if missing).
+# Full feature set so the image works with the web panel (management-api →
+# /run/aivpn/api.sock), the metrics dashboard, and neural mask rotation —
+# matching `make server`. Use a custom build for a minimal gateway.
+RUN cargo build --release --bin aivpn-server --features "management-api,metrics,neural"
 
 # Stage 2: Runtime
 FROM debian:bookworm-slim
