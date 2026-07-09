@@ -149,8 +149,14 @@ impl ClientDatabase {
         let mut data: ClientDbFile = if file_path.exists() {
             let content = std::fs::read_to_string(file_path)
                 .map_err(|e| Error::Session(format!("Failed to read client DB: {}", e)))?;
-            serde_json::from_str(&content)
-                .map_err(|e| Error::Session(format!("Failed to parse client DB: {}", e)))?
+            if content.trim().is_empty() {
+                // A zero-byte DB (e.g. pre-created by a package post-install)
+                // is an empty database, not corruption.
+                ClientDbFile::default()
+            } else {
+                serde_json::from_str(&content)
+                    .map_err(|e| Error::Session(format!("Failed to parse client DB: {}", e)))?
+            }
         } else {
             ClientDbFile::default()
         };
@@ -872,6 +878,27 @@ mod tests {
             keepalive_secs: None,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn load_treats_empty_file_as_empty_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("clients.json");
+        // Package post-installs pre-create the DB as a zero-byte file.
+        std::fs::write(&db_path, "").unwrap();
+
+        let db = ClientDatabase::load(&db_path, test_network_config()).unwrap();
+        assert!(db.list_clients().is_empty());
+
+        // Whitespace-only must behave the same way.
+        std::fs::write(&db_path, "  \n\t\n").unwrap();
+        let db = ClientDatabase::load(&db_path, test_network_config()).unwrap();
+        assert!(db.list_clients().is_empty());
+
+        // A fresh DB must still be usable: adding a client persists it.
+        db.add_client("alice").unwrap();
+        let reloaded = ClientDatabase::load(&db_path, test_network_config()).unwrap();
+        assert_eq!(reloaded.list_clients().len(), 1);
     }
 
     #[test]
