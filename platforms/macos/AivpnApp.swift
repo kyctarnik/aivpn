@@ -73,6 +73,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         if popover.isShown {
             popover.performClose(nil)
         } else {
+            // Re-check on every open: a single failed launch-time ping (helper
+            // restarting, install in progress) must not freeze the UI on
+            // "Service unavailable" until the app itself is relaunched —
+            // the Connect button is disabled in that state, so no user action
+            // can trigger a retry.
+            if !VPNManager.shared.helperAvailable {
+                VPNManager.shared.checkHelperAvailable()
+            }
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
             NSApp.activate(ignoringOtherApps: true)
         }

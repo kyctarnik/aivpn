@@ -969,9 +969,14 @@ func handleConnection(_ clientFD: Int32) {
     // any request bytes. The caller closes clientFD after we return.
     guard peerIsAuthorized(clientFD) else { return }
 
-    // 5-second read timeout
+    // 5-second read AND write timeouts. Connections are handled on a serial
+    // queue: a single write() blocked forever on a stalled peer would wedge
+    // the queue and make the helper unreachable while launchd still reports
+    // it running.
     var timeout = timeval(tv_sec: 5, tv_usec: 0)
     setsockopt(clientFD, SOL_SOCKET, SO_RCVTIMEO,
+               &timeout, socklen_t(MemoryLayout<timeval>.size))
+    setsockopt(clientFD, SOL_SOCKET, SO_SNDTIMEO,
                &timeout, socklen_t(MemoryLayout<timeval>.size))
 
     // Read 4-byte big-endian length prefix
@@ -1095,6 +1100,9 @@ var signalSources: [DispatchSourceSignal] = []
 
 func setupSignals() {
     signal(SIGHUP, SIG_IGN)
+    // A peer that closes mid-response must produce EPIPE from write(), not
+    // kill the whole daemon with the default SIGPIPE action.
+    signal(SIGPIPE, SIG_IGN)
     for sig in [SIGTERM, SIGINT] {
         signal(sig, SIG_IGN) // required so default termination doesn't preempt the source
         let source = DispatchSource.makeSignalSource(signal: sig, queue: connectionQueue)
@@ -1154,6 +1162,47 @@ func recoverExistingClient() {
     }
 }
 
+// MARK: - Console-user tracking
+
+// The chown in createSocket() runs once, at daemon start. The LaunchDaemon
+// starts at boot (RunAtLoad) BEFORE anyone is logged in, so that chown finds
+// no console user and the socket stays root-only 0600 — the GUI then gets
+// EACCES on connect() forever ("Service unavailable") even though the daemon
+// is healthy. Track console-user changes and re-chown on every login/switch.
+
+// Must be retained globally: a released store stops delivering notifications.
+var consoleUserStore: SCDynamicStore?
+
+func chownSocketToConsoleUser() {
+    var uid: uid_t = 0
+    var gid: gid_t = 0
+    guard SCDynamicStoreCopyConsoleUser(nil, &uid, &gid) != nil, uid != 0 else {
+        return // logged out / loginwindow — keep root-only
+    }
+    if chown(SOCKET_PATH, uid, gid) == 0 {
+        log("Socket ownership updated for console user (uid \(uid))")
+    } else {
+        log("WARNING: chown(\(SOCKET_PATH)) to uid \(uid) failed: \(String(cString: strerror(errno)))")
+    }
+}
+
+func setupConsoleUserWatcher() {
+    // Non-capturing closure — bridges to the C callback pointer.
+    guard let store = SCDynamicStoreCreate(nil, "aivpn-helper" as CFString,
+                                           { _, _, _ in chownSocketToConsoleUser() },
+                                           nil) else {
+        log("WARNING: SCDynamicStoreCreate failed — socket ownership will not track console-user changes")
+        return
+    }
+    let key = SCDynamicStoreKeyCreateConsoleUser(nil)
+    guard SCDynamicStoreSetNotificationKeys(store, [key] as CFArray, nil),
+          SCDynamicStoreSetDispatchQueue(store, connectionQueue) else {
+        log("WARNING: SCDynamicStore notification setup failed — socket ownership will not track console-user changes")
+        return
+    }
+    consoleUserStore = store
+}
+
 // MARK: - Main
 
 func main() {
@@ -1165,6 +1214,9 @@ func main() {
         log("FATAL: Could not create helper socket")
         exit(1)
     }
+    // Fix ownership for the already-logged-in case and track future logins.
+    chownSocketToConsoleUser()
+    setupConsoleUserWatcher()
     defer {
         close(sockFD)
         try? FileManager.default.removeItem(atPath: SOCKET_PATH)

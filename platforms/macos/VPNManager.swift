@@ -404,6 +404,7 @@ class VPNManager: ObservableObject {
         DispatchQueue.global(qos: .userInitiated).async {
             let fd = socket(AF_UNIX, SOCK_STREAM, 0)
             guard fd >= 0 else {
+                NSLog("AIVPN IPC[%@]: socket() failed: %s", request.action, strerror(errno))
                 DispatchQueue.main.async {
                     completion(nil)
                 }
@@ -433,6 +434,7 @@ class VPNManager: ObservableObject {
             }
 
             guard connectResult == 0 else {
+                NSLog("AIVPN IPC[%@]: connect() failed: %s", request.action, strerror(errno))
                 close(fd)
                 DispatchQueue.main.async {
                     completion(nil)
@@ -445,6 +447,7 @@ class VPNManager: ObservableObject {
             do {
                 requestData = try JSONEncoder().encode(request)
             } catch {
+                NSLog("AIVPN IPC[%@]: encode failed: %@", request.action, "\(error)")
                 close(fd)
                 DispatchQueue.main.async { completion(nil) }
                 return
@@ -459,8 +462,12 @@ class VPNManager: ObservableObject {
             ]
             var lenSent = 0
             while lenSent < 4 {
-                let n = write(fd, &lenBuf[lenSent], 4 - lenSent)
+                let n = lenBuf.withUnsafeBytes { raw in
+                    write(fd, raw.baseAddress!.advanced(by: lenSent), 4 - lenSent)
+                }
                 if n <= 0 {
+                    NSLog("AIVPN IPC[%@]: prefix write failed at %d: %s",
+                          request.action, lenSent, strerror(errno))
                     close(fd)
                     DispatchQueue.main.async { completion(nil) }
                     return
@@ -478,6 +485,7 @@ class VPNManager: ObservableObject {
                 return true
             }
             if !sendResult {
+                NSLog("AIVPN IPC[%@]: payload write failed: %s", request.action, strerror(errno))
                 close(fd)
                 DispatchQueue.main.async { completion(nil) }
                 return
@@ -499,13 +507,22 @@ class VPNManager: ObservableObject {
             close(fd)
 
             guard !accum.isEmpty else {
+                NSLog("AIVPN IPC[%@]: empty response (read timeout/EOF): %s",
+                      request.action, strerror(errno))
                 DispatchQueue.main.async { completion(nil) }
                 return
             }
 
             if let response = try? JSONDecoder().decode(HelperResponse.self, from: accum) {
+                if response.status != "ok" {
+                    NSLog("AIVPN IPC[%@]: helper replied status=%@ message=%@",
+                          request.action, response.status, response.message)
+                }
                 DispatchQueue.main.async { completion(response) }
             } else {
+                NSLog("AIVPN IPC[%@]: undecodable response (%d bytes): %@",
+                      request.action, accum.count,
+                      String(data: accum.prefix(200), encoding: .utf8) ?? "<binary>")
                 DispatchQueue.main.async { completion(nil) }
             }
         }
