@@ -17,6 +17,10 @@ import SystemConfiguration
 let SOCKET_PATH = "/var/run/aivpn/helper.sock"
 let DEFAULT_CLIENT_PATH = "/Library/Application Support/AIVPN/aivpn-client"
 let ALLOWED_CLIENT_PATHS = [
+    // build.sh produces "Aivpn.app"; the filesystem is case-insensitive but
+    // this string comparison is not — keep both historical capitalizations.
+    "/Applications/Aivpn.app/Contents/MacOS/aivpn-client",
+    "/Applications/Aivpn.app/Contents/Resources/aivpn-client",
     "/Applications/AIVPN.app/Contents/MacOS/aivpn-client",
     "/Applications/AIVPN.app/Contents/Resources/aivpn-client",
     DEFAULT_CLIENT_PATH,
