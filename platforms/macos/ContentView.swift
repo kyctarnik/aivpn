@@ -1,5 +1,32 @@
 import SwiftUI
 
+/// One entry of the server-pushed mask catalog (mirrors the JSON aivpn-client
+/// writes to the temp file: `[{"mask_id","label","generated"},...]`).
+struct MaskCatalogItem: Identifiable, Decodable {
+    let mask_id: String
+    let label: String
+    let generated: Bool
+    var id: String { mask_id }
+}
+
+/// Read the catalog aivpn-client persisted, trying the same paths it writes to.
+/// Returns [] when no catalog has been received yet (caller keeps presets).
+func loadMaskCatalogFile() -> [MaskCatalogItem] {
+    var paths: [String] = []
+    if let xdg = ProcessInfo.processInfo.environment["XDG_RUNTIME_DIR"] {
+        paths.append(xdg + "/aivpn/mask_catalog.json")
+    }
+    paths.append("/var/run/aivpn/mask_catalog.json")
+    paths.append("/tmp/aivpn-mask-catalog.json")
+    for path in paths {
+        guard let data = FileManager.default.contents(atPath: path) else { continue }
+        if let items = try? JSONDecoder().decode([MaskCatalogItem].self, from: data) {
+            return items
+        }
+    }
+    return []
+}
+
 struct ContentView: View {
     @EnvironmentObject var vpn: VPNManager
     @EnvironmentObject var loc: LocalizationManager
@@ -15,6 +42,12 @@ struct ContentView: View {
     @AppStorage("adaptiveLevel") private var adaptiveLevel: Int = 0
     @AppStorage("dnsProxyAddr") private var dnsProxyAddr: String = ""
     @AppStorage("killSwitch") private var killSwitch: Bool = false
+    @AppStorage("preferred_mask") private var preferredMask: String = "auto"
+    @AppStorage("polymorphicMask") private var polymorphicMask: Bool = false
+    @AppStorage("shareMaskFeedback") private var shareMaskFeedback: Bool = false
+    @AppStorage("receiveMaskHints") private var receiveMaskHints: Bool = false
+    @AppStorage("maskCountryCode") private var maskCountryCode: String = ""
+    @AppStorage("themePreference") private var themePreference: String = "system"
     @State private var showDiagnostics: Bool = false
     @State private var benchRunning: Bool = false
     @State private var benchResult: BenchDisplayResult? = nil
@@ -24,9 +57,29 @@ struct ContentView: View {
     @State private var keyToDelete: ConnectionKey?
     @State private var mtlsCertPath: String = ""
     @State private var recordingServiceName: String = ""
+    // Server-pushed mask catalog (written by aivpn-client to a temp file). Drives
+    // the dynamic mask Picker + its "(авто)" marker for auto-generated masks.
+    @State private var maskCatalog: [MaskCatalogItem] = []
+    @AppStorage("connectOnLaunch") private var connectOnLaunch: Bool = false
+    // Advanced/operator bootstrap discovery (per-key, collapsed by default —
+    // only needed when there's no working aivpn:// key yet).
+    @State private var showBootstrapAdvanced: Bool = false
+    @State private var bootstrapCdnUrl: String = ""
+    @State private var bootstrapTelegramToken: String = ""
+    @State private var bootstrapTelegramChat: String = ""
+    @State private var bootstrapGithub: String = ""
+    @State private var serverSigningKey: String = ""
     private let recordingDarkGreen = Color(red: 0.0, green: 0.35, blue: 0.16)
 
     var body: some View {
+        // The NSPopover hosting this view has a fixed contentSize (see AivpnApp.swift).
+        // Conditional sections below (Add Key form, recording panel, diagnostics, etc.)
+        // can push the VStack's ideal height well past that fixed window size. Without
+        // a ScrollView, anything past the fixed height renders outside the popover's
+        // window bounds — invisible and un-clickable, even though the state that reveals
+        // it (e.g. showKeyInput) toggled correctly. This was the actual reason "Add First
+        // Key" appeared to do nothing: the form did open, just entirely below the fold.
+        ScrollView {
         VStack(spacing: 0) {
             // Header
             HStack {
@@ -95,10 +148,21 @@ struct ContentView: View {
                             Spacer()
                         }
                         if vpn.serverAdaptiveLevel > 0 {
-                            let label = ["Off", "Light", "Aggressive", "Satellite"][max(0, min(vpn.serverAdaptiveLevel, 3))]
+                            let adaptiveLabels = ["Off", "Light", "Aggressive", "Satellite"]
+                            let label = adaptiveLabels.indices.contains(vpn.serverAdaptiveLevel) ? adaptiveLabels[vpn.serverAdaptiveLevel] : "Level \(vpn.serverAdaptiveLevel)"
                             Text("A: \(label)")
                                 .font(.caption)
                                 .foregroundColor(.cyan)
+                            Spacer()
+                        }
+                        if vpn.serverAdaptiveLevel >= 2 {
+                            Text(loc.t("fec_badge"))
+                                .font(.system(size: 9, weight: .semibold))
+                                .foregroundColor(.white)
+                                .padding(.horizontal, 5)
+                                .padding(.vertical, 2)
+                                .background(Color.orange)
+                                .cornerRadius(4)
                             Spacer()
                         }
                         Text("↑ \(formatBytes(vpn.bytesSent))")
@@ -132,6 +196,14 @@ struct ContentView: View {
                             showKeyInput = true
                             keyName = ""
                             connectionKey = ""
+                            editingKeyId = nil
+                            mtlsCertPath = ""
+                            bootstrapCdnUrl = ""
+                            bootstrapTelegramToken = ""
+                            bootstrapTelegramChat = ""
+                            bootstrapGithub = ""
+                            serverSigningKey = ""
+                            showBootstrapAdvanced = false
                         }
                     }) {
                         Image(systemName: "plus.circle.fill")
@@ -140,9 +212,10 @@ struct ContentView: View {
                     .buttonStyle(.plain)
                     .help(loc.t("add_key"))
                 }
-                
-                if vpn.keys.isEmpty {
-                    // Empty state
+
+                if vpn.keys.isEmpty && !showKeyInput {
+                    // Empty state — hidden while the add-key form is open, so the
+                    // "Add First Key" button can't be clicked again instead of Save.
                     VStack(spacing: 8) {
                         Image(systemName: "key")
                             .font(.system(size: 32))
@@ -155,6 +228,14 @@ struct ContentView: View {
                                 showKeyInput = true
                                 keyName = ""
                                 connectionKey = ""
+                                editingKeyId = nil
+                                mtlsCertPath = ""
+                                bootstrapCdnUrl = ""
+                                bootstrapTelegramToken = ""
+                                bootstrapTelegramChat = ""
+                                bootstrapGithub = ""
+                                serverSigningKey = ""
+                                showBootstrapAdvanced = false
                             }
                         }
                         .buttonStyle(.bordered)
@@ -179,6 +260,15 @@ struct ContentView: View {
                                         keyName = key.name
                                         connectionKey = key.keyValue
                                         mtlsCertPath = key.mtlsCertPath ?? ""
+                                        bootstrapCdnUrl = key.bootstrapCdnUrl ?? ""
+                                        bootstrapTelegramToken = key.bootstrapTelegramToken ?? ""
+                                        bootstrapTelegramChat = key.bootstrapTelegramChat ?? ""
+                                        bootstrapGithub = key.bootstrapGithub ?? ""
+                                        serverSigningKey = key.serverSigningKey ?? ""
+                                        showBootstrapAdvanced = [key.bootstrapCdnUrl, key.bootstrapTelegramToken,
+                                                                  key.bootstrapTelegramChat, key.bootstrapGithub,
+                                                                  key.serverSigningKey]
+                                            .contains { !($0 ?? "").isEmpty }
                                         withAnimation {
                                             showKeyInput = true
                                         }
@@ -301,6 +391,74 @@ struct ContentView: View {
                         .font(.caption)
                     }
 
+                    HStack {
+                        Text(loc.t("mask_profile"))
+                            .font(.caption)
+                            .help(loc.t("mask_profile_help"))
+                        Spacer()
+                        Picker("", selection: $preferredMask) {
+                            Text(loc.t("mask_auto")).tag("auto")
+                            if maskCatalog.isEmpty {
+                                // Fallback until the server catalog has been received.
+                                Text("WebRTC / Zoom").tag("webrtc_zoom_v3")
+                                Text("QUIC / HTTPS").tag("quic_https_v2")
+                                Text("Yandex Telemost").tag("webrtc_yandex_telemost_v1")
+                                Text("VK Teams").tag("webrtc_vk_teams_v1")
+                                Text("SberJazz").tag("webrtc_sberjazz_v1")
+                            } else {
+                                ForEach(maskCatalog.filter { $0.mask_id != "auto" }) { item in
+                                    Text(item.label + (item.generated ? loc.t("mask_auto_marker") : ""))
+                                        .tag(item.mask_id)
+                                }
+                            }
+                        }
+                        .pickerStyle(.menu)
+                        .frame(maxWidth: 160)
+                        .font(.caption)
+                        .onAppear { maskCatalog = loadMaskCatalogFile() }
+                        .onChange(of: preferredMask) { newValue in
+                            // "Auto" has no fixed base mask to polymorph from —
+                            // leaving the toggle checked would be inert (disabled
+                            // but still true), silently no-op'ing on connect.
+                            if newValue == "auto" { polymorphicMask = false }
+                        }
+                    }
+
+                    HStack {
+                        Toggle(loc.t("polymorphic_mask"), isOn: $polymorphicMask)
+                            .toggleStyle(.checkbox)
+                            .font(.caption)
+                            .help(loc.t("polymorphic_mask_help"))
+                            .disabled(preferredMask == "auto")
+                        Spacer()
+                    }
+
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(loc.t("mask_feedback_section"))
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+
+                        Toggle(loc.t("share_mask_feedback"), isOn: $shareMaskFeedback)
+                            .toggleStyle(.checkbox)
+                            .font(.caption)
+                            .help(loc.t("share_mask_feedback_help"))
+
+                        Toggle(loc.t("receive_mask_hints"), isOn: $receiveMaskHints)
+                            .toggleStyle(.checkbox)
+                            .font(.caption)
+                            .help(loc.t("receive_mask_hints_help"))
+
+                        TextField(loc.t("country_code_placeholder"), text: $maskCountryCode)
+                            .textFieldStyle(.roundedBorder)
+                            .font(.system(size: 11))
+                            .help(loc.t("country_code_help"))
+                            .frame(width: 120)
+                            .onChange(of: maskCountryCode) { newValue in
+                                let filtered = String(newValue.uppercased().filter { $0.isASCII && $0.isLetter }.prefix(2))
+                                if filtered != newValue { maskCountryCode = filtered }
+                            }
+                    }
+
                     TextField(loc.t("mtls_cert_path"), text: $mtlsCertPath)
                         .textFieldStyle(.roundedBorder)
                         .font(.system(size: 11))
@@ -320,6 +478,48 @@ struct ContentView: View {
                         Spacer()
                     }
 
+                    // Advanced/operator bootstrap discovery — collapsed by default.
+                    // Lets a client with no working aivpn:// key yet discover a
+                    // usable server/mask via signed multi-channel fallback.
+                    DisclosureGroup(isExpanded: $showBootstrapAdvanced) {
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text(loc.t("bootstrap_advanced_hint"))
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+
+                            TextField(loc.t("bootstrap_cdn_url"), text: $bootstrapCdnUrl)
+                                .textFieldStyle(.roundedBorder)
+                                .font(.system(size: 11))
+                                .help(loc.t("bootstrap_cdn_url_help"))
+
+                            TextField(loc.t("bootstrap_telegram_token"), text: $bootstrapTelegramToken)
+                                .textFieldStyle(.roundedBorder)
+                                .font(.system(size: 11))
+                                .help(loc.t("bootstrap_telegram_token_help"))
+
+                            TextField(loc.t("bootstrap_telegram_chat"), text: $bootstrapTelegramChat)
+                                .textFieldStyle(.roundedBorder)
+                                .font(.system(size: 11))
+                                .help(loc.t("bootstrap_telegram_chat_help"))
+
+                            TextField(loc.t("bootstrap_github"), text: $bootstrapGithub)
+                                .textFieldStyle(.roundedBorder)
+                                .font(.system(size: 11))
+                                .help(loc.t("bootstrap_github_help"))
+
+                            TextField(loc.t("server_signing_key"), text: $serverSigningKey)
+                                .textFieldStyle(.roundedBorder)
+                                .font(.system(size: 11))
+                                .help(loc.t("server_signing_key_help"))
+                        }
+                        .padding(.top, 4)
+                    } label: {
+                        Text(loc.t("bootstrap_advanced_label"))
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+
                     HStack(spacing: 8) {
                         Button(loc.t("cancel")) {
                             withAnimation {
@@ -328,35 +528,78 @@ struct ContentView: View {
                                 connectionKey = ""
                                 mtlsCertPath = ""
                                 editingKeyId = nil
+                                bootstrapCdnUrl = ""
+                                bootstrapTelegramToken = ""
+                                bootstrapTelegramChat = ""
+                                bootstrapGithub = ""
+                                serverSigningKey = ""
+                                showBootstrapAdvanced = false
                             }
                         }
                         .buttonStyle(.bordered)
-                        
+
                         Button(loc.t("save_key")) {
                             let name = keyName.isEmpty ? "Key \(vpn.keys.count + 1)" : keyName
-                            
+
+                            // Strict validation (base64 JSON with non-empty `s` and a
+                            // 32-byte `k` — standard base64, the server's real format,
+                            // or 64-hex) so a malformed key is rejected right here
+                            // with a clear error instead of failing opaquely at
+                            // connect time. Mirrors the tunnel/client parser rules.
+                            guard ConnectionKey.isValidKeyString(connectionKey) else {
+                                vpn.lastError = loc.t("error_invalid_key")
+                                return
+                            }
+
                             let cert = mtlsCertPath.trimmingCharacters(in: .whitespaces)
+                            let cdnUrl = bootstrapCdnUrl.trimmingCharacters(in: .whitespaces)
+                            let telegramToken = bootstrapTelegramToken.trimmingCharacters(in: .whitespaces)
+                            let telegramChat = bootstrapTelegramChat.trimmingCharacters(in: .whitespaces)
+                            let github = bootstrapGithub.trimmingCharacters(in: .whitespaces)
+                            let signingKey = serverSigningKey.trimmingCharacters(in: .whitespaces)
                             if let editId = editingKeyId {
                                 if vpn.updateKey(id: editId, name: name, keyValue: connectionKey,
-                                                 mtlsCertPath: cert.isEmpty ? nil : cert) {
+                                                 mtlsCertPath: cert.isEmpty ? nil : cert,
+                                                 bootstrapCdnUrl: cdnUrl.isEmpty ? nil : cdnUrl,
+                                                 bootstrapTelegramToken: telegramToken.isEmpty ? nil : telegramToken,
+                                                 bootstrapTelegramChat: telegramChat.isEmpty ? nil : telegramChat,
+                                                 bootstrapGithub: github.isEmpty ? nil : github,
+                                                 serverSigningKey: signingKey.isEmpty ? nil : signingKey) {
                                     withAnimation {
                                         showKeyInput = false
                                         keyName = ""
                                         connectionKey = ""
                                         mtlsCertPath = ""
                                         editingKeyId = nil
+                                        bootstrapCdnUrl = ""
+                                        bootstrapTelegramToken = ""
+                                        bootstrapTelegramChat = ""
+                                        bootstrapGithub = ""
+                                        serverSigningKey = ""
+                                        showBootstrapAdvanced = false
                                     }
                                 } else {
                                     vpn.lastError = loc.t("duplicate_key")
                                 }
                             } else {
                                 if vpn.addKey(name: name, keyValue: connectionKey,
-                                              mtlsCertPath: cert.isEmpty ? nil : cert) {
+                                              mtlsCertPath: cert.isEmpty ? nil : cert,
+                                              bootstrapCdnUrl: cdnUrl.isEmpty ? nil : cdnUrl,
+                                              bootstrapTelegramToken: telegramToken.isEmpty ? nil : telegramToken,
+                                              bootstrapTelegramChat: telegramChat.isEmpty ? nil : telegramChat,
+                                              bootstrapGithub: github.isEmpty ? nil : github,
+                                              serverSigningKey: signingKey.isEmpty ? nil : signingKey) {
                                     withAnimation {
                                         showKeyInput = false
                                         keyName = ""
                                         connectionKey = ""
                                         mtlsCertPath = ""
+                                        bootstrapCdnUrl = ""
+                                        bootstrapTelegramToken = ""
+                                        bootstrapTelegramChat = ""
+                                        bootstrapGithub = ""
+                                        serverSigningKey = ""
+                                        showBootstrapAdvanced = false
                                     }
                                 } else {
                                     vpn.lastError = loc.t("duplicate_key")
@@ -364,41 +607,13 @@ struct ContentView: View {
                             }
                         }
                         .buttonStyle(.borderedProminent)
-                        
+
                         Spacer()
                     }
                 }
                 .padding(.horizontal, 16)
                 .padding(.vertical, 8)
                 .transition(.opacity.combined(with: .move(edge: .top)))
-            }
-
-            // Device public key
-            if !vpn.devicePublicKey.isEmpty {
-                HStack(spacing: 6) {
-                    Text("Device Key:")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                    let truncated = vpn.devicePublicKey.count > 20
-                        ? String(vpn.devicePublicKey.prefix(8)) + "…" + String(vpn.devicePublicKey.suffix(8))
-                        : vpn.devicePublicKey
-                    Text(truncated)
-                        .font(.caption2)
-                        .monospaced()
-                        .foregroundColor(.primary)
-                    Spacer()
-                    Button {
-                        NSPasteboard.general.clearContents()
-                        NSPasteboard.general.setString(vpn.devicePublicKey, forType: .string)
-                    } label: {
-                        Image(systemName: "doc.on.doc")
-                            .font(.caption)
-                    }
-                    .buttonStyle(.plain)
-                    .foregroundColor(.secondary)
-                }
-                .padding(.horizontal, 16)
-                .padding(.vertical, 4)
             }
 
             Divider()
@@ -532,8 +747,8 @@ struct ContentView: View {
                         }
 
                         Button(action: {
-                            guard let key = vpn.selectedKey?.keyValue ?? vpn.keys.first?.keyValue,
-                                  let addr = serverAddrFromConnectionKey(key) else { return }
+                            guard let keyModel = vpn.selectedKey ?? vpn.keys.first,
+                                  let addr = serverAddrFromConnectionKey(keyModel.fullKey) else { return }
                             benchRunning = true
                             benchResult = nil
                             vpn.runBench(serverAddr: addr) { result in
@@ -574,15 +789,37 @@ struct ContentView: View {
                     if !vpn.helperAvailable {
                         vpn.checkHelperAvailable()
                     } else {
-                        if proxyMode, let port = Int(proxyPort), port > 1024 {
-                            vpn.connectProxy(key: selectedKey.keyValue, proxyPort: port)
+                        if proxyMode {
+                            // Proxy mode explicitly means "SOCKS5, no root". Never fall
+                            // through to the full-tunnel helper connect on a bad port —
+                            // that would silently start a root VPN the user didn't ask for.
+                            guard let port = Int(proxyPort), port > 1024 else {
+                                vpn.lastError = loc.t("proxy_port_invalid")
+                                return
+                            }
+                            vpn.connectProxy(key: selectedKey.keyValue, proxyPort: port,
+                                             preferredMask: preferredMask == "auto" ? nil : preferredMask,
+                                             polymorphicBase: (polymorphicMask && preferredMask != "auto") ? preferredMask : nil,
+                                             shareMaskFeedback: shareMaskFeedback,
+                                             receiveMaskHints: receiveMaskHints,
+                                             countryCode: maskCountryCode.count == 2 ? maskCountryCode : nil)
                         } else {
                             vpn.connect(key: selectedKey.keyValue, fullTunnel: fullTunnel,
                                         mtlsCertPath: selectedKey.mtlsCertPath,
                                         excludeRoutes: excludeRoutes.isEmpty ? nil : excludeRoutes,
                                         adaptiveLevel: adaptiveLevel,
                                         dnsProxy: dnsProxyAddr.isEmpty ? nil : dnsProxyAddr,
-                                        killSwitch: killSwitch)
+                                        killSwitch: killSwitch,
+                                        preferredMask: preferredMask == "auto" ? nil : preferredMask,
+                                        polymorphicBase: (polymorphicMask && preferredMask != "auto") ? preferredMask : nil,
+                                        shareMaskFeedback: shareMaskFeedback,
+                                        receiveMaskHints: receiveMaskHints,
+                                        countryCode: maskCountryCode.count == 2 ? maskCountryCode : nil,
+                                        bootstrapCdnUrl: selectedKey.bootstrapCdnUrl,
+                                        bootstrapTelegramToken: selectedKey.bootstrapTelegramToken,
+                                        bootstrapTelegramChat: selectedKey.bootstrapTelegramChat,
+                                        bootstrapGithub: selectedKey.bootstrapGithub,
+                                        serverSigningKey: selectedKey.serverSigningKey)
                         }
                     }
                 }
@@ -622,6 +859,41 @@ struct ContentView: View {
 
             Divider()
 
+            // Autoconnect toggle
+            HStack {
+                Toggle(loc.t("connect_on_launch"), isOn: $connectOnLaunch)
+                    .toggleStyle(.checkbox)
+                    .font(.caption2)
+                    .help(loc.t("connect_on_launch_help"))
+                    .onChange(of: connectOnLaunch) { newValue in
+                        LaunchAgentManager.shared.setEnabled(newValue)
+                    }
+                Spacer()
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 4)
+
+            // Theme picker (System / Light / Dark)
+            HStack {
+                Text(loc.t("theme"))
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+                    .help(loc.t("theme_help"))
+                Spacer()
+                Picker("", selection: $themePreference) {
+                    Text(loc.t("theme_system")).tag("system")
+                    Text(loc.t("theme_light")).tag("light")
+                    Text(loc.t("theme_dark")).tag("dark")
+                }
+                .pickerStyle(.menu)
+                .frame(maxWidth: 120)
+                .font(.caption2)
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 4)
+
+            Divider()
+
             // Footer
             HStack {
                 Text("AIVPN v\(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?")")
@@ -629,7 +901,10 @@ struct ContentView: View {
                     .foregroundColor(.secondary)
                 Spacer()
                 Button(loc.t("quit")) {
-                    vpn.disconnect()
+                    // Synchronous disconnect with a short timeout: the async
+                    // disconnect() races NSApp.terminate — the process would die
+                    // before the helper IPC completes, leaving the VPN up.
+                    vpn.disconnectBlocking()
                     NSApp.terminate(nil)
                 }
                 .font(.caption2)
@@ -639,8 +914,12 @@ struct ContentView: View {
             .padding(.horizontal, 16)
             .padding(.vertical, 8)
         }
-        .frame(width: 360)
-        .frame(minHeight: 420)
+        }
+        .frame(width: 360, height: 440)
+        .preferredColorScheme(colorSchemeOverride)
+        .onAppear {
+            connectOnLaunch = LaunchAgentManager.shared.isEnabled
+        }
         .onReceive(vpn.$isConnected) { connected in
             if let appDelegate = NSApp.delegate as? AppDelegate {
                 appDelegate.updateStatusIcon(connected: connected)
@@ -656,6 +935,19 @@ struct ContentView: View {
             Button(loc.t("cancel"), role: .cancel) {}
         } message: {
             Text(loc.t("delete_key_message"))
+        }
+    }
+
+    /// Maps the persisted "system"/"light"/"dark" preference to a ColorScheme override.
+    /// nil means "follow the system appearance" (SwiftUI's default behavior).
+    private var colorSchemeOverride: ColorScheme? {
+        switch themePreference {
+        case "light":
+            return .light
+        case "dark":
+            return .dark
+        default:
+            return nil
         }
     }
 

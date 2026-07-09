@@ -86,10 +86,34 @@ impl KillSwitch {
                 )));
             }
             let chain_spec = "{ type filter hook output priority 0 ; policy drop ; }";
-            Command::new("nft")
+            let chain_ok = Command::new("nft")
                 .args(["add", "chain", "inet", "aivpn_ks", "output", chain_spec])
                 .status()
-                .ok();
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if !chain_ok {
+                // Roll back the table so we don't leave a policy-less table behind,
+                // then fail loud instead of reporting "active" with nothing blocked.
+                let _ = Command::new("nft")
+                    .args(["delete", "table", "inet", "aivpn_ks"])
+                    .status();
+                return Err(Error::Io(io::Error::new(
+                    io::ErrorKind::Other,
+                    "kill-switch: nft failed to create drop-policy chain",
+                )));
+            }
+            // Flush stale accept rules from a previous activation. `add table` /
+            // `add chain` are idempotent and do NOT clear existing rules, so
+            // without this every reconnect (new random TUN name) or pool failover
+            // (new server IP) would APPEND another `oifname <old-tun> accept` /
+            // `ip daddr <old-server-ip> accept` rule that survives for the life of
+            // the process. The stale `daddr` rules are a real bypass — any host
+            // process could still reach the old server IP unblocked. The drop
+            // policy set above is preserved by flushing only the chain's rules
+            // (mirrors the iptables path's `-F AIVPN_KS`).
+            let _ = Command::new("nft")
+                .args(["flush", "chain", "inet", "aivpn_ks", "output"])
+                .status();
             for rule in &[
                 vec![
                     "add", "rule", "inet", "aivpn_ks", "output", "oifname", "lo", "accept",
@@ -104,38 +128,82 @@ impl KillSwitch {
                     self.tun_name.as_str(),
                     "accept",
                 ],
-                // Server IP bypass — pass as distinct argv, never through a shell
-                vec![
-                    "add",
-                    "rule",
-                    "inet",
-                    "aivpn_ks",
-                    "output",
-                    "ip",
-                    "daddr",
-                    self.server_ip.as_str(),
-                    "accept",
-                ],
+                // Server IP bypass — use ip/ip6 family based on address type
+                {
+                    let ip_family = if self.server_ip.contains(':') {
+                        "ip6"
+                    } else {
+                        "ip"
+                    };
+                    vec![
+                        "add",
+                        "rule",
+                        "inet",
+                        "aivpn_ks",
+                        "output",
+                        ip_family,
+                        "daddr",
+                        self.server_ip.as_str(),
+                        "accept",
+                    ]
+                },
             ] {
-                Command::new("nft").args(rule.as_slice()).status().ok();
+                let rule_ok = Command::new("nft")
+                    .args(rule.as_slice())
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false);
+                if !rule_ok {
+                    let _ = Command::new("nft")
+                        .args(["delete", "table", "inet", "aivpn_ks"])
+                        .status();
+                    return Err(Error::Io(io::Error::new(
+                        io::ErrorKind::Other,
+                        "kill-switch: nft failed to add accept rule (tunnel would be blocked)",
+                    )));
+                }
             }
             return Ok(());
         }
 
-        // Fallback: iptables
+        // Fallback: iptables / ip6tables
         let tun = self.tun_name.as_str();
         let sip = self.server_ip.as_str();
-        for cmd in &[
-            vec!["iptables", "-N", "AIVPN_KS"],
-            vec!["iptables", "-F", "AIVPN_KS"],
-            vec!["iptables", "-D", "OUTPUT", "-j", "AIVPN_KS"],
-            vec!["iptables", "-I", "OUTPUT", "1", "-j", "AIVPN_KS"],
-            vec!["iptables", "-A", "AIVPN_KS", "-o", "lo", "-j", "ACCEPT"],
-            vec!["iptables", "-A", "AIVPN_KS", "-o", tun, "-j", "ACCEPT"],
-            vec!["iptables", "-A", "AIVPN_KS", "-d", sip, "-j", "ACCEPT"],
-            vec!["iptables", "-A", "AIVPN_KS", "-j", "DROP"],
-        ] {
+        // Use ip6tables for IPv6 server addresses
+        let ipt = if self.server_ip.contains(':') {
+            "ip6tables"
+        } else {
+            "iptables"
+        };
+        for cmd in &[vec![ipt, "-N", "AIVPN_KS"], vec![ipt, "-F", "AIVPN_KS"]] {
             let _ = Command::new(cmd[0]).args(&cmd[1..]).status();
+        }
+        // -D may legitimately fail (no pre-existing jump rule); ignore its result.
+        let _ = Command::new(ipt)
+            .args(["-D", "OUTPUT", "-j", "AIVPN_KS"])
+            .status();
+        for cmd in &[
+            vec![ipt, "-I", "OUTPUT", "1", "-j", "AIVPN_KS"],
+            vec![ipt, "-A", "AIVPN_KS", "-o", "lo", "-j", "ACCEPT"],
+            vec![ipt, "-A", "AIVPN_KS", "-o", tun, "-j", "ACCEPT"],
+            vec![ipt, "-A", "AIVPN_KS", "-d", sip, "-j", "ACCEPT"],
+            vec![ipt, "-A", "AIVPN_KS", "-j", "DROP"],
+        ] {
+            let ok = Command::new(cmd[0])
+                .args(&cmd[1..])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if !ok {
+                let _ = Command::new(ipt)
+                    .args(["-D", "OUTPUT", "-j", "AIVPN_KS"])
+                    .status();
+                let _ = Command::new(ipt).args(["-F", "AIVPN_KS"]).status();
+                return Err(Error::Io(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("kill-switch: {ipt} rule setup failed (nothing is blocked)"),
+                )));
+            }
         }
         Ok(())
     }
@@ -290,26 +358,54 @@ impl KillSwitch {
     // ──────────────────── Windows ────────────────────
 
     #[cfg(target_os = "windows")]
+    fn policy_save_path() -> std::path::PathBuf {
+        std::path::PathBuf::from(
+            std::env::var("SYSTEMROOT").unwrap_or_else(|_| "C:\\Windows".to_string()),
+        )
+        .join("Temp")
+        .join("aivpn_ks_policy.txt")
+    }
+
+    #[cfg(target_os = "windows")]
     fn activate_impl(&self) -> Result<()> {
         use std::process::Command;
 
+        // Save current firewall policy so we can restore it on deactivate
+        if let Ok(out) = Command::new("netsh")
+            .args(["advfirewall", "show", "currentprofile", "firewallpolicy"])
+            .output()
+        {
+            let save_path = Self::policy_save_path();
+            if let Some(p) = save_path.parent() {
+                let _ = std::fs::create_dir_all(p);
+            }
+            let _ = std::fs::write(&save_path, &out.stdout);
+        }
+
+        // Set default outbound to block — allow rules below override this for
+        // specific interfaces/IPs, so VPN traffic still flows.
         let status = Command::new("netsh")
             .args([
                 "advfirewall",
-                "firewall",
-                "add",
-                "rule",
-                "name=AIVPN_KS_BLOCK",
-                "dir=out",
-                "action=block",
-                "profile=any",
+                "set",
+                "currentprofile",
+                "firewallpolicy",
+                "allowinbound,blockoutbound",
             ])
             .status()
             .map_err(Error::Io)?;
         if !status.success() {
-            warn!("kill-switch: failed to add block rule — Windows Firewall may be disabled");
+            return Err(Error::Io(io::Error::new(
+                io::ErrorKind::Other,
+                "kill-switch: failed to set outbound block policy — Windows Firewall may be disabled, nothing is blocked",
+            )));
         }
 
+        // Add allow rules that override the default block for VPN traffic.
+        // The block policy above is already live, so a failure here means
+        // outbound traffic — including to the VPN server itself — stays
+        // fully blocked with no way to reconnect. Fail loud and roll back
+        // to the pre-activation policy instead of reporting "active".
         for (name, extra) in &[
             ("AIVPN_KS_ALLOW_VPN", format!("interface={}", self.tun_name)),
             (
@@ -318,7 +414,7 @@ impl KillSwitch {
             ),
             ("AIVPN_KS_ALLOW_LOCAL", "remoteip=127.0.0.0/8".to_string()),
         ] {
-            let _ = Command::new("netsh")
+            let ok = Command::new("netsh")
                 .args([
                     "advfirewall",
                     "firewall",
@@ -329,7 +425,20 @@ impl KillSwitch {
                     "action=allow",
                     extra.as_str(),
                 ])
-                .status();
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if !ok {
+                self.deactivate_impl();
+                return Err(Error::Io(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!(
+                        "kill-switch: failed to add allow rule '{name}' — rolled back \
+                         (outbound was fully blocked with no allow rules, which would \
+                         have locked out the VPN server itself)"
+                    ),
+                )));
+            }
         }
 
         Ok(())
@@ -338,8 +447,9 @@ impl KillSwitch {
     #[cfg(target_os = "windows")]
     fn deactivate_impl(&self) {
         use std::process::Command;
+
+        // Remove allow rules
         for name in &[
-            "AIVPN_KS_BLOCK",
             "AIVPN_KS_ALLOW_VPN",
             "AIVPN_KS_ALLOW_SERVER",
             "AIVPN_KS_ALLOW_LOCAL",
@@ -354,27 +464,54 @@ impl KillSwitch {
                 ])
                 .status();
         }
+
+        // Restore saved policy, or fall back to allow
+        let save_path = Self::policy_save_path();
+        let restored = if save_path.exists() {
+            if let Ok(saved) = std::fs::read_to_string(&save_path) {
+                // The policy label is locale-specific ("Firewall Policy" in EN,
+                // "Firewallrichtlinie" in DE, "Политика брандмауэра" in RU, …) but
+                // the VALUE is always English: "(Block|Allow)Inbound,(Block|Allow)Outbound".
+                // Match by value shape, not by label, so any Windows locale works.
+                saved.lines().find_map(|l| {
+                    let v = l.split(':').last().unwrap_or(l).trim().to_lowercase();
+                    if (v.starts_with("allowinbound") || v.starts_with("blockinbound"))
+                        && (v.ends_with("allowoutbound") || v.ends_with("blockoutbound"))
+                    {
+                        Some(v)
+                    } else {
+                        None
+                    }
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let policy = restored.as_deref().unwrap_or("allowinbound,allowoutbound");
+        let _ = Command::new("netsh")
+            .args([
+                "advfirewall",
+                "set",
+                "currentprofile",
+                "firewallpolicy",
+                policy,
+            ])
+            .status();
+        let _ = std::fs::remove_file(&save_path);
     }
 
     #[cfg(target_os = "windows")]
     fn clear_stale_impl() {
-        use std::process::Command;
-        for name in &[
-            "AIVPN_KS_BLOCK",
-            "AIVPN_KS_ALLOW_VPN",
-            "AIVPN_KS_ALLOW_SERVER",
-            "AIVPN_KS_ALLOW_LOCAL",
-        ] {
-            let _ = Command::new("netsh")
-                .args([
-                    "advfirewall",
-                    "firewall",
-                    "delete",
-                    "rule",
-                    &format!("name={}", name),
-                ])
-                .status();
-        }
+        // Reuse deactivate_impl logic via a temporary instance
+        let ks = KillSwitch {
+            tun_name: String::new(),
+            server_ip: String::new(),
+            active: true,
+        };
+        ks.deactivate_impl();
     }
 
     // ──────────────────── Unsupported platforms ────────────────────

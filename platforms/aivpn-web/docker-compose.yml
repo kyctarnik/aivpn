@@ -1,0 +1,23 @@
+# This file shows how to add aivpn-web alongside aivpn-server.
+# Merge with the root docker-compose.yml or use as an override.
+services:
+  aivpn-web:
+    build:
+      context: platforms/aivpn-web
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      DATABASE_URL: file:./data/aivpn-web.db
+      JWT_SECRET: ${AIVPN_WEB_JWT_SECRET:?required}
+      ORIGIN: ${AIVPN_WEB_ORIGIN:-http://localhost:8080}
+      UNIX_SOCK: /run/aivpn/api.sock
+    volumes:
+      - aivpn-web-data:/app/data
+      - /run/aivpn:/run/aivpn
+    depends_on:
+      - aivpn-server
+
+volumes:
+  aivpn-web-data:

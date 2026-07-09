@@ -22,6 +22,8 @@ pub enum PoolMode {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ServerEntry {
+    /// Accept both "endpoint" (canonical) and "addr" (legacy connection-key format).
+    #[serde(alias = "addr")]
     pub endpoint: String,
     #[serde(default)]
     pub priority: u8,
@@ -103,7 +105,7 @@ impl ServerPool {
     }
 
     pub fn next_server(&self) -> Option<SocketAddr> {
-        let nodes = self.nodes.lock().unwrap();
+        let nodes = self.nodes.lock().unwrap_or_else(|e| e.into_inner());
         if nodes.is_empty() {
             return None;
         }
@@ -151,7 +153,7 @@ impl ServerPool {
     }
 
     pub fn report_failure(&self, addr: SocketAddr) {
-        let mut nodes = self.nodes.lock().unwrap();
+        let mut nodes = self.nodes.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(n) = nodes.iter_mut().find(|n| n.addr == addr) {
             n.record_failure();
             warn!("Pool: {} failing ({} strikes)", addr, n.failures);
@@ -159,25 +161,30 @@ impl ServerPool {
     }
 
     pub fn report_success(&self, addr: SocketAddr) {
-        let mut nodes = self.nodes.lock().unwrap();
+        let mut nodes = self.nodes.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(n) = nodes.iter_mut().find(|n| n.addr == addr) {
             n.record_success();
         }
     }
 
     pub fn update_rtt(&self, addr: SocketAddr, rtt_ms: f64) {
-        let mut nodes = self.nodes.lock().unwrap();
+        let mut nodes = self.nodes.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(n) = nodes.iter_mut().find(|n| n.addr == addr) {
             n.rtt_ms = Some(rtt_ms);
         }
     }
 
     pub fn node_count(&self) -> usize {
-        self.nodes.lock().unwrap().len()
+        self.nodes.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 
     pub fn all_servers(&self) -> Vec<SocketAddr> {
-        self.nodes.lock().unwrap().iter().map(|n| n.addr).collect()
+        self.nodes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|n| n.addr)
+            .collect()
     }
 }
 

@@ -6,6 +6,7 @@ use aivpn_common::mask::{IATDistType, MaskProfile, SizeDistType};
 use aivpn_common::network_config::{netmask_to_prefix_len, ClientNetworkConfig, VpnNetworkConfig};
 use aivpn_server::audit_log::AuditLogger;
 use aivpn_server::backup::{export_server, import_server, ExportOptions};
+use aivpn_server::bootstrap_publish::BootstrapPublishConfig;
 #[cfg(feature = "dns")]
 use aivpn_server::dns_proxy::DnsProxyConfig;
 use aivpn_server::gateway::GatewayConfig;
@@ -146,6 +147,72 @@ struct ServerFileConfig {
     dns: Option<DnsProxyConfig>,
     #[serde(default)]
     allow_peer_routing: Option<bool>,
+    /// A7 downlink shaping parity. Absent = enabled (pad server→client DATA to
+    /// the session mask's own size distribution). Set `false` for the
+    /// throughput-first profile.
+    #[serde(default)]
+    downlink_shaping: Option<bool>,
+    /// Neural Resonance master switch. Absent = enabled (the default). Set
+    /// `false` to turn off compromise detection entirely: the gateway skips the
+    /// periodic resonance loop, so neither the per-mask autoencoder (MSE) nor
+    /// its sibling inline ML-DPI "reads-as-tunnel" gate runs and neither can
+    /// trigger a mask rotation. Useful for debugging, perf profiling, or
+    /// silencing false positives without a rebuild.
+    #[serde(default)]
+    neural_enabled: Option<bool>,
+    /// Neural Resonance / ML-DPI gate tuning. A `"neural"` block whose fields
+    /// override `NeuralConfig` defaults (thresholds, check interval, rotation
+    /// cooldown). Absent = built-in defaults. Lets operators calibrate detection
+    /// (Part 6) and lets tests force a rotation by dropping the thresholds.
+    #[serde(default)]
+    neural: Option<NeuralConfig>,
+    #[serde(default)]
+    bootstrap_publish: Option<BootstrapPublishConfig>,
+    /// §2 crowdsourced-feedback tuning, pushed to opted-in clients via
+    /// `FeedbackConfig` so thresholds can change without a client release.
+    #[serde(default)]
+    feedback: Option<FeedbackFileConfig>,
+    /// §3 F "every session polymorphic" server policy — see
+    /// `PolymorphicFileConfig`. Absent = disabled (opt-in `MaskPreference`
+    /// remains the only way a client gets a polymorphic mask).
+    #[serde(default)]
+    polymorphic: Option<PolymorphicFileConfig>,
+    /// R2 Phase B: path to the operator Ed25519 mask-signing key (32-byte
+    /// seed, raw or base64). Signs auto-generated masks post self-test.
+    #[serde(default)]
+    mask_signing_key: Option<String>,
+    /// R2 Phase B: operator Ed25519 verifying public key (base64, 32 bytes)
+    /// for mask-load verification. Derived from `mask_signing_key` if absent.
+    #[serde(default)]
+    mask_operator_pubkey: Option<String>,
+    /// R2 Phase B: mask verification mode on disk load: "off" | "warn"
+    /// (default) | "enforce".
+    #[serde(default)]
+    mask_verify_mode: Option<String>,
+}
+
+/// server.json `"feedback"` block (§2 M3). All optional; omitted keys fall back
+/// to the gateway defaults.
+#[derive(Debug, Clone, Default, Deserialize)]
+struct FeedbackFileConfig {
+    /// Min consecutive failures for a mask before a client records a failure.
+    report_failure_threshold: Option<u8>,
+    /// Min spacing (seconds) between a client's successive feedback sends.
+    report_interval_secs: Option<u32>,
+}
+
+/// server.json `"polymorphic"` block (§3 F). Example:
+/// ```json
+/// "polymorphic": { "all_sessions": true, "base_mask": "webrtc_zoom_v3" }
+/// ```
+/// `all_sessions` defaults to `false` (feature disabled) when the block or
+/// key is omitted. `base_mask` is optional — when absent, each session uses
+/// its own current mask as the polymorphic base instead of a fixed preset.
+#[derive(Debug, Clone, Default, Deserialize)]
+struct PolymorphicFileConfig {
+    #[serde(default)]
+    all_sessions: bool,
+    base_mask: Option<String>,
 }
 
 #[tokio::main]
@@ -162,6 +229,16 @@ async fn main() {
     // mTLS CA management — no config or client DB needed.
     if args.gen_ca {
         handle_gen_ca();
+        return;
+    }
+    // R2 Phase B: operator mask-signing key generation — no config needed.
+    if let Some(ref path) = args.gen_mask_signing_key {
+        handle_gen_mask_signing_key(path);
+        return;
+    }
+    // R2 Phase B: sign a mask corpus in place, then exit.
+    if let Some(ref dir) = args.sign_mask_dir {
+        handle_sign_mask_dir(dir, &args);
         return;
     }
     if let Some(ref pubkey_hex) = args.issue_cert {
@@ -184,6 +261,18 @@ async fn main() {
         eprintln!("Failed to load bootstrap masks: {}", e);
         std::process::exit(1);
     });
+
+    // --list-masks: scan mask directory and print names (no DB needed)
+    if args.list_masks {
+        handle_list_masks(&args, file_config.as_ref());
+        return;
+    }
+
+    // --export-bootstrap-descriptor: print signed descriptors, no DB needed
+    if args.export_bootstrap_descriptor {
+        handle_export_bootstrap_descriptor(&args, &bootstrap_masks);
+        return;
+    }
 
     // Load client database
     let clients_db_path = Path::new(&args.clients_db);
@@ -234,6 +323,10 @@ async fn main() {
     }
     if let Some(ref name_or_id) = args.set_client_qos.clone() {
         handle_set_client_qos(&client_db, name_or_id, &args);
+        return;
+    }
+    if let Some(ref name_or_id) = args.set_mask.clone() {
+        handle_set_mask(&client_db, name_or_id, &args, file_config.as_ref());
         return;
     }
 
@@ -324,6 +417,18 @@ async fn main() {
             format!("{}:{}", ip, port)
         }
     });
+    #[cfg(all(feature = "management-api", unix))]
+    let mgmt_config_path = config_path.as_ref().map(std::path::PathBuf::from);
+    #[cfg(all(feature = "management-api", unix))]
+    let mgmt_clients_db_path = Some(std::path::PathBuf::from(&args.clients_db));
+    #[cfg(all(feature = "management-api", unix))]
+    let mgmt_mask_dir = resolve_mask_dir(&args, file_config.as_ref());
+    #[cfg(all(feature = "management-api", unix))]
+    let mgmt_audit_log_path = Some(std::path::PathBuf::from(&args.audit_log));
+    #[cfg(all(feature = "management-api", unix))]
+    let mgmt_mask_operator_pubkey = resolve_mask_operator_pubkey(&args, file_config.as_ref());
+    #[cfg(all(feature = "management-api", unix))]
+    let mgmt_mask_verify_mode = resolve_mask_verify_mode(&args, file_config.as_ref());
 
     // Build structured event bus (stdout JSONL sink)
     let event_bus = EventBus::new(EventSinkConfig {
@@ -378,8 +483,17 @@ async fn main() {
         server_private_key,
         signing_key: [0u8; 64],
         enable_nat: true,
-        enable_neural: true,
-        neural_config: NeuralConfig::default(),
+        // Neural Resonance (+ inline ML-DPI gate) on unless server.json
+        // explicitly sets "neural_enabled": false.
+        enable_neural: file_config
+            .as_ref()
+            .and_then(|c| c.neural_enabled)
+            .unwrap_or(true),
+        // Neural/ML-DPI tuning: server.json "neural" block overrides defaults.
+        neural_config: file_config
+            .as_ref()
+            .and_then(|c| c.neural.clone())
+            .unwrap_or_default(),
         client_db: Some(client_db),
         mask_dir: resolve_mask_dir(&args, file_config.as_ref()),
         session_timeout_secs: file_config.as_ref().and_then(|c| c.session_timeout_secs),
@@ -399,62 +513,109 @@ async fn main() {
             .as_ref()
             .and_then(|c| c.allow_peer_routing)
             .unwrap_or(args.allow_peer_routing),
+        feedback_report_failure_threshold: file_config
+            .as_ref()
+            .and_then(|c| c.feedback.as_ref())
+            .and_then(|f| f.report_failure_threshold)
+            .unwrap_or(aivpn_server::gateway::DEFAULT_FEEDBACK_FAILURE_THRESHOLD),
+        feedback_report_interval_secs: file_config
+            .as_ref()
+            .and_then(|c| c.feedback.as_ref())
+            .and_then(|f| f.report_interval_secs)
+            .unwrap_or(aivpn_server::gateway::DEFAULT_FEEDBACK_REPORT_INTERVAL_SECS),
+        bootstrap_publish: file_config
+            .as_ref()
+            .and_then(|c| c.bootstrap_publish.clone()),
+        polymorphic_all_sessions: file_config
+            .as_ref()
+            .and_then(|c| c.polymorphic.as_ref())
+            .map(|p| p.all_sessions)
+            .unwrap_or(false),
+        polymorphic_base_mask: file_config
+            .as_ref()
+            .and_then(|c| c.polymorphic.as_ref())
+            .and_then(|p| p.base_mask.clone()),
+        downlink_shaping: file_config
+            .as_ref()
+            .and_then(|c| c.downlink_shaping)
+            .unwrap_or(true),
+        // R2 Phase B: operator mask signing + config-gated verification.
+        mask_signing_key: resolve_mask_signing_key(&args, file_config.as_ref()),
+        mask_operator_pubkey: resolve_mask_operator_pubkey(&args, file_config.as_ref()),
+        mask_verify_mode: resolve_mask_verify_mode(&args, file_config.as_ref()),
     };
-
-    // Spawn management API (Unix socket, optional)
-    #[cfg(all(feature = "management-api", unix))]
-    {
-        if mgmt_socket.is_some() {
-            let db = mgmt_db.clone();
-            let socket = mgmt_socket.clone();
-            let handle = tokio::spawn(async move {
-                aivpn_server::management_api::serve(
-                    Some(db),
-                    socket,
-                    mgmt_pub_key,
-                    mgmt_server_addr,
-                )
-                .await;
-            });
-            // Keep handle alive; log if the task exits unexpectedly
-            tokio::spawn(async move {
-                if handle.await.is_err() {
-                    error!("Management API task exited unexpectedly");
-                }
-            });
-        }
-
-        // SIGHUP → reload client database
-        {
-            let db = mgmt_db;
-            tokio::spawn(async move {
-                use tokio::signal::unix::{signal, SignalKind};
-                let mut sighup = match signal(SignalKind::hangup()) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        tracing::warn!("Failed to register SIGHUP handler: {}", e);
-                        return;
-                    }
-                };
-                loop {
-                    sighup.recv().await;
-                    info!("SIGHUP received — reloading client database");
-                    let db = db.clone();
-                    let _ = tokio::task::spawn_blocking(move || db.reload_if_changed()).await;
-                }
-            });
-        }
-    }
 
     // Create and run server
     match AivpnServer::new(config) {
         Ok(mut server) => {
+            // Spawn management API (Unix socket, optional). Placed after
+            // AivpnServer::new() so ServeConfig can share the SAME live
+            // bootstrap_descriptors Arc as the gateway's rotation task —
+            // building a separate copy here would silently go stale after
+            // the first rotation.
+            #[cfg(all(feature = "management-api", unix))]
+            {
+                let bootstrap_descriptors = Some(server.bootstrap_descriptors());
+                #[cfg(feature = "metrics")]
+                let mgmt_metrics = Some(server.metrics());
+                if mgmt_socket.is_some() {
+                    let db = mgmt_db.clone();
+                    let socket = mgmt_socket.clone();
+                    let handle = tokio::spawn(async move {
+                        aivpn_server::management_api::serve(
+                            aivpn_server::management_api::ServeConfig {
+                                db: Some(db),
+                                socket_path: socket,
+                                server_pub_key: mgmt_pub_key,
+                                server_addr: mgmt_server_addr,
+                                config_path: mgmt_config_path,
+                                clients_db_path: mgmt_clients_db_path,
+                                mask_dir: mgmt_mask_dir,
+                                audit_log_path: mgmt_audit_log_path,
+                                bootstrap_descriptors,
+                                mask_operator_pubkey: mgmt_mask_operator_pubkey,
+                                mask_verify_mode: mgmt_mask_verify_mode,
+                                #[cfg(feature = "metrics")]
+                                metrics: mgmt_metrics,
+                            },
+                        )
+                        .await;
+                    });
+                    // Keep handle alive; log if the task exits unexpectedly
+                    tokio::spawn(async move {
+                        if handle.await.is_err() {
+                            error!("Management API task exited unexpectedly");
+                        }
+                    });
+                }
+
+                // SIGHUP → reload client database
+                {
+                    let db = mgmt_db;
+                    tokio::spawn(async move {
+                        use tokio::signal::unix::{signal, SignalKind};
+                        let mut sighup = match signal(SignalKind::hangup()) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                tracing::warn!("Failed to register SIGHUP handler: {}", e);
+                                return;
+                            }
+                        };
+                        loop {
+                            sighup.recv().await;
+                            info!("SIGHUP received — reloading client database");
+                            let db = db.clone();
+                            let _ =
+                                tokio::task::spawn_blocking(move || db.reload_if_changed()).await;
+                        }
+                    });
+                }
+            }
+
             // Start pool sync after session_manager and mask catalog are initialised.
             // Sync packets ride the existing VPN UDP port — no extra TCP port needed.
             if let (Some(ref pool_cfg), Some(db)) = (&pool_sync_config, client_db_for_sync) {
-                if let Some(syncer) =
-                    PeerSyncer::new(db, pool_cfg, server.catalog_mdh(), event_bus.clone())
-                {
+                if let Some(syncer) = PeerSyncer::new(db, pool_cfg, event_bus.clone()) {
                     syncer.start(server.session_manager());
                     info!(
                         "Pool sync active ({} peers, in-protocol UDP)",
@@ -484,7 +645,7 @@ async fn main() {
                             if let Some(cf) = aivpn_server::chain_forwarder::ChainForwarder::new(
                                 exit_node,
                                 sync_key,
-                                server.catalog_mdh(),
+                                pool_cfg.node_id.as_deref(),
                             )
                             .await
                             {
@@ -498,11 +659,7 @@ async fn main() {
 
             // Start site-to-site route sync — pass session_manager so peer sessions are registered.
             if let Some(ref s2s_cfg) = s2s_config {
-                aivpn_server::site_sync::start(
-                    s2s_cfg,
-                    server.catalog_mdh(),
-                    server.session_manager(),
-                );
+                aivpn_server::site_sync::start(s2s_cfg, server.session_manager());
                 info!("Site-to-site active ({} peers)", s2s_cfg.peers.len());
             }
 
@@ -542,6 +699,217 @@ fn load_server_public_key(args: &ServerArgs) -> Option<[u8; 32]> {
     })
 }
 
+/// The server's ed25519 signing (verifying) public key, base64-standard encoded,
+/// derived deterministically from the server private key. Embedded in connection
+/// keys as the `sk` field so clients can verify signed server messages.
+fn load_server_signing_public_key(args: &ServerArgs) -> Option<String> {
+    use base64::Engine;
+    let key_file = args.key_file.as_ref()?;
+    let key_data = std::fs::read(key_file).ok()?;
+    if key_data.len() != 32 {
+        return None;
+    }
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&key_data);
+    let signing = aivpn_server::gateway::derive_server_signing_key(&key);
+    let verifying = signing.verifying_key().to_bytes();
+    Some(base64::engine::general_purpose::STANDARD.encode(verifying))
+}
+
+// ─── R2 Phase B: operator mask-signing key handling ──────────────────────────
+
+/// Load the operator Ed25519 mask-signing key seed from a file. Accepts raw
+/// 32 bytes, or base64-encoded 32 bytes (whitespace-trimmed). Exits with a
+/// clear error on a configured-but-unreadable key: silently skipping it would
+/// silently ship unsigned masks.
+fn load_mask_signing_seed(path: &str) -> [u8; 32] {
+    use base64::Engine;
+    let data = std::fs::read(path).unwrap_or_else(|e| {
+        eprintln!("Failed to read mask signing key '{}': {}", path, e);
+        std::process::exit(1);
+    });
+    let bytes: Vec<u8> = if data.len() == 32 {
+        data
+    } else {
+        let text = String::from_utf8_lossy(&data);
+        base64::engine::general_purpose::STANDARD
+            .decode(text.trim())
+            .unwrap_or_else(|e| {
+                eprintln!(
+                    "Mask signing key '{}' is neither raw 32 bytes nor base64: {}",
+                    path, e
+                );
+                std::process::exit(1);
+            })
+    };
+    if bytes.len() != 32 {
+        eprintln!(
+            "Mask signing key '{}' must decode to 32 bytes, got {}",
+            path,
+            bytes.len()
+        );
+        std::process::exit(1);
+    }
+    let mut seed = [0u8; 32];
+    seed.copy_from_slice(&bytes);
+    seed
+}
+
+/// Resolve the operator mask-signing key seed: CLI/env → server.json.
+fn resolve_mask_signing_key(
+    args: &ServerArgs,
+    file_config: Option<&ServerFileConfig>,
+) -> Option<[u8; 32]> {
+    args.mask_signing_key
+        .clone()
+        .or_else(|| file_config.and_then(|c| c.mask_signing_key.clone()))
+        .map(|path| load_mask_signing_seed(&path))
+}
+
+/// Resolve the operator mask-verifying public key: CLI/env → server.json →
+/// derived from the signing key. Exits on a malformed configured value.
+fn resolve_mask_operator_pubkey(
+    args: &ServerArgs,
+    file_config: Option<&ServerFileConfig>,
+) -> Option<[u8; 32]> {
+    use base64::Engine;
+    let explicit = args
+        .mask_operator_pubkey
+        .clone()
+        .or_else(|| file_config.and_then(|c| c.mask_operator_pubkey.clone()));
+    if let Some(b64) = explicit {
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(b64.trim())
+            .unwrap_or_else(|e| {
+                eprintln!("Invalid --mask-operator-pubkey (not base64): {}", e);
+                std::process::exit(1);
+            });
+        if bytes.len() != 32 {
+            eprintln!(
+                "--mask-operator-pubkey must be 32 bytes, got {}",
+                bytes.len()
+            );
+            std::process::exit(1);
+        }
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&bytes);
+        return Some(key);
+    }
+    // Derive from the signing key so a single-host setup needs only one flag.
+    resolve_mask_signing_key(args, file_config).map(|seed| {
+        ed25519_dalek::SigningKey::from_bytes(&seed)
+            .verifying_key()
+            .to_bytes()
+    })
+}
+
+/// Resolve the mask verification mode: CLI/env → server.json → default (warn).
+fn resolve_mask_verify_mode(
+    args: &ServerArgs,
+    file_config: Option<&ServerFileConfig>,
+) -> aivpn_common::mask::MaskVerifyMode {
+    let raw = args
+        .mask_verify_mode
+        .clone()
+        .or_else(|| file_config.and_then(|c| c.mask_verify_mode.clone()));
+    match raw {
+        None => aivpn_common::mask::MaskVerifyMode::default(),
+        Some(s) => s.parse().unwrap_or_else(|e| {
+            eprintln!("{}", e);
+            std::process::exit(1);
+        }),
+    }
+}
+
+/// `--gen-mask-signing-key PATH`: generate a fresh operator Ed25519 seed,
+/// write it base64-encoded to PATH (0600), print the base64 public key.
+fn handle_gen_mask_signing_key(path: &str) {
+    use base64::Engine;
+    use rand::RngCore;
+    let mut seed = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut seed);
+    let b64 = base64::engine::general_purpose::STANDARD.encode(seed);
+    if std::path::Path::new(path).exists() {
+        eprintln!("Refusing to overwrite existing key file '{}'", path);
+        std::process::exit(1);
+    }
+    if let Err(e) = std::fs::write(path, &b64) {
+        eprintln!("Failed to write '{}': {}", path, e);
+        std::process::exit(1);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    let pubkey = ed25519_dalek::SigningKey::from_bytes(&seed)
+        .verifying_key()
+        .to_bytes();
+    println!("✅ Operator mask-signing key written to {}", path);
+    println!(
+        "   Public key (base64) — distribute to servers (--mask-operator-pubkey)\n   and clients (--mask-operator-pubkey / config mask_operator_pubkey):\n   {}",
+        base64::engine::general_purpose::STANDARD.encode(pubkey)
+    );
+}
+
+/// `--sign-mask-dir DIR`: sign every `*.json` mask in DIR in place (and its
+/// nested reverse profile) with the operator key from `--mask-signing-key`, so
+/// the corpus survives `mask_verify_mode=enforce`. The reverse profile is signed
+/// first because the outer signature covers it.
+fn handle_sign_mask_dir(dir: &str, args: &ServerArgs) {
+    let seed = match resolve_mask_signing_key(args, None) {
+        Some(s) => s,
+        None => {
+            eprintln!("--sign-mask-dir requires --mask-signing-key (or config mask_signing_key)");
+            std::process::exit(1);
+        }
+    };
+    let key = ed25519_dalek::SigningKey::from_bytes(&seed);
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("Cannot read directory '{dir}': {e}");
+            std::process::exit(1);
+        }
+    };
+    let mut signed = 0usize;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let data = match std::fs::read_to_string(&path) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("  skip {}: read failed: {e}", path.display());
+                continue;
+            }
+        };
+        let mut profile: aivpn_common::mask::MaskProfile = match serde_json::from_str(&data) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("  skip {}: not a MaskProfile: {e}", path.display());
+                continue;
+            }
+        };
+        if let Some(rev) = profile.reverse_profile.as_deref_mut() {
+            rev.sign(&key);
+        }
+        profile.sign(&key);
+        match serde_json::to_string_pretty(&profile) {
+            Ok(out) => match std::fs::write(&path, out) {
+                Ok(()) => {
+                    signed += 1;
+                    println!("  signed {}", path.display());
+                }
+                Err(e) => eprintln!("  FAILED {}: write: {e}", path.display()),
+            },
+            Err(e) => eprintln!("  FAILED {}: serialize: {e}", path.display()),
+        }
+    }
+    println!("✅ Signed {signed} mask(s) in '{dir}' with the operator key.");
+}
+
 /// Build a connection key: aivpn://BASE64({"s":"host:port","k":"...","p":"...","i":"...","n":{...}})
 fn build_connection_key(
     args: &ServerArgs,
@@ -552,13 +920,31 @@ fn build_connection_key(
 ) -> String {
     use base64::Engine;
     let server_addr = build_connection_server_addr(args, server_ip);
-    let json = serde_json::json!({
+    let mut json = serde_json::json!({
         "s": server_addr,
         "k": server_pub_b64,
         "p": psk_b64,
         "i": client_network_config.client_ip,
         "n": client_network_config,
     });
+    // Embed the server's ed25519 signing (verifying) public key so the client can
+    // authenticate bootstrap descriptors / ServerHello / MaskUpdate out of the box
+    // (previously verification was unreachable without a manual --server-signing-key).
+    if let Some(sk) = load_server_signing_public_key(args) {
+        json["sk"] = serde_json::Value::String(sk);
+    }
+    // R2 Phase B: embed the operator mask-verifying public key (`mop`) so
+    // clients can verify the embedded MaskProfile.signature of pushed masks
+    // out of the box (default client mode is `warn` — log-only).
+    {
+        use base64::Engine as _;
+        let config_path = resolve_config_path(args);
+        let file_config = load_server_file_config(config_path.as_deref());
+        if let Some(mop) = resolve_mask_operator_pubkey(args, file_config.as_ref()) {
+            json["mop"] =
+                serde_json::Value::String(base64::engine::general_purpose::STANDARD.encode(mop));
+        }
+    }
     let json_bytes = serde_json::to_string(&json).unwrap();
     let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json_bytes.as_bytes());
     format!("aivpn://{}", encoded)
@@ -959,6 +1345,138 @@ fn load_bootstrap_masks(
         ));
     }
     Ok(masks)
+}
+
+/// --list-masks: print mask JSON filenames from mask-dir
+fn handle_list_masks(args: &ServerArgs, file_config: Option<&ServerFileConfig>) {
+    let mask_dir = resolve_mask_dir(args, file_config);
+    let mut names: Vec<String> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&mask_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("json") {
+                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                    names.push(stem.to_string());
+                }
+            }
+        }
+    }
+    names.sort();
+    if names.is_empty() {
+        println!("No masks found in {}", mask_dir.display());
+    } else {
+        println!(
+            "Available masks in {} ({}):",
+            mask_dir.display(),
+            names.len()
+        );
+        for name in &names {
+            println!("  {}", name);
+        }
+    }
+}
+
+/// --export-bootstrap-descriptor: print the current signed descriptors as a
+/// JSON array (identical shape to what already-connected clients receive),
+/// for an operator to manually publish to a CDN/GitHub/Telegram/other
+/// channel. Requires --key-file: an ephemeral key would produce a descriptor
+/// signed by a key nobody's client trusts, so unlike normal server startup
+/// (which tolerates an ephemeral key with just a warning), this exits.
+fn handle_export_bootstrap_descriptor(args: &ServerArgs, bootstrap_masks: &[MaskProfile]) {
+    let Some(ref key_file) = args.key_file else {
+        eprintln!("--export-bootstrap-descriptor requires --key-file (an ephemeral server key cannot be exported — no client trusts it)");
+        std::process::exit(1);
+    };
+    let key_data = std::fs::read(key_file).unwrap_or_else(|e| {
+        eprintln!("Failed to read key file '{}': {}", key_file, e);
+        std::process::exit(1);
+    });
+    if key_data.len() != 32 {
+        eprintln!("Key file must be exactly 32 bytes, got {}", key_data.len());
+        std::process::exit(1);
+    }
+    let mut server_private_key = [0u8; 32];
+    server_private_key.copy_from_slice(&key_data);
+
+    let signing_key = aivpn_server::gateway::derive_server_signing_key(&server_private_key);
+    let descriptors = aivpn_server::gateway::build_bootstrap_descriptors(
+        &server_private_key,
+        &signing_key,
+        bootstrap_masks,
+    );
+    let json = serde_json::to_string_pretty(&descriptors).unwrap_or_else(|e| {
+        eprintln!("Failed to serialize bootstrap descriptors: {}", e);
+        std::process::exit(1);
+    });
+
+    match &args.bootstrap_output {
+        Some(path) => {
+            if let Err(e) = std::fs::write(path, &json) {
+                eprintln!("Failed to write {}: {}", path, e);
+                std::process::exit(1);
+            }
+            eprintln!(
+                "Wrote {} signed bootstrap descriptor(s) to {}",
+                descriptors.len(),
+                path
+            );
+        }
+        None => println!("{}", json),
+    }
+}
+
+/// --set-mask NAME_OR_ID --mask-name MASK_NAME: write a mask override file
+fn handle_set_mask(
+    client_db: &ClientDatabase,
+    name_or_id: &str,
+    args: &ServerArgs,
+    file_config: Option<&ServerFileConfig>,
+) {
+    let mask_name = match args.mask_name.as_deref() {
+        Some(n) if !n.is_empty() => n,
+        _ => {
+            eprintln!("--mask-name is required with --set-mask");
+            std::process::exit(1);
+        }
+    };
+    // Validate client exists
+    let client = client_db
+        .find_by_name(name_or_id)
+        .or_else(|| client_db.find_by_id(name_or_id));
+    let client = match client {
+        Some(c) => c,
+        None => {
+            eprintln!("Client '{}' not found", name_or_id);
+            std::process::exit(1);
+        }
+    };
+    // Validate mask exists (on disk or as a built-in preset)
+    let mask_dir = resolve_mask_dir(args, file_config);
+    let on_disk = mask_dir.join(format!("{}.json", mask_name)).exists();
+    let is_preset = aivpn_common::mask::preset_masks::by_id(mask_name).is_some();
+    if !on_disk && !is_preset {
+        eprintln!(
+            "Mask '{}' not found in {} or built-in presets",
+            mask_name,
+            mask_dir.display()
+        );
+        std::process::exit(1);
+    }
+    // Write override: <mask_dir>/.overrides/<client-id>.mask
+    let overrides_dir = mask_dir.join(".overrides");
+    if let Err(e) = std::fs::create_dir_all(&overrides_dir) {
+        eprintln!("Failed to create overrides dir: {}", e);
+        std::process::exit(1);
+    }
+    let override_path = overrides_dir.join(format!("{}.mask", client.id));
+    if let Err(e) = std::fs::write(&override_path, mask_name) {
+        eprintln!("Failed to write mask override: {}", e);
+        std::process::exit(1);
+    }
+    println!(
+        "Mask override set: client '{}' ({}) → '{}'",
+        client.name, client.id, mask_name
+    );
 }
 
 /// Resolve mask directory: CLI --mask-dir / env AIVPN_MASK_DIR → server.json "mask_dir" → default
@@ -1371,6 +1889,7 @@ fn handle_validate_mask(path: &str) {
         IATDistType::LogNormal => "LogNormal",
         IATDistType::Empirical => "Empirical",
         IATDistType::Gamma => "Gamma",
+        IATDistType::Gmm => "GMM",
     };
     println!(
         "IAT:      {} params={:?} jitter=[{jlo:.1}, {jhi:.1}] ms",
@@ -1441,6 +1960,16 @@ mod tests {
             add_client_one_time: None,
             reset_device: None,
             allow_peer_routing: false,
+            list_masks: false,
+            set_mask: None,
+            mask_name: None,
+            mask_signing_key: None,
+            mask_operator_pubkey: None,
+            mask_verify_mode: None,
+            gen_mask_signing_key: None,
+            sign_mask_dir: None,
+            export_bootstrap_descriptor: false,
+            bootstrap_output: None,
         }
     }
 
@@ -1791,5 +2320,34 @@ mod tests {
         assert_eq!(masks[1].mask_id, "mask2");
 
         std::fs::remove_dir_all(&temp_dir).ok();
+    }
+
+    /// §3.2 server.json `"polymorphic"` block — mirrors the existing
+    /// `"feedback"` block's parsing shape: an optional nested struct with
+    /// its own optional/defaulted fields.
+    #[test]
+    fn polymorphic_block_parses_all_sessions_and_base_mask() {
+        let json = r#"{ "polymorphic": { "all_sessions": true, "base_mask": "webrtc_zoom_v3" } }"#;
+        let cfg: ServerFileConfig = serde_json::from_str(json).unwrap();
+        let poly = cfg.polymorphic.expect("polymorphic block must parse");
+        assert!(poly.all_sessions);
+        assert_eq!(poly.base_mask.as_deref(), Some("webrtc_zoom_v3"));
+    }
+
+    /// Omitted `"polymorphic"` block, or an empty one, must resolve to the
+    /// disabled default (`all_sessions: false`, `base_mask: None`) — this is
+    /// what `GatewayConfig::default()`'s `polymorphic_all_sessions: false`
+    /// depends on when server.json doesn't mention the feature at all.
+    #[test]
+    fn polymorphic_block_defaults_to_disabled_when_absent_or_empty() {
+        let cfg: ServerFileConfig = serde_json::from_str("{}").unwrap();
+        assert!(cfg.polymorphic.is_none());
+
+        let cfg: ServerFileConfig = serde_json::from_str(r#"{ "polymorphic": {} }"#).unwrap();
+        let poly = cfg
+            .polymorphic
+            .expect("empty polymorphic block must still parse");
+        assert!(!poly.all_sessions);
+        assert_eq!(poly.base_mask, None);
     }
 }

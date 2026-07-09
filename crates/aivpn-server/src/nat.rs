@@ -695,6 +695,13 @@ impl Drop for NatForwarder {
 
         #[cfg(target_os = "linux")]
         {
+            // Tear down the IPv6 NAT66 rules installed by setup_nat66 when IPv6 was
+            // enabled — the IPv4 cleanup below only removes the `aivpn` table, so
+            // without this the `aivpn6` table / ip6tables MASQUERADE+FORWARD rules
+            // leaked on the host after shutdown.
+            if self.network_config.ipv6_enabled {
+                let _ = teardown_nat66(&self.tun_name, &self.network_config.ipv6_prefix);
+            }
             match self.fw_backend {
                 Some(FwBackend::Nftables) => {
                     use std::process::Command;

@@ -8,7 +8,7 @@
 
 use blake3::Hasher;
 use chacha20poly1305::{
-    aead::{Aead, KeyInit, OsRng},
+    aead::{AeadInPlace, KeyInit, OsRng},
     ChaCha20Poly1305, Key as ChachaKey, Nonce,
 };
 use hmac::Hmac;
@@ -43,13 +43,38 @@ pub const DEFAULT_WINDOW_MS: u64 = 10_000;
 
 /// HKDF context strings
 const HKDF_SESSION_KEY_CONTEXT: &str = "aivpn-session-key-v1";
+const HKDF_SESSION_KEY_S2C_CONTEXT: &str = "aivpn-session-key-s2c-v1";
 const HKDF_TAG_SECRET_CONTEXT: &str = "aivpn-tag-secret-v1";
 const HKDF_PRNG_SEED_CONTEXT: &str = "aivpn-prng-seed-v1";
+
+/// Domain-separation contexts for directional peer-link sub-keys (server pool
+/// sync, site-to-site, chain forwarding). The lexicographically smaller peer
+/// id takes the "client" role: it SENDS with the pair's c2s key and RECEIVES
+/// with the s2c key; the larger id does the opposite.
+const PEER_DIR_C2S_CONTEXT: &str = "aivpn-peer-dir-c2s-v1";
+const PEER_DIR_S2C_CONTEXT: &str = "aivpn-peer-dir-s2c-v1";
 
 /// Session keys derived from key exchange
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct SessionKeys {
+    /// AEAD key for the client→server (uplink) direction. Named `session_key`
+    /// for historical reasons; it is the C2S key.
+    ///
+    /// Server-to-server peer links (pool sync, site-to-site, chain
+    /// forwarding) do NOT share one symmetric key in both directions: each
+    /// direction derives its own root via [`derive_directional_peer_keys`]
+    /// and builds a separate `SessionKeys` from it, so this field then holds
+    /// that one direction's key and the two directions never share a
+    /// (key, nonce) space. The kernel offload path mirrors user space:
+    /// `session_key` for uplink decrypt, `session_key_s2c` for downlink
+    /// encrypt.
     pub session_key: [u8; CHACHA20_KEY_SIZE],
+    /// AEAD key for the server→client (downlink) direction. Distinct from
+    /// `session_key` so the two directions never share a (key, nonce) pair:
+    /// nonces are counter-derived and both directions start their counter at 0
+    /// (and reset to 0 on every ratchet/rekey), so a single shared key would
+    /// reuse the ChaCha20 keystream across directions — a confidentiality break.
+    pub session_key_s2c: [u8; CHACHA20_KEY_SIZE],
     pub tag_secret: [u8; 32],
     pub prng_seed: [u8; 32],
 }
@@ -147,14 +172,118 @@ pub fn derive_session_keys(
     let prng_seed_input: Vec<u8> = [ikm, eph_pub.to_vec()].concat();
 
     let session_key_hash = blake3::derive_key(HKDF_SESSION_KEY_CONTEXT, &session_key_input);
+    let session_key_s2c_hash = blake3::derive_key(HKDF_SESSION_KEY_S2C_CONTEXT, &session_key_input);
     let tag_secret_hash = blake3::derive_key(HKDF_TAG_SECRET_CONTEXT, &tag_secret_input);
     let prng_seed_hash = blake3::derive_key(HKDF_PRNG_SEED_CONTEXT, &prng_seed_input);
 
     SessionKeys {
         session_key: session_key_hash[..CHACHA20_KEY_SIZE].try_into().unwrap(),
+        session_key_s2c: session_key_s2c_hash[..CHACHA20_KEY_SIZE]
+            .try_into()
+            .unwrap(),
         tag_secret: tag_secret_hash[..32].try_into().unwrap(),
         prng_seed: prng_seed_hash[..32].try_into().unwrap(),
     }
+}
+
+/// Derive one directional sub-key of a peer pair.
+///
+/// `low_id` is length-prefixed so `("ab", "c")` and `("a", "bc")` can never
+/// produce identical key material.
+fn derive_peer_pair_key(
+    context: &str,
+    shared_key: &[u8; 32],
+    low_id: &str,
+    high_id: &str,
+) -> [u8; 32] {
+    let mut material = Vec::with_capacity(32 + 4 + low_id.len() + high_id.len());
+    material.extend_from_slice(shared_key);
+    material.extend_from_slice(&(low_id.len() as u32).to_le_bytes());
+    material.extend_from_slice(low_id.as_bytes());
+    material.extend_from_slice(high_id.as_bytes());
+    blake3::derive_key(context, &material)
+}
+
+/// Derive directional sub-keys for a symmetric-secret peer link (pool sync,
+/// site-to-site, chain forwarding).
+///
+/// Returns `(send_root, recv_root)` from the LOCAL node's perspective.
+/// Roles are assigned deterministically by lexicographic byte order of the
+/// two peer identifiers: the smaller id acts as the "client" (sends with the
+/// pair's c2s sub-key, receives with s2c), the larger id acts as the
+/// "server" (sends s2c, receives c2s). Both peers call this with swapped
+/// arguments and the same 32-byte shared key and independently arrive at
+/// mirrored results — no handshake needed:
+///
+/// * `A.send_root == B.recv_root` and `B.send_root == A.recv_root`
+/// * `A.send_root != B.send_root` — the two directions never share an AEAD
+///   (key, nonce) space even though each node builds nonces from its own
+///   independent counter.
+///
+/// The sub-keys are additionally bound to the (unordered) id pair, so in a
+/// pool of 3+ nodes no two links share a key either.
+///
+/// `local_id` and `peer_id` MUST differ: equal ids would collapse both
+/// directions onto one key — with both sides then building AEAD nonces from
+/// independent counters starting near the same value, that is ChaCha20
+/// (key, nonce) reuse on traffic carrying client PSKs. This fails CLOSED at
+/// runtime (`Err`) rather than deriving reused keys; callers must refuse to
+/// bring up the peer link.
+pub fn derive_directional_peer_keys(
+    shared_key: &[u8; 32],
+    local_id: &str,
+    peer_id: &str,
+) -> Result<([u8; 32], [u8; 32])> {
+    if local_id == peer_id {
+        return Err(Error::Crypto(format!(
+            "directional peer keys require distinct peer ids (both are '{}')",
+            local_id
+        )));
+    }
+    let local_is_client = local_id < peer_id;
+    let (low, high) = if local_is_client {
+        (local_id, peer_id)
+    } else {
+        (peer_id, local_id)
+    };
+    // c2s = low → high direction; s2c = high → low direction.
+    let c2s = derive_peer_pair_key(PEER_DIR_C2S_CONTEXT, shared_key, low, high);
+    let s2c = derive_peer_pair_key(PEER_DIR_S2C_CONTEXT, shared_key, low, high);
+    Ok(if local_is_client {
+        (c2s, s2c)
+    } else {
+        (s2c, c2s)
+    })
+}
+
+/// Encrypt payload into a caller-owned buffer using ChaCha20-Poly1305.
+///
+/// This is the allocation-free variant of [`encrypt_payload`]: it clears `out`,
+/// copies `plaintext` into it, and encrypts in place, appending the 16-byte
+/// Poly1305 tag. On success `out` holds `plaintext.len() + POLY1305_TAG_SIZE`
+/// bytes — byte-for-byte identical to what [`encrypt_payload`] returns.
+///
+/// Reusing the same `out` across calls avoids a heap allocation per packet on
+/// the server's hot path. A dirty (non-empty) `out` is handled correctly
+/// because it is cleared first.
+///
+/// On AEAD failure `out` is cleared (never left holding partial ciphertext).
+pub fn encrypt_payload_into(
+    key: &[u8; CHACHA20_KEY_SIZE],
+    nonce: &[u8; NONCE_SIZE],
+    plaintext: &[u8],
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    let cipher = ChaCha20Poly1305::new(ChachaKey::from_slice(key));
+    let nonce = Nonce::from_slice(nonce);
+
+    out.clear();
+    out.extend_from_slice(plaintext);
+    if let Err(e) = cipher.encrypt_in_place(nonce, b"", out) {
+        out.clear();
+        return Err(e.into());
+    }
+    Ok(())
 }
 
 /// Encrypt payload using ChaCha20-Poly1305
@@ -163,11 +292,36 @@ pub fn encrypt_payload(
     nonce: &[u8; NONCE_SIZE],
     plaintext: &[u8],
 ) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(plaintext.len() + POLY1305_TAG_SIZE);
+    encrypt_payload_into(key, nonce, plaintext, &mut out)?;
+    Ok(out)
+}
+
+/// Decrypt payload into a caller-owned buffer using ChaCha20-Poly1305.
+///
+/// Allocation-free variant of [`decrypt_payload`]: clears `out`, copies
+/// `ciphertext` into it, and decrypts in place, truncating away the Poly1305
+/// tag. On success `out` holds the recovered plaintext — identical to what
+/// [`decrypt_payload`] returns.
+///
+/// On AEAD failure (bad tag / wrong key) `out` is cleared so no partial or
+/// unauthenticated plaintext is exposed to the caller.
+pub fn decrypt_payload_into(
+    key: &[u8; CHACHA20_KEY_SIZE],
+    nonce: &[u8; NONCE_SIZE],
+    ciphertext: &[u8],
+    out: &mut Vec<u8>,
+) -> Result<()> {
     let cipher = ChaCha20Poly1305::new(ChachaKey::from_slice(key));
     let nonce = Nonce::from_slice(nonce);
 
-    let ciphertext = cipher.encrypt(nonce, plaintext)?;
-    Ok(ciphertext)
+    out.clear();
+    out.extend_from_slice(ciphertext);
+    if let Err(e) = cipher.decrypt_in_place(nonce, b"", out) {
+        out.clear();
+        return Err(e.into());
+    }
+    Ok(())
 }
 
 /// Decrypt payload using ChaCha20-Poly1305
@@ -176,11 +330,9 @@ pub fn decrypt_payload(
     nonce: &[u8; NONCE_SIZE],
     ciphertext: &[u8],
 ) -> Result<Vec<u8>> {
-    let cipher = ChaCha20Poly1305::new(ChachaKey::from_slice(key));
-    let nonce = Nonce::from_slice(nonce);
-
-    let plaintext = cipher.decrypt(nonce, ciphertext)?;
-    Ok(plaintext)
+    let mut out = Vec::with_capacity(ciphertext.len());
+    decrypt_payload_into(key, nonce, ciphertext, &mut out)?;
+    Ok(out)
 }
 
 /// Generate Resonance Tag using HMAC-BLAKE3
@@ -288,6 +440,68 @@ mod tests {
     }
 
     #[test]
+    fn test_encrypt_into_matches_allocating() {
+        let key = [9u8; CHACHA20_KEY_SIZE];
+        let nonce = [4u8; NONCE_SIZE];
+        let plaintext = b"in-place equals allocating output";
+
+        let expected = encrypt_payload(&key, &nonce, plaintext).unwrap();
+
+        let mut out = Vec::new();
+        encrypt_payload_into(&key, &nonce, plaintext, &mut out).unwrap();
+        assert_eq!(out, expected);
+        assert_eq!(out.len(), plaintext.len() + POLY1305_TAG_SIZE);
+    }
+
+    #[test]
+    fn test_decrypt_into_matches_allocating() {
+        let key = [9u8; CHACHA20_KEY_SIZE];
+        let nonce = [4u8; NONCE_SIZE];
+        let plaintext = b"in-place decrypt round-trip";
+
+        let ciphertext = encrypt_payload(&key, &nonce, plaintext).unwrap();
+
+        let mut out = Vec::new();
+        decrypt_payload_into(&key, &nonce, &ciphertext, &mut out).unwrap();
+        assert_eq!(out, plaintext);
+    }
+
+    #[test]
+    fn test_into_roundtrip_with_dirty_reused_buffers() {
+        let key = [11u8; CHACHA20_KEY_SIZE];
+        let nonce = [5u8; NONCE_SIZE];
+
+        // Pre-fill both buffers with junk to prove they are cleared first and
+        // reuse across calls yields correct results (the pooled-buffer case).
+        let mut ct_buf = vec![0xAAu8; 4096];
+        let mut pt_buf = vec![0xBBu8; 4096];
+
+        for msg in [b"first message".as_slice(), b"second, longer message!!"] {
+            encrypt_payload_into(&key, &nonce, msg, &mut ct_buf).unwrap();
+            assert_eq!(ct_buf.len(), msg.len() + POLY1305_TAG_SIZE);
+            assert_eq!(ct_buf, encrypt_payload(&key, &nonce, msg).unwrap());
+
+            decrypt_payload_into(&key, &nonce, &ct_buf, &mut pt_buf).unwrap();
+            assert_eq!(pt_buf, msg);
+        }
+    }
+
+    #[test]
+    fn test_decrypt_into_wrong_key_clears_out() {
+        let key = [1u8; CHACHA20_KEY_SIZE];
+        let wrong_key = [2u8; CHACHA20_KEY_SIZE];
+        let nonce = [0u8; NONCE_SIZE];
+
+        let ciphertext = encrypt_payload(&key, &nonce, b"authenticated").unwrap();
+
+        let mut out = vec![0x77u8; 128];
+        let result = decrypt_payload_into(&wrong_key, &nonce, &ciphertext, &mut out);
+        assert!(result.is_err());
+        // No unauthenticated plaintext must survive in the buffer.
+        assert!(out.is_empty());
+    }
+
+    #[test]
     fn test_resonance_tag() {
         let tag_secret = [3u8; 32];
         let tag1 = generate_resonance_tag(&tag_secret, 1, 100);
@@ -374,6 +588,53 @@ mod tests {
         assert_eq!(keys1.session_key, keys2.session_key);
         assert_eq!(keys1.tag_secret, keys2.tag_secret);
         assert_eq!(keys1.prng_seed, keys2.prng_seed);
+    }
+
+    #[test]
+    fn test_directional_peer_keys_mirror_across_roles() {
+        let shared = [0x55u8; 32];
+        // "a" < "b": a is the client role, b is the server role.
+        let (a_send, a_recv) = derive_directional_peer_keys(&shared, "a:443", "b:443").unwrap();
+        let (b_send, b_recv) = derive_directional_peer_keys(&shared, "b:443", "a:443").unwrap();
+
+        // Each side's send key is the other side's recv key.
+        assert_eq!(a_send, b_recv);
+        assert_eq!(b_send, a_recv);
+        // The two directions never share a key.
+        assert_ne!(a_send, b_send);
+        // And neither equals the raw shared key.
+        assert_ne!(a_send, shared);
+        assert_ne!(b_send, shared);
+    }
+
+    #[test]
+    fn test_directional_peer_keys_bound_to_pair() {
+        let shared = [0x66u8; 32];
+        // Same role (client) on two different links must yield different keys,
+        // otherwise two "client" senders in a 3-node pool would collide.
+        let (ab_send, _) = derive_directional_peer_keys(&shared, "a", "b").unwrap();
+        let (ac_send, _) = derive_directional_peer_keys(&shared, "a", "c").unwrap();
+        assert_ne!(ab_send, ac_send);
+    }
+
+    #[test]
+    fn test_directional_peer_keys_equal_ids_fail_closed() {
+        // Equal ids would collapse both directions onto one key with both
+        // counters starting near the same value → (key, nonce) reuse. The
+        // primitive must refuse at runtime, not just debug_assert.
+        let shared = [0x88u8; 32];
+        assert!(derive_directional_peer_keys(&shared, "node-1", "node-1").is_err());
+        assert!(derive_directional_peer_keys(&shared, "", "").is_err());
+    }
+
+    #[test]
+    fn test_directional_peer_keys_length_prefix_disambiguates() {
+        let shared = [0x77u8; 32];
+        // ("ab","c") vs ("a","bc") concatenate to the same bytes — the length
+        // prefix must keep them distinct.
+        let (k1, _) = derive_directional_peer_keys(&shared, "ab", "c").unwrap();
+        let (k2, _) = derive_directional_peer_keys(&shared, "a", "bc").unwrap();
+        assert_ne!(k1, k2);
     }
 
     #[test]

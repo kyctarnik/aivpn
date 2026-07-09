@@ -24,8 +24,12 @@ typedef uint64_t __u64;
 #endif
 
 /* Module API version returned by AIVPN_IOC_GET_VERSION.
- * Increment when any ioctl struct or semantic changes. */
-#define AIVPN_MODULE_API_VERSION  2U
+ * Increment when any ioctl struct or semantic changes.
+ * v3: aivpn_session_add carries tag_offset + mdh_len (Variant A wire layout).
+ * v4: aivpn_session_add carries session_key_s2c (directional downlink key).
+ * v5: adds AIVPN_IOC_SESSION_DOWNLINK (reserved counter block + MDH template)
+ *     and AIVPN_IOC_SET_EGRESS (kernel-side downlink encrypt egress hook). */
+#define AIVPN_MODULE_API_VERSION  5U
 
 /* ioctl magic byte */
 #define AIVPN_MAGIC  0xAE
@@ -37,11 +41,23 @@ typedef uint64_t __u64;
 /**
  * struct aivpn_session_add - payload for AIVPN_IOC_SESSION_ADD
  *
- * @session_id:   16-byte opaque session identifier (matches Rust [u8;16])
- * @session_key:  32-byte ChaCha20-Poly1305 symmetric key
+ * @session_id:      16-byte opaque session identifier (matches Rust [u8;16])
+ * @session_key:     32-byte ChaCha20-Poly1305 key for the client->server (c2s)
+ *                   uplink the kernel decrypts.
+ * @session_key_s2c: 32-byte ChaCha20-Poly1305 key for the server->client (s2c)
+ *                   downlink direction (used by kernel downlink encryption).
  * @tag_secret:   32-byte BLAKE3 secret used to derive resonance tags
- * @nonce_suffix:  4-byte static per-session nonce suffix (bytes 8-11 of the 12-byte nonce)
- *                 Only the first 4 bytes are used; remaining 28 bytes reserved.
+ * @nonce_suffix:  bytes 8-11 of the 12-byte ChaCha20 nonce. The current AIVPN
+ *                 protocol builds the nonce as counter_LE(8) || zeros(4), so
+ *                 user-space MUST pass all zeros here; the field exists only so
+ *                 a future protocol revision can introduce a real suffix without
+ *                 an ABI change.
+ * @tag_offset:   Variant A wire layout selector. u16::MAX (0xFFFF) = legacy
+ *                (8-byte resonance tag prefixed at packet offset 0, ciphertext
+ *                at TAG_SIZE + mdh_len). Otherwise the tag is embedded inside
+ *                the mimic header at byte offset @tag_offset and the ciphertext
+ *                starts at @mdh_len (no separate prefix).
+ * @mdh_len:      mimic-header length in bytes (ciphertext-offset basis).
  * @counter_base: initial send counter value (little-endian u64)
  * @client_ip:    VPN IPv4 address assigned to this client (network byte order)
  * @client_addr:  28-byte sockaddr_storage holding UDP peer address
@@ -49,10 +65,13 @@ typedef uint64_t __u64;
  */
 struct aivpn_session_add {
 	__u8  session_id[16];
-	__u8  session_key[32];
+	__u8  session_key[32];     /* c2s uplink key */
+	__u8  session_key_s2c[32]; /* s2c downlink key */
 	__u8  tag_secret[32];
-	__u8  nonce_suffix[4]; /* bytes 8-11 of the 12-byte ChaCha20 nonce; 28 bytes reserved */
-	__u8  _reserved[28];
+	__u8  nonce_suffix[4]; /* bytes 8-11 of the 12-byte ChaCha20 nonce */
+	__u16 tag_offset;      /* Variant A: u16::MAX = legacy prefix; else embedded */
+	__u16 mdh_len;         /* mimic-header length (ciphertext offset basis) */
+	__u8  _reserved[24];
 	__u64 counter_base;
 	__u32 client_ip;
 	__u8  client_addr[28];
@@ -140,6 +159,61 @@ struct aivpn_session_update_tags {
 	struct aivpn_tag_window_entry entries[AIVPN_TAG_WINDOW_SLOTS];
 } __attribute__((packed));
 
+/* Maximum MDH (mask header) bytes the kernel downlink path carries inline.
+ * Real masks use short headers (DNS/QUIC/WebRTC, well under this); a session
+ * whose MDH exceeds this simply is not armed for kernel downlink and its
+ * server->client traffic keeps flowing through the user-space path. */
+#define AIVPN_DL_MDH_MAX  64
+
+/**
+ * struct aivpn_session_downlink - payload for AIVPN_IOC_SESSION_DOWNLINK
+ *
+ * Arms (or refreshes) the kernel downlink (server->client) fast path for a
+ * session. User-space RESERVES a contiguous block of downlink send-counters
+ * exclusively for the kernel (advancing its own send_counter past the block so
+ * it can never emit any counter in it), pre-computes the BLAKE3 resonance tag
+ * for each reserved counter, and hands the block plus the mask-derived MDH
+ * template to the kernel here. The kernel consumes the entries strictly one per
+ * packet; when the block is exhausted it stops accelerating and the packet
+ * falls back to user-space (which uses fresh, higher counters). Because every
+ * counter value has exactly one owner, no (s2c-key, nonce) pair is ever reused.
+ *
+ * @session_id: identifies the session to arm.
+ * @mdh_len:    valid bytes in @mdh (<= AIVPN_DL_MDH_MAX). 0 = no MDH.
+ * @seq_base:   starting inner-header seq_num; the kernel increments per packet.
+ * @count:      number of reserved (tag,counter) entries (<= AIVPN_TAG_WINDOW_SLOTS).
+ * @mdh:        mask-derived downlink header template prepended after the tag.
+ * @entries:    reserved (resonance_tag, counter) pairs, ascending by counter.
+ */
+struct aivpn_session_downlink {
+	__u8  session_id[16];
+	__u16 mdh_len;
+	__u16 seq_base;
+	__u32 count;
+	__u8  mdh[AIVPN_DL_MDH_MAX];
+	struct aivpn_tag_window_entry entries[AIVPN_TAG_WINDOW_SLOTS];
+} __attribute__((packed));
+
+/**
+ * struct aivpn_set_egress - payload for AIVPN_IOC_SET_EGRESS
+ *
+ * Enables or disables the kernel downlink egress hook. When enabled the module
+ * registers a netfilter LOCAL_OUT hook that intercepts packets routed toward a
+ * kernel-known client VPN IP, encrypts them with the session's s2c key using a
+ * reserved counter (see AIVPN_IOC_SESSION_DOWNLINK), and transmits them from
+ * @udp_fd to the client. Packets for sessions not armed for downlink (or with
+ * an exhausted counter block) pass through untouched to the user-space path.
+ *
+ * @udp_fd:      server UDP socket the downlink datagrams are transmitted from.
+ * @tun_ifindex: TUN ifindex whose egress is intercepted (0 = match on dst IP only).
+ * @enable:      1 = register the hook; 0 = unregister it.
+ */
+struct aivpn_set_egress {
+	__u32 udp_fd;
+	__u32 tun_ifindex;
+	__u32 enable;
+} __attribute__((packed));
+
 /* ------------------------------------------------------------------ *
  *  ioctl commands                                                      *
  * ------------------------------------------------------------------ */
@@ -167,5 +241,11 @@ struct aivpn_session_update_tags {
 
 /** Push a batch of (tag, counter) pairs so the kernel can route packets */
 #define AIVPN_IOC_SESSION_UPDATE_TAGS  _IOW(AIVPN_MAGIC, 8, struct aivpn_session_update_tags)
+
+/** Arm/refresh the kernel downlink fast path (reserved counter block + MDH) */
+#define AIVPN_IOC_SESSION_DOWNLINK     _IOW(AIVPN_MAGIC, 9, struct aivpn_session_downlink)
+
+/** Enable/disable the kernel downlink egress hook */
+#define AIVPN_IOC_SET_EGRESS           _IOW(AIVPN_MAGIC, 10, struct aivpn_set_egress)
 
 #endif /* _UAPI_AIVPN_H */

@@ -93,12 +93,12 @@ impl FecRepair {
     /// Recover a missing packet given the XOR of all received siblings.
     pub fn recover(&self, received_xor: &[u8]) -> Vec<u8> {
         let len = self.xor_data.len().max(received_xor.len());
-        let mut out = vec![0u8; len];
-        for i in 0..len {
-            out[i] = self.xor_data.get(i).copied().unwrap_or(0)
-                ^ received_xor.get(i).copied().unwrap_or(0);
-        }
-        out
+        (0..len)
+            .map(|i| {
+                self.xor_data.get(i).copied().unwrap_or(0)
+                    ^ received_xor.get(i).copied().unwrap_or(0)
+            })
+            .collect()
     }
 }
 

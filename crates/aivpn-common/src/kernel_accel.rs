@@ -24,7 +24,7 @@ const fn io_(nr: u64) -> u64 {
     (MAGIC << 8) | nr
 }
 
-const IOC_SESSION_ADD: u64 = iow(1, 160);
+const IOC_SESSION_ADD: u64 = iow(1, 192);
 const IOC_SESSION_DEL: u64 = iow(2, 16);
 #[allow(dead_code)]
 const IOC_SESSION_STAT: u64 = iowr(3, 52);
@@ -33,19 +33,38 @@ const IOC_SET_UDP_SOCK: u64 = iow(5, 4);
 const IOC_FLUSH: u64 = io_(6);
 const IOC_GET_VERSION: u64 = ior(7, 4);
 const IOC_SESSION_UPDATE_TAGS: u64 = iow(8, 4116);
+const IOC_SESSION_DOWNLINK: u64 = iow(9, 4184);
+const IOC_SET_EGRESS: u64 = iow(10, 12);
 
-pub const API_VERSION: u32 = 2;
+pub const API_VERSION: u32 = 5;
+
+/// Max MDH (mask header) bytes the kernel downlink path carries inline. Must
+/// match `AIVPN_DL_MDH_MAX` in include/uapi/aivpn.h. A session whose downlink
+/// MDH exceeds this is simply not armed for kernel downlink.
+pub const DL_MDH_MAX: usize = 64;
 
 // ── Wire structs (packed, matching C structs in include/uapi/aivpn.h) ─────────
 
-/// Payload for AIVPN_IOC_SESSION_ADD (160 bytes).
+/// Payload for AIVPN_IOC_SESSION_ADD (192 bytes).
+///
+/// `session_key` is the c2s (uplink) key the kernel decrypts; `session_key_s2c`
+/// is the s2c (downlink) key used by kernel downlink encryption.
+///
+/// `tag_offset`/`mdh_len` select the Variant A wire layout so the kernel can
+/// locate the resonance tag and the ciphertext start: `tag_offset == u16::MAX`
+/// means legacy (tag prefixed at offset 0, ciphertext at `TAG_SIZE + mdh_len`);
+/// any other value means the tag is embedded at that header byte offset and the
+/// ciphertext starts at `mdh_len`.
 #[repr(C, packed)]
 pub struct SessionAdd {
     pub session_id: [u8; 16],
-    pub session_key: [u8; 32],
+    pub session_key: [u8; 32],     // c2s uplink key
+    pub session_key_s2c: [u8; 32], // s2c downlink key
     pub tag_secret: [u8; 32],
     pub nonce_suffix: [u8; 4], // bytes 8-11 of the 12-byte ChaCha20 nonce
-    pub _reserved: [u8; 28],
+    pub tag_offset: u16,
+    pub mdh_len: u16,
+    pub _reserved: [u8; 24],
     pub counter_base: u64,
     pub client_ip: u32,
     pub client_addr: [u8; 28],
@@ -68,6 +87,42 @@ pub struct UpdateTagsPayload {
     pub count: u32,
     pub entries: [TagWindowEntry; 256],
 }
+
+/// Payload for AIVPN_IOC_SESSION_DOWNLINK (4184 bytes).
+///
+/// Arms/refreshes the kernel downlink fast path: `entries` are a block of
+/// (tag, counter) pairs the server has RESERVED exclusively for the kernel by
+/// advancing its own `send_counter` past them, so the kernel can use each
+/// counter as an s2c AEAD nonce with no risk of colliding with a user-space
+/// downlink packet. `mdh`/`mdh_len` carry the mask header the kernel prepends.
+#[repr(C, packed)]
+#[derive(Copy, Clone)]
+pub struct SessionDownlink {
+    pub session_id: [u8; 16],
+    pub mdh_len: u16,
+    pub seq_base: u16,
+    pub count: u32,
+    pub mdh: [u8; DL_MDH_MAX],
+    pub entries: [TagWindowEntry; 256],
+}
+
+/// Payload for AIVPN_IOC_SET_EGRESS (12 bytes).
+#[repr(C, packed)]
+#[derive(Copy, Clone)]
+pub struct SetEgress {
+    pub udp_fd: u32,
+    pub tun_ifindex: u32,
+    pub enable: u32,
+}
+
+// The ioctl numbers above bake in the packed struct sizes; a field change that
+// altered these would silently corrupt every ioctl. Pin them at compile time.
+const _: () = {
+    assert!(std::mem::size_of::<SessionAdd>() == 192);
+    assert!(std::mem::size_of::<UpdateTagsPayload>() == 4116);
+    assert!(std::mem::size_of::<SessionDownlink>() == 4184);
+    assert!(std::mem::size_of::<SetEgress>() == 12);
+};
 
 // ── KernelAccel handle ────────────────────────────────────────────────────────
 
@@ -109,8 +164,14 @@ impl KernelAccel {
     }
 
     pub fn api_version(&self) -> io::Result<u32> {
-        let v: u32 = 0;
-        ioctl_ref(self.fd(), IOC_GET_VERSION, &v)?;
+        // The kernel WRITES the version into this word (IOC_GET_VERSION is an
+        // _IOR). It must be `mut` and passed through a `*mut` pointer: with an
+        // immutable `let v` + `&v as *const`, release-mode LLVM is free to
+        // assume `v` never changes across the opaque ioctl call and constant-
+        // fold the return to the initializer (0), which silently reported an API
+        // mismatch and disabled kernel acceleration in optimized builds.
+        let mut v: u32 = 0;
+        ioctl_mut(self.fd(), IOC_GET_VERSION, &mut v)?;
         Ok(v)
     }
 
@@ -129,6 +190,26 @@ impl KernelAccel {
     /// Remove a session by its 16-byte session_id.
     pub fn session_remove(&self, session_id: &[u8; 16]) -> io::Result<()> {
         ioctl_ref(self.fd(), IOC_SESSION_DEL, session_id)?;
+        Ok(())
+    }
+
+    /// Arm (or refresh) the kernel downlink fast path for a session with a
+    /// reserved counter block + MDH template.
+    pub fn session_downlink(&self, dl: &SessionDownlink) -> io::Result<()> {
+        ioctl_ref(self.fd(), IOC_SESSION_DOWNLINK, dl)?;
+        Ok(())
+    }
+
+    /// Enable or disable the kernel downlink egress hook. `udp_fd` is the server
+    /// UDP socket downlink datagrams are transmitted from; `tun_ifindex` scopes
+    /// interception to that TUN device (0 = match on dst IP only).
+    pub fn set_egress(&self, udp_fd: RawFd, tun_ifindex: u32, enable: bool) -> io::Result<()> {
+        let payload = SetEgress {
+            udp_fd: udp_fd as u32,
+            tun_ifindex,
+            enable: enable as u32,
+        };
+        ioctl_ref(self.fd(), IOC_SET_EGRESS, &payload)?;
         Ok(())
     }
 
@@ -345,6 +426,19 @@ fn bpf_map_update_u64(map_fd: i32, key: u32, value: u64) -> io::Result<()> {
 
 fn ioctl_ref<T>(fd: RawFd, cmd: u64, arg: &T) -> io::Result<i32> {
     let ret = unsafe { libc::ioctl(fd, cmd as _, arg as *const T) };
+    if ret < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(ret)
+    }
+}
+
+/// Like [`ioctl_ref`] but for ioctls where the kernel WRITES back into `arg`
+/// (an `_IOR`/`_IOWR`). Passing a `*mut` from a `&mut` forces the optimizer to
+/// treat the value as clobbered by the call and reload it afterwards; a
+/// `*const` from `&` would let LLVM keep a stale copy in optimized builds.
+fn ioctl_mut<T>(fd: RawFd, cmd: u64, arg: &mut T) -> io::Result<i32> {
+    let ret = unsafe { libc::ioctl(fd, cmd as _, arg as *mut T) };
     if ret < 0 {
         Err(io::Error::last_os_error())
     } else {

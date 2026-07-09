@@ -77,12 +77,21 @@ async fn spawn_server_with_key(
     let db_clone = db.clone();
     let path_clone = socket_path.clone();
     tokio::spawn(async move {
-        management_api::serve(
-            Some(db_clone),
-            Some(path_clone),
+        management_api::serve(management_api::ServeConfig {
+            db: Some(db_clone),
+            socket_path: Some(path_clone),
             server_pub_key,
             server_addr,
-        )
+            config_path: None,
+            clients_db_path: None,
+            mask_dir: std::env::temp_dir(),
+            audit_log_path: None,
+            bootstrap_descriptors: None,
+            mask_operator_pubkey: None,
+            mask_verify_mode: aivpn_common::mask::MaskVerifyMode::default(),
+            #[cfg(feature = "metrics")]
+            metrics: None,
+        })
         .await;
     });
 

@@ -72,22 +72,27 @@ pub fn store_descriptor(descriptor: BootstrapDescriptor) -> Result<()> {
 
     let dir = cache_dir();
     fs::create_dir_all(&dir).map_err(Error::Io)?;
+    // Lock the cache directory to the owner (0700). This matters most on the
+    // no-$HOME fallback to a shared, predictable /tmp/aivpn path: without it a
+    // local attacker could pre-create or symlink the directory and plant
+    // bootstrap descriptors (which select the initial mask, and are stored
+    // without signature verification when no signing key is configured). Owner
+    // dirs like ~/.aivpn are equally fine at 0700.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
+    }
     let json = serde_json::to_string_pretty(&cache)
         .map_err(|e| Error::Session(format!("Failed to serialize bootstrap cache: {}", e)))?;
-    fs::write(cache_path(), json).map_err(Error::Io)
+    let final_path = cache_path();
+    let tmp_path = final_path.with_extension("tmp");
+    fs::write(&tmp_path, json).map_err(Error::Io)?;
+    fs::rename(&tmp_path, &final_path).map_err(Error::Io)
 }
 
-/// Store a bootstrap descriptor after verifying its ed25519 signature.
-///
-/// `trusted_key` should be the operator's ed25519 signing public key. When `Some`, the
-/// signature is verified and unsigned/invalid descriptors are rejected. When `None` the
-/// descriptor is stored without signature verification — callers must only pass `None` in
-/// development/test contexts where a signing key is not yet available.
-///
-/// TODO(production-secure): all call sites should supply the operator signing key once
-/// a dedicated ed25519 signing keypair is added to the connection-key format.
-pub fn store_verified_descriptor(
-    descriptor: BootstrapDescriptor,
+fn validate_descriptor_signature(
+    descriptor: &BootstrapDescriptor,
     trusted_key: Option<&[u8; 32]>,
 ) -> Result<()> {
     let sig_is_zero = descriptor.signature == [0u8; 64];
@@ -120,16 +125,56 @@ pub fn store_verified_descriptor(
         }
     }
 
+    Ok(())
+}
+
+/// Store a bootstrap descriptor after verifying its ed25519 signature.
+///
+/// `trusted_key` should be the operator's ed25519 signing public key. When `Some`, the
+/// signature is verified and unsigned/invalid descriptors are rejected. When `None` the
+/// descriptor is stored without signature verification — callers must only pass `None` in
+/// development/test contexts where a signing key is not yet available.
+///
+/// TODO(production-secure): all call sites should supply the operator signing key once
+/// a dedicated ed25519 signing keypair is added to the connection-key format.
+pub fn store_verified_descriptor(
+    descriptor: BootstrapDescriptor,
+    trusted_key: Option<&[u8; 32]>,
+) -> Result<()> {
+    validate_descriptor_signature(&descriptor, trusted_key)?;
     store_descriptor(descriptor)
 }
 
-pub async fn refresh_from_urls(urls: &[String]) -> usize {
+pub async fn refresh_from_urls(urls: &[String], signing_key: Option<&[u8; 32]>) -> usize {
+    // Descriptors fetched from CDN/GitHub/Telegram travel over unauthenticated
+    // transport, so without an operator signing key we cannot tell a genuine
+    // descriptor from one planted by whoever controls the URL/asset — a
+    // cache-poisoning vector that could steer the client onto an attacker's
+    // initial mask. Refuse to fetch-and-store any network descriptor unless a
+    // trusted key is configured to verify its signature. (The session-delivered
+    // descriptor path is already authenticated by the AEAD channel and is
+    // unaffected.)
+    if signing_key.is_none() {
+        tracing::warn!(
+            "Bootstrap URL refresh skipped: no operator signing key configured — \
+             network-fetched descriptors cannot be authenticated (set a server \
+             signing key to enable URL bootstrap)"
+        );
+        return 0;
+    }
+
     let mut stored = 0usize;
     for url in urls {
+        // Same SSRF guard as the active loader channels: these URLs come from
+        // the connection key / config, i.e. they are attacker-influenceable.
+        if let Err(e) = crate::bootstrap_loader::validate_bootstrap_url(url) {
+            tracing::warn!("Bootstrap descriptor URL rejected: {}", e);
+            continue;
+        }
         let Ok(response) = reqwest::get(url).await else {
             continue;
         };
-        let Ok(body) = response.text().await else {
+        let Ok(body) = crate::bootstrap_loader::read_body_capped(response).await else {
             continue;
         };
 
@@ -146,7 +191,7 @@ pub async fn refresh_from_urls(urls: &[String]) -> usize {
         };
 
         for descriptor in descriptors {
-            if store_verified_descriptor(descriptor, None).is_ok() {
+            if store_verified_descriptor(descriptor, signing_key).is_ok() {
                 stored += 1;
             }
         }
@@ -159,15 +204,8 @@ mod tests {
     use super::*;
     use aivpn_common::mask::BootstrapDescriptor;
 
-    #[test]
-    fn test_store_verified_descriptor_validation() {
-        // Temporarily override HOME env var to prevent overwriting active cache
-        let old_home = std::env::var("HOME").ok();
-        let temp_dir = std::env::temp_dir().join("aivpn_test_cache");
-        let _ = std::fs::create_dir_all(&temp_dir);
-        std::env::set_var("HOME", &temp_dir);
-
-        let mut desc = BootstrapDescriptor {
+    fn make_desc() -> BootstrapDescriptor {
+        BootstrapDescriptor {
             descriptor_id: "test_desc".to_string(),
             version: 1,
             created_at: 0,
@@ -177,15 +215,19 @@ mod tests {
             candidate_count: 1,
             kdf_salt: [0u8; 32],
             signature: [0u8; 64],
-        };
+        }
+    }
+
+    #[test]
+    fn test_descriptor_signature_validation() {
+        let mut desc = make_desc();
 
         // 1. None trusted key -> should succeed even with zero signature
-        let res = store_verified_descriptor(desc.clone(), None);
-        assert!(res.is_ok());
+        assert!(validate_descriptor_signature(&desc, None).is_ok());
 
-        // 2. Some trusted key, zero signature -> should fail under our fix!
+        // 2. Some trusted key, zero signature -> should fail
         let dummy_key = [0u8; 32];
-        let res = store_verified_descriptor(desc.clone(), Some(&dummy_key));
+        let res = validate_descriptor_signature(&desc, Some(&dummy_key));
         assert!(res.is_err());
         if let Err(e) = res {
             assert!(e.to_string().contains("no signature") || e.to_string().contains("all-zero"));
@@ -193,15 +235,7 @@ mod tests {
 
         // 3. Some trusted key, non-zero invalid signature -> should fail
         desc.signature = [1u8; 64];
-        let res = store_verified_descriptor(desc.clone(), Some(&dummy_key));
+        let res = validate_descriptor_signature(&desc, Some(&dummy_key));
         assert!(res.is_err());
-
-        // Clean up environment and temp files
-        if let Some(h) = old_home {
-            std::env::set_var("HOME", h);
-        } else {
-            std::env::remove_var("HOME");
-        }
-        let _ = std::fs::remove_dir_all(temp_dir);
     }
 }

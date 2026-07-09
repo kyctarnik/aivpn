@@ -51,6 +51,10 @@ class LocalizationManager: ObservableObject {
             "en": "Port:",
             "ru": "Порт:"
         ],
+        "proxy_port_invalid": [
+            "en": "Proxy port must be a number above 1024",
+            "ru": "Порт прокси должен быть числом больше 1024"
+        ],
         "connect": [
             "en": "Connect",
             "ru": "Подключить"
@@ -110,6 +114,10 @@ class LocalizationManager: ObservableObject {
         "duplicate_key": [
             "en": "This key already exists",
             "ru": "Этот ключ уже существует"
+        ],
+        "error_invalid_key": [
+            "en": "Invalid connection key format",
+            "ru": "Неверный формат ключа подключения"
         ],
         "delete_key_confirm": [
             "en": "Delete Key?",
@@ -261,7 +269,7 @@ class LocalizationManager: ObservableObject {
         ],
         "dns_proxy_help": [
             "en": "Local address for DNS leak prevention proxy. Leave empty to disable. Point your resolver here after connecting.",
-            "ru": "Локальный адрес DNS-прокси для предотвращения утечек. Оставьте пустым для отключения. После подключения укажите эот адрес в настройках резолвера."
+            "ru": "Локальный адрес DNS-прокси для предотвращения утечек. Оставьте пустым для отключения. После подключения укажите этот адрес в настройках резолвера."
         ],
         "exclude_routes_label": [
             "en": "Exclude routes (split tunnel)",
@@ -286,6 +294,146 @@ class LocalizationManager: ObservableObject {
         "kill_switch_help": [
             "en": "Block all non-VPN traffic while connected. Rules persist after unexpected process death.",
             "ru": "Блокировать весь трафик вне VPN. Правила сохраняются после аварийного завершения."
+        ],
+        "notification_connected": [
+            "en": "AIVPN Connected",
+            "ru": "AIVPN подключено"
+        ],
+        "notification_disconnected": [
+            "en": "AIVPN Disconnected",
+            "ru": "AIVPN отключено"
+        ],
+        "fec_badge": [
+            "en": "FEC",
+            "ru": "FEC"
+        ],
+        "connect_on_launch": [
+            "en": "Connect on launch",
+            "ru": "Запускать при входе"
+        ],
+        "connect_on_launch_help": [
+            "en": "Start AIVPN automatically when you log in",
+            "ru": "Автоматически запускать AIVPN при входе в систему"
+        ],
+        "mask_profile": [
+            "en": "Mask Profile",
+            "ru": "Профиль маски"
+        ],
+        "mask_auto": [
+            "en": "Auto",
+            "ru": "Авто"
+        ],
+        "mask_auto_marker": [
+            "en": " (auto)",
+            "ru": " (авто)"
+        ],
+        "mask_profile_help": [
+            "en": "Traffic mimicry profile. Auto lets the server choose the best mask.",
+            "ru": "Профиль маскировки трафика. Авто — сервер выбирает маску автоматически."
+        ],
+        "theme": [
+            "en": "Theme",
+            "ru": "Тема"
+        ],
+        "theme_help": [
+            "en": "Choose System to follow macOS appearance, or force Light/Dark.",
+            "ru": "«Система» — следовать оформлению macOS, либо принудительно Светлая/Тёмная."
+        ],
+        "theme_system": [
+            "en": "System",
+            "ru": "Система"
+        ],
+        "theme_light": [
+            "en": "Light",
+            "ru": "Светлая"
+        ],
+        "theme_dark": [
+            "en": "Dark",
+            "ru": "Тёмная"
+        ],
+        "bootstrap_advanced_label": [
+            "en": "Advanced: bootstrap discovery",
+            "ru": "Дополнительно: обнаружение сервера"
+        ],
+        "bootstrap_advanced_hint": [
+            "en": "For operators only. Lets the client find a working server/mask via signed CDN/Telegram/GitHub channels when you don't have a working aivpn:// key yet. Leave empty if you already have a key.",
+            "ru": "Только для операторов. Позволяет клиенту найти рабочий сервер/маску через подписанные каналы CDN/Telegram/GitHub, если рабочего ключа aivpn:// ещё нет. Оставьте пустым, если ключ уже есть."
+        ],
+        "bootstrap_cdn_url": [
+            "en": "CDN bootstrap URL",
+            "ru": "CDN URL для bootstrap"
+        ],
+        "bootstrap_cdn_url_help": [
+            "en": "HTTPS URL serving a signed bootstrap descriptor (multi-channel distribution).",
+            "ru": "HTTPS-адрес, отдающий подписанный bootstrap-дескриптор (мультиканальное распространение)."
+        ],
+        "bootstrap_telegram_token": [
+            "en": "Telegram bootstrap bot token",
+            "ru": "Токен Telegram-бота для bootstrap"
+        ],
+        "bootstrap_telegram_token_help": [
+            "en": "Telegram bot token that publishes signed bootstrap descriptors.",
+            "ru": "Токен Telegram-бота, публикующего подписанные bootstrap-дескрипторы."
+        ],
+        "bootstrap_telegram_chat": [
+            "en": "Telegram bootstrap chat/channel ID (optional)",
+            "ru": "ID чата/канала Telegram для bootstrap (необязательно)"
+        ],
+        "bootstrap_telegram_chat_help": [
+            "en": "Optional chat or channel ID the bootstrap bot publishes descriptors to.",
+            "ru": "Необязательный ID чата или канала, в который бот публикует bootstrap-дескрипторы."
+        ],
+        "bootstrap_github": [
+            "en": "GitHub bootstrap repo (e.g. owner/repo)",
+            "ru": "GitHub-репозиторий для bootstrap (например owner/repo)"
+        ],
+        "bootstrap_github_help": [
+            "en": "GitHub repository publishing signed bootstrap descriptors as releases/files.",
+            "ru": "GitHub-репозиторий, публикующий подписанные bootstrap-дескрипторы (релизы/файлы)."
+        ],
+        "server_signing_key": [
+            "en": "Server signing public key (base64)",
+            "ru": "Публичный ключ подписи сервера (base64)"
+        ],
+        "server_signing_key_help": [
+            "en": "Ed25519 public key used to verify bootstrap descriptor signatures. Required for bootstrap discovery to be trusted.",
+            "ru": "Публичный ключ Ed25519 для проверки подписи bootstrap-дескриптора. Требуется, чтобы обнаружение сервера считалось доверенным."
+        ],
+        "polymorphic_mask": [
+            "en": "Polymorphic (per-session unique shape)",
+            "ru": "Полиморфизм (уникальная форма на сессию)"
+        ],
+        "polymorphic_mask_help": [
+            "en": "Generates a unique traffic shape variant of the selected mask for every session, making DPI fingerprinting harder. Requires a specific mask (not Auto).",
+            "ru": "Генерирует уникальный вариант формы трафика выбранной маски для каждой сессии, усложняя её распознавание DPI. Требует конкретную маску (не Авто)."
+        ],
+        "mask_feedback_section": [
+            "en": "Crowdsourced mask feedback",
+            "ru": "Коллективная обратная связь по маскам"
+        ],
+        "share_mask_feedback": [
+            "en": "Share blocked-mask feedback",
+            "ru": "Делиться данными о заблокированных масках"
+        ],
+        "share_mask_feedback_help": [
+            "en": "Anonymously report when a mask gets blocked by DPI, helping other users avoid it.",
+            "ru": "Анонимно сообщать о блокировке маски DPI, помогая другим пользователям её избегать."
+        ],
+        "receive_mask_hints": [
+            "en": "Receive mask hints for my region",
+            "ru": "Получать подсказки по маскам для моего региона"
+        ],
+        "receive_mask_hints_help": [
+            "en": "Use crowdsourced feedback from other users to prefer masks that currently work well in your region.",
+            "ru": "Использовать коллективные данные других пользователей для выбора масок, которые сейчас хорошо работают в вашем регионе."
+        ],
+        "country_code_placeholder": [
+            "en": "Country code (e.g. RU)",
+            "ru": "Код страны (например RU)"
+        ],
+        "country_code_help": [
+            "en": "ISO 3166-1 alpha-2 country code (2 letters), used only for regional mask hints. Leave empty to disable.",
+            "ru": "Код страны ISO 3166-1 alpha-2 (2 буквы), используется только для региональных подсказок по маскам. Оставьте пустым для отключения."
         ],
     ]
 

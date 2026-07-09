@@ -16,14 +16,18 @@
     <key>KeepAlive</key>
     <true/>
 
-    <key>WorkingDirectory</key>
-    <string>/var/run/aivpn</string>
-
+    <!-- NOTE: never point WorkingDirectory or Standard*Path at /var/run/aivpn.
+         /var/run is cleared on every reboot, and launchd does NOT create missing
+         parent directories for these paths (it only creates the log *file*, and
+         WorkingDirectory is a plain chdir(2)). With the old /var/run/aivpn paths
+         the spawn failed after any reboot — job "loaded" but the helper never ran,
+         so the app perpetually showed "service unavailable". /var/log persists.
+         The helper itself recreates /var/run/aivpn for its socket on each launch. -->
     <key>StandardErrorPath</key>
-    <string>/var/run/aivpn/helper.log</string>
+    <string>/var/log/aivpn-helper.log</string>
 
     <key>StandardOutPath</key>
-    <string>/var/run/aivpn/helper.log</string>
+    <string>/var/log/aivpn-helper.log</string>
 
     <key>UserName</key>
     <string>root</string>

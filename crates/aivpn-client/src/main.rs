@@ -4,7 +4,8 @@ use aivpn_client::adaptive::{AdaptiveConfig, AdaptiveMonitor};
 use aivpn_client::bench::run_bench;
 use aivpn_client::bootstrap_cache;
 use aivpn_client::bootstrap_loader::{self, BootstrapConfig};
-use aivpn_client::client::ClientConfig;
+use aivpn_client::client::{base_mask_family, ClientConfig};
+use aivpn_client::mask_feedback_log::{MaskFeedbackLog, RegionalHintsStore};
 use aivpn_client::server_pool::{PoolMode, ServerEntry, ServerPool};
 use aivpn_client::tunnel::TunnelConfig;
 use aivpn_client::AivpnClient;
@@ -13,6 +14,7 @@ use aivpn_common::mask::preset_masks;
 use aivpn_common::mask::preset_masks::bootstrap_default;
 use aivpn_common::mask::BootstrapDescriptor;
 use aivpn_common::network_config::{ClientNetworkConfig, DEFAULT_VPN_MTU, LEGACY_SERVER_VPN_IP};
+use aivpn_common::quality::AdaptiveLevel;
 use base64::Engine;
 use clap::Parser;
 use serde::Deserialize;
@@ -37,6 +39,17 @@ pub struct ClientArgs {
     /// Server signing public key (base64, 32 bytes)
     #[arg(long)]
     pub server_signing_key: Option<String>,
+
+    /// Operator mask-verifying public key (base64, 32 bytes) — verifies the
+    /// embedded operator signature of masks pushed via MaskUpdate (R2 Phase B).
+    /// Also sourced from the config file or the `mop` field of the connection key.
+    #[arg(long)]
+    pub mask_operator_pubkey: Option<String>,
+
+    /// Mask artifact verification mode: off | warn | enforce (default: warn).
+    /// warn logs failures but accepts; enforce rejects unsigned/badly-signed masks.
+    #[arg(long)]
+    pub mask_verify_mode: Option<String>,
 
     /// Connection key (aivpn://...) — contains server, key, PSK, VPN IP
     #[arg(short = 'k', long)]
@@ -66,25 +79,25 @@ pub struct ClientArgs {
     #[arg(long)]
     pub bootstrap_cdn_url: Option<String>,
 
-    /// Telegram bot for bootstrap distribution (e.g., @aivpn_bot)
+    /// Telegram bot token for bootstrap distribution (authenticated Bot API —
+    /// required for the server's actual publish path, sendDocument, to be
+    /// retrievable at all). Prefer the env var over the flag: a CLI arg is
+    /// visible in /proc/<pid>/cmdline to every local user.
+    #[arg(long, env = "AIVPN_BOOTSTRAP_TELEGRAM_TOKEN")]
+    pub bootstrap_telegram_token: Option<String>,
+
+    /// Telegram chat/channel ID to filter updates to (optional; if the bot
+    /// is only used for bootstrap distribution, omitting this works fine)
     #[arg(long)]
-    pub bootstrap_telegram: Option<String>,
+    pub bootstrap_telegram_chat: Option<String>,
 
     /// GitHub repo for bootstrap distribution (e.g., infosave2007/aivpn)
     #[arg(long)]
     pub bootstrap_github: Option<String>,
 
-    /// IPFS hash for bootstrap distribution
-    #[arg(long)]
-    pub bootstrap_ipfs: Option<String>,
-
     /// Disable built-in bootstrap fallback (production secure mode)
     #[arg(long, default_value_t = false)]
     pub no_fallback: bool,
-
-    /// Print this device's X25519 public key (base64) and exit. Used by GUI clients.
-    #[arg(long, default_value_t = false)]
-    pub show_device_key: bool,
 
     /// Run as SOCKS5 proxy on this address instead of a TUN device (no root required).
     /// Example: --proxy-listen 127.0.0.1:1080
@@ -138,6 +151,34 @@ pub struct ClientArgs {
     /// Upstream DNS resolver used by --dns-proxy (default: 1.1.1.1:53).
     #[arg(long, value_name = "HOST:PORT", default_value = "1.1.1.1:53")]
     pub dns_upstream: String,
+
+    /// Preferred mask profile name (e.g. webrtc_zoom_v3, quic_https_v2).
+    /// When set, overrides the bootstrap-selected mask with the named built-in preset.
+    /// Has no effect if the name is not a known preset.
+    #[arg(long, value_name = "NAME")]
+    pub preferred_mask: Option<String>,
+
+    /// Request a polymorphic (per-session perturbed) variant of the named base mask
+    /// (e.g. webrtc_zoom_v3). The server derives the variant deterministically from
+    /// the session's PRNG seed and pushes it back via the normal MaskUpdate channel.
+    /// Has no effect if the name is not a known preset.
+    #[arg(long, value_name = "MASK_ID")]
+    pub polymorphic_base: Option<String>,
+
+    /// Opt in to sharing crowdsourced mask-blocking feedback with the server
+    /// (which masks worked/failed, aggregated by coarse region). Off by default.
+    #[arg(long, default_value_t = false)]
+    pub share_mask_feedback: bool,
+
+    /// Opt in to receiving server-provided "masks currently working in your
+    /// region" hints. Off by default.
+    #[arg(long, default_value_t = false)]
+    pub receive_mask_hints: bool,
+
+    /// Coarse region (ISO 3166-1 alpha-2, e.g. "DE") used only for crowdsourced
+    /// mask feedback. No finer-grained location ever leaves the client.
+    #[arg(long, value_name = "CC")]
+    pub country_code: Option<String>,
 
     #[command(subcommand)]
     pub command: Option<ClientCommand>,
@@ -194,6 +235,8 @@ struct ClientFileConfig {
     server_addr: Option<String>,
     server_public_key: Option<String>,
     server_signing_public_key: Option<String>,
+    mask_operator_pubkey: Option<String>,
+    mask_verify_mode: Option<String>,
     preshared_key: Option<String>,
     tun_name: Option<String>,
     tun_addr: Option<String>,
@@ -240,42 +283,165 @@ fn bootstrap_mask_for_psk(psk: &[u8; 32]) -> aivpn_common::mask::MaskProfile {
 
 #[tokio::main]
 async fn main() {
-    // Initialize logging — default to INFO level when RUST_LOG is not set
+    // On Windows, stderr inheritance via Stdio::from(File) is unreliable for
+    // cross-compiled (MinGW) binaries with CREATE_NO_WINDOW. Write the log
+    // directly to %LOCALAPPDATA%\AIVPN\client.log instead.
+    #[cfg(target_os = "windows")]
+    let _log_guard = {
+        let args: Vec<String> = std::env::args().collect();
+        // Only write to the persistent log file for the main VPN connection mode.
+        // Subcommands (record, bench, status, key) are short-lived GUI polls that
+        // must not truncate the VPN connection log.
+        let is_subcommand = args
+            .iter()
+            .skip(1)
+            .any(|a| matches!(a.as_str(), "record" | "bench" | "status" | "key"));
+
+        let log_path = if is_subcommand {
+            None
+        } else {
+            std::env::var_os("LOCALAPPDATA")
+                .map(|p| std::path::PathBuf::from(p).join("AIVPN").join("client.log"))
+        };
+
+        if let Some(ref path) = log_path {
+            let _ = std::fs::create_dir_all(path.parent().unwrap());
+            // Redact the connection key before logging: the value of
+            // --connection-key/-k (or any bare aivpn:// token) embeds the PSK
+            // and server keys — a reusable secret that must never land in a
+            // persistent plaintext log.
+            let redacted_args: Vec<String> = {
+                let mut out = Vec::with_capacity(args.len());
+                let mut redact_next = false;
+                for a in &args {
+                    if redact_next {
+                        redact_next = false;
+                        out.push("<redacted>".to_string());
+                    } else if a == "--connection-key" || a == "-k" {
+                        redact_next = true;
+                        out.push(a.clone());
+                    } else if a.starts_with("--connection-key=") {
+                        out.push("--connection-key=<redacted>".to_string());
+                    } else if a.contains("aivpn://") {
+                        out.push("<redacted>".to_string());
+                    } else {
+                        out.push(a.clone());
+                    }
+                }
+                out
+            };
+            // Truncate and write startup header so each connect starts fresh.
+            let _ = std::fs::write(
+                path,
+                format!(
+                    "=== aivpn-client started ===\nargs: {:?}\nfull_tunnel: {}\n",
+                    redacted_args,
+                    args.contains(&"--full-tunnel".to_string())
+                ),
+            );
+        }
+
+        let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+
+        let file = log_path.as_ref().and_then(|p| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(p)
+                .ok()
+        });
+
+        if let Some(f) = file {
+            tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_writer(std::sync::Mutex::new(f))
+                .with_ansi(false)
+                .init();
+        } else {
+            tracing_subscriber::fmt().with_env_filter(filter).init();
+        }
+        log_path // keep in scope so the subscriber lives for the whole process
+    };
+
+    #[cfg(not(target_os = "windows"))]
+    // Initialize logging — default to INFO level when RUST_LOG is not set.
+    // Writes to stderr, not stdout: `bench --json`/other structured-output
+    // subcommands print their result via `println!` to stdout, and mixing
+    // log lines into that stream corrupts the JSON a caller (e.g. the Linux
+    // GUI's diagnostics button) tries to parse — the GUI would then silently
+    // show no result at all, since serde_json::from_slice on the combined
+    // buffer just fails.
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
+        .with_writer(std::io::stderr)
         .init();
+
+    // Diagnostic for the "getcap says the capability is granted, but `ip`
+    // still gets RTNETLINK EPERM" failure mode: if this process (or an
+    // ancestor) has the kernel's no_new_privs bit set, file capabilities
+    // granted via setcap to this binary and to `ip` are silently ignored at
+    // exec time (capabilities(7); Documentation/userspace-api/no_new_privs.rst).
+    // `getcap` only inspects the on-disk xattr, so it can't detect this.
+    #[cfg(target_os = "linux")]
+    {
+        let no_new_privs = std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|s| {
+                s.lines()
+                    .find(|l| l.starts_with("NoNewPrivs:"))
+                    .map(|l| l.trim().to_string())
+            })
+            .unwrap_or_else(|| "NoNewPrivs: <unavailable>".to_string());
+        info!("{no_new_privs} (1 = file capabilities granted via setcap to this binary or to `ip` are silently voided at exec time)");
+    }
 
     // Setup Ctrl+C handler in a separate task
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_clone = shutdown.clone();
     tokio::spawn(async move {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("Failed to setup signal handler");
+        match tokio::signal::ctrl_c().await {
+            Ok(()) => {}
+            Err(e) => warn!("Ctrl+C handler error: {e}"),
+        }
         info!("Received Ctrl+C, shutting down...");
         shutdown_clone.store(true, Ordering::SeqCst);
         SHUTDOWN.store(true, Ordering::SeqCst);
     });
 
-    // Parse arguments
-    let args = ClientArgs::parse();
-
-    // Device key query — must run before anything else (no root, no network needed)
-    if args.show_device_key {
-        match aivpn_client::client::device_public_key_b64() {
-            Some(key) => {
-                println!("{}", key);
+    // Handle SIGTERM (sent by systemd, docker stop, kill) so the tunnel routes
+    // and kill-switch firewall rules are cleaned up on graceful service stop.
+    #[cfg(unix)]
+    {
+        let shutdown_sigterm = shutdown.clone();
+        tokio::spawn(async move {
+            use tokio::signal::unix::{signal, SignalKind};
+            match signal(SignalKind::terminate()) {
+                Ok(mut sig) => {
+                    sig.recv().await;
+                    info!("Received SIGTERM, shutting down...");
+                }
+                Err(e) => {
+                    warn!("SIGTERM handler setup failed: {e}");
+                    return;
+                }
             }
-            None => {
-                error!("Failed to load or generate device key");
-                std::process::exit(1);
-            }
-        }
-        return;
+            shutdown_sigterm.store(true, Ordering::SeqCst);
+            SHUTDOWN.store(true, Ordering::SeqCst);
+        });
     }
+
+    // Parse arguments
+    let mut args = ClientArgs::parse();
+    if args.connection_key.is_none() {
+        if let Ok(val) = std::env::var("AIVPN_CONNECTION_KEY") {
+            args.connection_key = Some(val);
+        }
+    }
+    std::env::remove_var("AIVPN_CONNECTION_KEY");
 
     // Handle subcommands
     if let Some(command) = args.command {
@@ -336,9 +502,11 @@ async fn main() {
                 match action {
                     RecordAction::Start { service } => {
                         aivpn_client::record_cmd::handle_recording_status(true, Some(&service));
+                        let token =
+                            aivpn_client::record_cmd::read_admin_token().unwrap_or_default();
                         match std::net::UdpSocket::bind("127.0.0.1:0").and_then(|s| {
                             s.send_to(
-                                format!("record_start:{service}").as_bytes(),
+                                format!("{token}:record_start:{service}").as_bytes(),
                                 "127.0.0.1:44301",
                             )
                             .map(|_| s)
@@ -355,9 +523,12 @@ async fn main() {
                         aivpn_client::record_cmd::mark_recording_stop_requested(
                             prior.as_ref().and_then(|status| status.service.as_deref()),
                         );
-                        match std::net::UdpSocket::bind("127.0.0.1:0")
-                            .and_then(|s| s.send_to(b"record_stop", "127.0.0.1:44301").map(|_| s))
-                        {
+                        let token =
+                            aivpn_client::record_cmd::read_admin_token().unwrap_or_default();
+                        match std::net::UdpSocket::bind("127.0.0.1:0").and_then(|s| {
+                            s.send_to(format!("{token}:record_stop").as_bytes(), "127.0.0.1:44301")
+                                .map(|_| s)
+                        }) {
                             Ok(_) => {}
                             Err(e) => eprintln!("Failed to send record command: {e}"),
                         }
@@ -368,8 +539,13 @@ async fn main() {
                         let before = aivpn_client::record_cmd::read_local_status()
                             .map(|status| status.updated_at_ms)
                             .unwrap_or(0);
+                        let token =
+                            aivpn_client::record_cmd::read_admin_token().unwrap_or_default();
                         if let Ok(socket) = std::net::UdpSocket::bind("127.0.0.1:0") {
-                            let _ = socket.send_to(b"record_status", "127.0.0.1:44301");
+                            let _ = socket.send_to(
+                                format!("{token}:record_status").as_bytes(),
+                                "127.0.0.1:44301",
+                            );
                         }
                         let start = std::time::Instant::now();
                         let mut latest = None;
@@ -565,11 +741,15 @@ async fn main() {
         info!("Server pool active: {} node(s)", pool.node_count());
     }
 
-    // Resolve effective adaptive flag: --adaptive-level N overrides bool --adaptive.
-    let adaptive_on = args
-        .adaptive_level
-        .unwrap_or(if args.adaptive { 1 } else { 0 })
-        > 0;
+    // Resolve effective adaptive level: --adaptive-level N overrides bool --adaptive.
+    // N is honored as the client's starting AdaptiveLevel (keepalive interval + FEC),
+    // not just a hint for MTU shrinkage — the quality tracker can still raise/lower it
+    // automatically from there based on observed RTT/jitter/loss.
+    let initial_adaptive_level = AdaptiveLevel::from_u8(
+        args.adaptive_level
+            .unwrap_or(if args.adaptive { 1 } else { 0 }),
+    );
+    let adaptive_on = initial_adaptive_level != AdaptiveLevel::Off;
 
     // Adaptive mode monitor
     let adaptive_monitor = AdaptiveMonitor::new(AdaptiveConfig {
@@ -577,10 +757,14 @@ async fn main() {
         ..AdaptiveConfig::default()
     });
     if adaptive_on {
-        info!("Adaptive mode enabled (auto MTU/keepalive tuning)");
+        info!(
+            "Adaptive mode enabled at level {:?} (keepalive {}s, FEC 1/{})",
+            initial_adaptive_level,
+            initial_adaptive_level.keepalive_secs(),
+            initial_adaptive_level.fec_n()
+        );
     }
     // Lower initial MTU for restrictive mobile networks (MTS, Megafon) when adaptive is on.
-    // The AdaptiveMonitor will step it down further if packet loss is detected.
     let network_config = if adaptive_on {
         aivpn_common::network_config::ClientNetworkConfig {
             mtu: network_config.mtu.min(1200),
@@ -589,6 +773,10 @@ async fn main() {
     } else {
         network_config
     };
+    // NOTE: the loss-triggered live MTU step-down was removed as a never-wired
+    // dead path — the TUN device's MTU is fixed at creation (tunnel.rs) and nothing
+    // fed real packet loss into it. Loss resilience today comes from AdaptiveLevel's
+    // score-driven keepalive + FEC redundancy instead (see quality.rs / client.rs).
     let _ = adaptive_monitor;
 
     info!("AIVPN Client v{}", env!("CARGO_PKG_VERSION"));
@@ -596,16 +784,59 @@ async fn main() {
 
     let server_public_key = decode_base64_key("server key", &server_key_b64);
 
-    // Optional ed25519 signing key for ServerHello/MaskUpdate/BootstrapDescriptor verification.
-    let server_signing_key: Option<[u8; 32]> = args
+    // Optional ed25519 signing key for ServerHello/MaskUpdate/BootstrapDescriptor
+    // verification. Sourced (in precedence order) from --server-signing-key, the
+    // config file, or the `sk` field embedded in the aivpn:// connection key — the
+    // last is the default onboarding path, so verification is now active out of
+    // the box for anyone who pastes a key from a server that embeds it.
+    let conn_signing_key_b64: Option<String> = args.connection_key.as_deref().and_then(|ck| {
+        parse_connection_key(ck)
+            .ok()
+            .and_then(|j| j.get("sk").and_then(|v| v.as_str().map(String::from)))
+    });
+    let server_signing_b64: Option<String> = args
         .server_signing_key
-        .as_deref()
+        .clone()
         .or_else(|| {
             file_config
                 .as_ref()
-                .and_then(|c| c.server_signing_public_key.as_deref())
+                .and_then(|c| c.server_signing_public_key.clone())
         })
-        .map(|b64| decode_base64_key("server signing key", b64));
+        .or(conn_signing_key_b64);
+    let server_signing_key: Option<[u8; 32]> =
+        server_signing_b64.map(|b64| decode_base64_key("server signing key", &b64));
+
+    // R2 Phase B: operator mask-verifying public key for artifact-level mask
+    // signature verification. Sourced (in precedence order) from
+    // --mask-operator-pubkey, the config file, or the `mop` field embedded in
+    // the aivpn:// connection key — mirroring the `sk` transport key above.
+    let conn_mop_b64: Option<String> = args.connection_key.as_deref().and_then(|ck| {
+        parse_connection_key(ck)
+            .ok()
+            .and_then(|j| j.get("mop").and_then(|v| v.as_str().map(String::from)))
+    });
+    let mask_operator_pubkey: Option<[u8; 32]> = args
+        .mask_operator_pubkey
+        .clone()
+        .or_else(|| {
+            file_config
+                .as_ref()
+                .and_then(|c| c.mask_operator_pubkey.clone())
+        })
+        .or(conn_mop_b64)
+        .map(|b64| decode_base64_key("mask operator pubkey", &b64));
+    let mask_verify_mode: aivpn_common::mask::MaskVerifyMode =
+        match args.mask_verify_mode.clone().or_else(|| {
+            file_config
+                .as_ref()
+                .and_then(|c| c.mask_verify_mode.clone())
+        }) {
+            None => aivpn_common::mask::MaskVerifyMode::default(),
+            Some(s) => s.parse().unwrap_or_else(|e| {
+                error!("{}", e);
+                std::process::exit(1);
+            }),
+        };
 
     // Parse PSK
     let preshared_key: Option<[u8; 32]> = psk_bytes.and_then(|v| {
@@ -620,15 +851,22 @@ async fn main() {
 
     let network_config = network_config;
 
+    if server_signing_key.is_none() {
+        warn!("No --server-signing-key provided; bootstrap descriptors accepted without signature verification");
+    }
     for descriptor in inline_descriptors {
-        if let Err(e) = bootstrap_cache::store_verified_descriptor(descriptor, None) {
+        if let Err(e) =
+            bootstrap_cache::store_verified_descriptor(descriptor, server_signing_key.as_ref())
+        {
             warn!(
                 "Failed to store bootstrap descriptor from config/key: {}",
                 e
             );
         }
     }
-    let fetched = bootstrap_cache::refresh_from_urls(&bootstrap_descriptor_urls).await;
+    let fetched =
+        bootstrap_cache::refresh_from_urls(&bootstrap_descriptor_urls, server_signing_key.as_ref())
+            .await;
     if fetched > 0 {
         info!(
             "Fetched {} bootstrap descriptor(s) from passive URLs",
@@ -641,14 +879,12 @@ async fn main() {
     if let Some(cdn_url) = &args.bootstrap_cdn_url {
         bootstrap_config = bootstrap_config.with_cdn(cdn_url, "custom");
     }
-    if let Some(telegram_bot) = &args.bootstrap_telegram {
-        bootstrap_config = bootstrap_config.with_telegram(telegram_bot);
+    if let Some(telegram_token) = &args.bootstrap_telegram_token {
+        bootstrap_config =
+            bootstrap_config.with_telegram(telegram_token, args.bootstrap_telegram_chat.clone());
     }
     if let Some(github_repo) = &args.bootstrap_github {
         bootstrap_config = bootstrap_config.with_github(github_repo, "bootstrap-");
-    }
-    if let Some(ipfs_hash) = &args.bootstrap_ipfs {
-        bootstrap_config = bootstrap_config.with_ipfs(ipfs_hash);
     }
 
     // Load from multi-channel if configured
@@ -669,10 +905,19 @@ async fn main() {
 
     let no_fallback = args.no_fallback || !bootstrap_config.channels.is_empty();
     let proxy_listen = args.proxy_listen.as_ref().map(|s| {
-        s.parse::<std::net::SocketAddr>().unwrap_or_else(|e| {
+        let addr = s.parse::<std::net::SocketAddr>().unwrap_or_else(|e| {
             error!("Invalid --proxy-listen '{}': {}", s, e);
             std::process::exit(1);
-        })
+        });
+        if !addr.ip().is_loopback() {
+            warn!(
+                "--proxy-listen {} binds to a non-loopback address; the SOCKS5 proxy has no \
+                 authentication, so anyone reachable on that interface can relay traffic \
+                 through the VPN tunnel",
+                addr
+            );
+        }
+        addr
     });
     let mtls_cert: Option<Vec<u8>> = args.mtls_cert.as_ref().map(|path| {
         let raw = std::fs::read(path).unwrap_or_else(|e| {
@@ -696,8 +941,59 @@ async fn main() {
                 })
         }
     });
-    let mut backoff = Duration::from_secs(1);
-    let max_backoff = Duration::from_secs(60);
+    let mut backoff = INITIAL_BACKOFF;
+    let max_backoff = MAX_BACKOFF;
+
+    // §2 crowdsourced blocking feedback — parse the coarse region once (shared
+    // by every reconnect iteration). Invalid codes are dropped with a warning.
+    let country_code: Option<[u8; 2]> = args.country_code.as_deref().and_then(|s| {
+        let b = s.trim().as_bytes();
+        if b.len() == 2 && b[0].is_ascii_alphabetic() && b[1].is_ascii_alphabetic() {
+            Some([b[0].to_ascii_uppercase(), b[1].to_ascii_uppercase()])
+        } else {
+            warn!(
+                "--country-code '{}' is not a 2-letter ISO 3166-1 code; ignoring it (mask feedback will omit region)",
+                s
+            );
+            None
+        }
+    });
+    // §2 L2 failure attribution — consecutive failed-attempt counts per base
+    // mask family, carried across reconnect iterations. A family is only
+    // recorded as a FAILURE once it has failed `report_failure_threshold`
+    // consecutive times (the server-pushed noise gate), then the counter
+    // resets. A successful connection clears the family's counter.
+    let mut consecutive_fails: std::collections::HashMap<String, u8> =
+        std::collections::HashMap::new();
+    // Resilience against an unmatchable cached bootstrap descriptor: count
+    // consecutive attempts that NEVER reached a connected state. A cached
+    // descriptor signed by a server whose key was rotated (or an epoch the
+    // current server no longer retains) yields a polymorphic handshake mask the
+    // server cannot reproduce → every handshake fails with a tag mismatch and
+    // the client loops forever. After this many dead handshakes we drop the
+    // descriptor-derived mask for the built-in default preset, which every
+    // server matches via its builtin candidate set. Reset on any real connect.
+    const HANDSHAKE_FALLBACK_THRESHOLD: u32 = 3;
+    let mut handshake_fail_streak: u32 = 0;
+    // Whether the user opted in to sharing outcome data (failures + successes).
+    // Recording a failure additionally requires a country code (the server
+    // aggregates per region and drops feedback without one).
+    let feedback_share_enabled = args.share_mask_feedback && country_code.is_some();
+
+    // Start DNS proxy once before the reconnect loop so it stays alive across
+    // tunnel restarts. If created inside the loop, the handle is dropped at the
+    // end of each iteration and the proxy is killed during the backoff sleep —
+    // creating a DNS leak window on every reconnect.
+    let _dns_proxy_handle = args.dns_proxy.as_deref().and_then(|bind_str| {
+        let bind_addr = bind_str.parse::<std::net::SocketAddr>().ok()?;
+        let upstream_addr = args.dns_upstream.parse::<std::net::SocketAddr>().ok()?;
+        Some(aivpn_client::dns_proxy::spawn_dns_proxy(
+            aivpn_client::dns_proxy::DnsProxyConfig {
+                listen_addr: bind_addr,
+                upstream_addr,
+            },
+        ))
+    });
 
     loop {
         if shutdown.load(Ordering::SeqCst) {
@@ -756,7 +1052,113 @@ async fn main() {
             }
         };
 
-        let include_routes: Vec<String> = if !args.include_routes.is_empty() {
+        // Resilience net (F1): after repeated handshakes that never connected,
+        // abandon the descriptor-derived mask for the built-in default preset,
+        // which every server matches. Only in builds that permit the built-in
+        // fallback bootstrap — a production-secure client must stay on signed
+        // descriptors even at the cost of availability. An explicit
+        // --preferred-mask / --polymorphic-base below still takes precedence.
+        #[cfg(not(feature = "production-secure"))]
+        let initial_mask = if !no_fallback && handshake_fail_streak >= HANDSHAKE_FALLBACK_THRESHOLD
+        {
+            warn!(
+                "{} consecutive handshakes never connected — falling back to the built-in default mask (a cached bootstrap descriptor may be unmatchable by this server, e.g. after a server-key change)",
+                handshake_fail_streak
+            );
+            bootstrap_default()
+        } else {
+            initial_mask
+        };
+
+        // Honor --preferred-mask: override with a named built-in preset when
+        // available. In polymorphic mode we deliberately leave the initial mask
+        // as the bootstrap fallback (matching every GUI) so the opening burst
+        // isn't a fingerprintable named preset — the server pushes the
+        // per-session variant via MaskUpdate one RTT later. So --polymorphic-base
+        // takes precedence and suppresses --preferred-mask.
+        let initial_mask = if args.polymorphic_base.is_some() {
+            if args.preferred_mask.is_some() {
+                warn!("--polymorphic-base set; ignoring --preferred-mask for the initial mask");
+            }
+            initial_mask
+        } else if let Some(ref name) = args.preferred_mask {
+            match aivpn_common::mask::preset_masks::by_id(name.as_str()) {
+                Some(m) => {
+                    info!("Using preferred mask '{}'", name);
+                    m
+                }
+                None => {
+                    warn!(
+                        "Preferred mask '{}' not found in built-in presets, using bootstrap selection",
+                        name
+                    );
+                    initial_mask
+                }
+            }
+        } else {
+            initial_mask
+        };
+
+        // §2 L3 — soft regional-hint bias. When the user opts in to hints and a
+        // country is set, and there is NO explicit --preferred-mask /
+        // --polymorphic-base override, softly steer the initial mask toward the
+        // preset that the server reported working best in this region. Rules
+        // that keep this SOFT and safe:
+        //   - Never overrides an explicit --preferred-mask/--polymorphic-base
+        //     (those branches above already produced a mask; this only runs in
+        //     the plain fallthrough case).
+        //   - Never runs in `no_fallback`/production-secure mode, where the
+        //     opening mask MUST be a valid signed bootstrap descriptor — biasing
+        //     it to a named preset would break bootstrap security.
+        //   - Only applies when a hinted mask is a KNOWN built-in preset with a
+        //     success score at or above `HINT_BIAS_MIN_SCORE`; otherwise the
+        //     bootstrap-selected mask is kept unchanged.
+        let initial_mask = if args.receive_mask_hints
+            && !no_fallback
+            && args.preferred_mask.is_none()
+            && args.polymorphic_base.is_none()
+        {
+            if let Some(cc) = country_code {
+                let hints = RegionalHintsStore::load_default().for_region(cc);
+                let biased = hints.into_iter().find_map(|(mask_id, score)| {
+                    if score < HINT_BIAS_MIN_SCORE {
+                        return None;
+                    }
+                    aivpn_common::mask::preset_masks::by_id(&mask_id).map(|m| (mask_id, score, m))
+                });
+                match biased {
+                    Some((mask_id, score, mask)) => {
+                        info!(
+                            "Regional hint bias: using mask '{}' (score {:.2}) for region {}{}",
+                            mask_id, score, cc[0] as char, cc[1] as char
+                        );
+                        mask
+                    }
+                    None => initial_mask,
+                }
+            } else {
+                initial_mask
+            }
+        } else {
+            initial_mask
+        };
+        // Capture the attempt's base mask family for §2 failure attribution
+        // before `initial_mask` is moved into ClientConfig below.
+        //
+        // In polymorphic mode the initial mask is deliberately the
+        // bootstrap-fallback family (so the opening burst isn't a named preset),
+        // but the mask the session actually runs is the server-pushed per-session
+        // variant of `--polymorphic-base`. Attributing a failed attempt to the
+        // fallback family would silently blame the wrong family for every §3
+        // session, defeating §2. So prefer the configured polymorphic base when
+        // set; otherwise fall back to the bootstrap/initial mask family. Kept
+        // consistent with the success path in `client.rs`.
+        let attempt_mask_family = match args.polymorphic_base.as_deref() {
+            Some(base) => base_mask_family(base),
+            None => base_mask_family(&initial_mask.mask_id),
+        };
+
+        let mut include_routes: Vec<String> = if !args.include_routes.is_empty() {
             args.include_routes.clone()
         } else {
             file_config
@@ -764,6 +1166,22 @@ async fn main() {
                 .and_then(|c| c.include_routes.clone())
                 .unwrap_or_default()
         };
+        // DNS proxy forwards queries from a fresh OS socket bound to 0.0.0.0, so
+        // without an explicit route the upstream resolver is only reachable via the
+        // tunnel when --full-tunnel is set — split-tunnel users would silently leak
+        // every DNS query out the physical interface. Add a host route for the
+        // upstream resolver so --dns-proxy actually tunnels regardless of mode.
+        if args.dns_proxy.is_some() {
+            if let Ok(upstream) = args.dns_upstream.parse::<std::net::SocketAddr>() {
+                let cidr = match upstream.ip() {
+                    std::net::IpAddr::V4(ip) => format!("{ip}/32"),
+                    std::net::IpAddr::V6(ip) => format!("{ip}/128"),
+                };
+                if !include_routes.iter().any(|r| r == &cidr) {
+                    include_routes.push(cidr);
+                }
+            }
+        }
         let exclude_routes: Vec<String> = if !args.exclude_routes.is_empty() {
             args.exclude_routes.clone()
         } else {
@@ -801,19 +1219,16 @@ async fn main() {
             tun_config,
             proxy_listen,
             mtls_cert: mtls_cert.clone(),
+            initial_adaptive_level,
+            polymorphic_base: args.polymorphic_base.clone(),
+            // §2 crowdsourced blocking feedback — opt-in, OFF unless the user
+            // explicitly enables it via CLI flags (or a GUI that passes them).
+            share_mask_feedback: args.share_mask_feedback,
+            receive_mask_hints: args.receive_mask_hints,
+            country_code,
+            mask_operator_pubkey,
+            mask_verify_mode,
         };
-
-        // Start DNS proxy before connecting so it is ready as soon as the tunnel is up.
-        let _dns_proxy_handle = args.dns_proxy.as_deref().and_then(|bind_str| {
-            let bind_addr = bind_str.parse::<std::net::SocketAddr>().ok()?;
-            let upstream_addr = args.dns_upstream.parse::<std::net::SocketAddr>().ok()?;
-            Some(aivpn_client::dns_proxy::spawn_dns_proxy(
-                aivpn_client::dns_proxy::DnsProxyConfig {
-                    listen_addr: bind_addr,
-                    upstream_addr,
-                },
-            ))
-        });
 
         match AivpnClient::new(config) {
             Ok(mut client) => {
@@ -839,11 +1254,64 @@ async fn main() {
                 }
                 aivpn_client::record_cmd::reset_local_status();
 
-                match client.run(shutdown.clone()).await {
-                    Ok(()) => break,
+                let connect_started = std::time::Instant::now();
+                let run_result = client.run(shutdown.clone()).await;
+
+                // §2 L2 failure attribution — did this attempt ever reach a
+                // connected state? An attempt that never connected is evidence
+                // the mask may be blocked; record it (subject to the consecutive
+                // threshold) so the next successful connection reports it. A
+                // successful connection clears the family's failure streak.
+                // F1 resilience streak — independent of feedback opt-in. A real
+                // connection clears it; a dead handshake grows it until the
+                // built-in-mask fallback above kicks in.
+                if client.ever_connected() {
+                    handshake_fail_streak = 0;
+                } else {
+                    handshake_fail_streak = handshake_fail_streak.saturating_add(1);
+                }
+
+                if feedback_share_enabled {
+                    if client.ever_connected() {
+                        consecutive_fails.remove(&attempt_mask_family);
+                    } else {
+                        let mut log = MaskFeedbackLog::load_default();
+                        let threshold = log.failure_threshold().max(1);
+                        let count = consecutive_fails
+                            .entry(attempt_mask_family.clone())
+                            .or_insert(0);
+                        *count = count.saturating_add(1);
+                        if *count >= threshold {
+                            log.append(attempt_mask_family.clone(), false);
+                            info!(
+                                "§2 recorded mask FAILURE for family '{}' ({} consecutive failed attempts)",
+                                attempt_mask_family, count
+                            );
+                            *count = 0;
+                        }
+                    }
+                }
+
+                match run_result {
+                    Ok(()) => {
+                        // Clean shutdown — deactivate kill-switch before exiting
+                        client.deactivate_kill_switch();
+                        break;
+                    }
                     Err(e) => {
+                        // A connection that stayed up beyond the healthy threshold is
+                        // treated as a genuinely established session, so its backoff
+                        // resets to the initial value. Without this, a transient drop
+                        // after hours of healthy uptime would inherit the grown backoff
+                        // from earlier failures (up to max_backoff) and stall the first
+                        // reconnect attempt for up to a full minute.
+                        let uptime = connect_started.elapsed();
+                        if should_reset_backoff(uptime) {
+                            backoff = INITIAL_BACKOFF;
+                        }
                         warn!(
-                            "Client run failed: {}. Reconnecting in {}s",
+                            "Client run failed after {}s: {}. Reconnecting in {}s",
+                            uptime.as_secs(),
                             e,
                             backoff.as_secs()
                         );
@@ -884,6 +1352,26 @@ fn parse_connection_key(conn_key: &str) -> Result<serde_json::Value, String> {
         .decode(payload)
         .map_err(|e| format!("Invalid connection key base64: {}", e))?;
     serde_json::from_slice(&json_bytes).map_err(|e| format!("Malformed connection key JSON: {}", e))
+}
+
+/// §2 L3 — minimum server-reported success score for a regional hint to be
+/// allowed to bias initial mask selection. Below this the bootstrap-selected
+/// mask is kept, so a weak/noisy hint never displaces the default choice.
+const HINT_BIAS_MIN_SCORE: f32 = 0.5;
+
+/// Initial reconnect backoff, also the value a healthy session resets to.
+const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
+/// Upper bound on the reconnect backoff.
+const MAX_BACKOFF: Duration = Duration::from_secs(60);
+/// A session that stayed connected at least this long is considered healthy;
+/// its reconnect backoff resets to `INITIAL_BACKOFF` instead of continuing to
+/// grow. The threshold comfortably exceeds normal handshake time so that only
+/// genuinely established sessions (well past connect) trigger a reset.
+const HEALTHY_CONNECTION_THRESHOLD: Duration = Duration::from_secs(30);
+
+/// Whether a session with the given uptime should reset the reconnect backoff.
+fn should_reset_backoff(uptime: Duration) -> bool {
+    uptime >= HEALTHY_CONNECTION_THRESHOLD
 }
 
 fn fallback_network_config(tun_addr: &str) -> ClientNetworkConfig {
@@ -997,6 +1485,24 @@ mod tests {
     }
 
     // ── decode_base64_key ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_should_reset_backoff_healthy_session() {
+        // A session that lasted past the healthy threshold resets the backoff.
+        assert!(should_reset_backoff(HEALTHY_CONNECTION_THRESHOLD));
+        assert!(should_reset_backoff(Duration::from_secs(3600)));
+    }
+
+    #[test]
+    fn test_should_reset_backoff_short_session() {
+        // A session that dropped quickly (e.g. failed handshake) keeps growing
+        // the backoff instead of resetting it.
+        assert!(!should_reset_backoff(Duration::from_secs(0)));
+        assert!(!should_reset_backoff(Duration::from_secs(1)));
+        assert!(!should_reset_backoff(
+            HEALTHY_CONNECTION_THRESHOLD - Duration::from_millis(1)
+        ));
+    }
 
     #[test]
     fn test_decode_base64_key_valid_32_bytes() {

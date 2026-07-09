@@ -1,41 +1,159 @@
 //! Localization — English/Russian
+//!
+//! App settings (language + theme) are persisted together in
+//! %LOCALAPPDATA%\AIVPN\settings.json. Legacy lang.txt is migrated on first load.
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Lang {
     En,
     Ru,
 }
 
-impl Lang {
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AppSettings {
+    #[serde(default = "default_lang")]
+    pub lang: Lang,
+    #[serde(default = "default_dark")]
+    pub dark_mode: bool,
+    #[serde(default)]
+    pub kill_switch: bool,
+    #[serde(default)]
+    pub adaptive_level: u8,
+    #[serde(default)]
+    pub dns_proxy: String,
+    #[serde(default = "default_preferred_mask")]
+    pub preferred_mask: String,
+    #[serde(default)]
+    pub connect_on_startup: bool,
+    // Advanced/operator bootstrap discovery — lets a client with no working
+    // aivpn:// key yet discover a server/mask via signed multi-channel fallback.
+    #[serde(default)]
+    pub bootstrap_cdn_url: String,
+    #[serde(default)]
+    pub bootstrap_telegram_token: String,
+    #[serde(default)]
+    pub bootstrap_telegram_chat: String,
+    #[serde(default)]
+    pub bootstrap_github: String,
+    #[serde(default)]
+    pub server_signing_key: String,
+    // Polymorphic per-session mask variant (§3). Takes precedence over
+    // preferred_mask when enabled and preferred_mask is a concrete preset.
+    #[serde(default)]
+    pub polymorphic_mask: bool,
+    // Crowdsourced mask feedback opt-ins (§2).
+    #[serde(default)]
+    pub share_mask_feedback: bool,
+    #[serde(default)]
+    pub receive_mask_hints: bool,
+    #[serde(default)]
+    pub country_code: String,
+}
+
+fn default_lang() -> Lang {
+    Lang::En
+}
+fn default_dark() -> bool {
+    true
+}
+fn default_preferred_mask() -> String {
+    "auto".to_string()
+}
+
+fn settings_path() -> PathBuf {
+    dirs::data_local_dir()
+        .unwrap_or_default()
+        .join("AIVPN")
+        .join("settings.json")
+}
+
+impl AppSettings {
     pub fn load() -> Self {
-        let path = dirs::data_local_dir()
+        let path = settings_path();
+        if path.exists() {
+            if let Ok(data) = std::fs::read_to_string(&path) {
+                if let Ok(s) = serde_json::from_str::<AppSettings>(&data) {
+                    return s;
+                }
+            }
+        }
+        // Migrate from legacy lang.txt
+        let lang_txt = dirs::data_local_dir()
             .unwrap_or_default()
             .join("AIVPN")
             .join("lang.txt");
-        if let Ok(v) = std::fs::read_to_string(&path) {
+        let lang = if let Ok(v) = std::fs::read_to_string(lang_txt) {
             match v.trim() {
-                "ru" => return Lang::Ru,
-                _ => return Lang::En,
+                "ru" => Lang::Ru,
+                _ => Lang::En,
             }
+        } else {
+            Lang::En
+        };
+        AppSettings {
+            lang,
+            dark_mode: true,
+            kill_switch: false,
+            adaptive_level: 0,
+            dns_proxy: String::new(),
+            preferred_mask: "auto".to_string(),
+            connect_on_startup: false,
+            bootstrap_cdn_url: String::new(),
+            bootstrap_telegram_token: String::new(),
+            bootstrap_telegram_chat: String::new(),
+            bootstrap_github: String::new(),
+            server_signing_key: String::new(),
+            polymorphic_mask: false,
+            share_mask_feedback: false,
+            receive_mask_hints: false,
+            country_code: String::new(),
         }
-        Lang::En
     }
 
     pub fn save(&self) {
-        let path = dirs::data_local_dir()
-            .unwrap_or_default()
-            .join("AIVPN")
-            .join("lang.txt");
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+        let path = settings_path();
+        if let Some(p) = path.parent() {
+            let _ = std::fs::create_dir_all(p);
         }
-        let _ = std::fs::write(
-            &path,
-            match self {
-                Lang::En => "en",
-                Lang::Ru => "ru",
-            },
-        );
+        let Ok(json) = serde_json::to_string_pretty(self) else {
+            return;
+        };
+        // Atomic write: write to .tmp then rename to prevent corrupt settings.json on crash
+        let tmp = path.with_extension("json.tmp");
+        if std::fs::write(&tmp, &json).is_ok() {
+            if let Err(e) = std::fs::rename(&tmp, &path) {
+                eprintln!("AppSettings::save rename {:?} → {:?}: {e}", tmp, path);
+                let _ = std::fs::remove_file(&tmp);
+            }
+        }
+    }
+}
+
+/// Load theme preference (defaults to dark).
+pub fn load_theme() -> bool {
+    AppSettings::load().dark_mode
+}
+
+/// Persist theme preference alongside language setting.
+pub fn save_theme(dark: bool) {
+    let mut s = AppSettings::load();
+    s.dark_mode = dark;
+    s.save();
+}
+
+impl Lang {
+    pub fn load() -> Self {
+        AppSettings::load().lang
+    }
+
+    pub fn save(&self) {
+        let mut s = AppSettings::load();
+        s.lang = *self;
+        s.save();
     }
 
     pub fn toggle(&mut self) {
@@ -78,8 +196,6 @@ pub fn t(lang: Lang, key: &str) -> &'static str {
         // Keys
         (Lang::En, "keys") => "Connection Keys",
         (Lang::Ru, "keys") => "Ключи подключения",
-        (Lang::En, "device_key") => "Device Public Key",
-        (Lang::Ru, "device_key") => "Публичный ключ устройства",
         (Lang::En, "copy") => "Copy",
         (Lang::Ru, "copy") => "Копировать",
         (Lang::En, "add_key") => "Add Key",
@@ -118,6 +234,10 @@ pub fn t(lang: Lang, key: &str) -> &'static str {
         (Lang::Ru, "exclude_routes") => "Исключить маршруты (по одному CIDR)",
         (Lang::En, "exclude_routes_hint") => "e.g. 192.168.1.0/24",
         (Lang::Ru, "exclude_routes_hint") => "напр. 192.168.1.0/24",
+        (Lang::En, "include_routes") => "Include routes only (one CIDR per line)",
+        (Lang::Ru, "include_routes") => "Только эти маршруты (по одному CIDR)",
+        (Lang::En, "include_routes_hint") => "e.g. 10.0.0.0/8 — leave empty to route everything",
+        (Lang::Ru, "include_routes_hint") => "напр. 10.0.0.0/8 — оставьте пустым, чтобы маршрутизировать всё",
 
         // Misc
         (Lang::En, "show") => "Show",
@@ -168,6 +288,90 @@ pub fn t(lang: Lang, key: &str) -> &'static str {
         // Adaptive / diagnostics
         (Lang::En, "adaptive_mode") => "Adaptive Mode",
         (Lang::Ru, "adaptive_mode") => "Адаптивный режим",
+        (Lang::En, "adaptive_hint") => "Auto: server picks best. Light: basic mimicry, 15s keepalive. Aggressive: HTTPS/QUIC mimicry, 8s keepalive. Satellite: max mimicry, high-latency optimized.",
+        (Lang::Ru, "adaptive_hint") => "Auto: сервер выбирает. Light: базовая маскировка, 15с. Aggressive: HTTPS/QUIC, 8с. Satellite: максимум, для высоких задержек.",
+        (Lang::En, "mask_hint") => "Traffic camouflage — auto picks the best profile",
+        (Lang::Ru, "mask_hint") => "Маскировка трафика — auto выбирает лучший профиль",
+        (Lang::En, "dns_hint") => "Route DNS through the tunnel to prevent leaks",
+        (Lang::Ru, "dns_hint") => "Направить DNS через туннель для защиты от утечек",
+        (Lang::En, "startup_hint") => "Launch VPN automatically when Windows starts",
+        (Lang::Ru, "startup_hint") => "Автозапуск VPN при старте Windows",
+
+        // No-traffic warning
+        (Lang::En, "no_traffic_warn") => {
+            "Tunnel up, no traffic. Check aivpn-client.exe and server."
+        }
+        (Lang::Ru, "no_traffic_warn") => {
+            "Туннель активен, трафика нет. Проверьте aivpn-client.exe и сервер."
+        }
+
+        // Tray connect/disconnect
+        (Lang::En, "tray_connect") => "Connect",
+        (Lang::Ru, "tray_connect") => "Подключить",
+        (Lang::En, "tray_disconnect") => "Disconnect",
+        (Lang::Ru, "tray_disconnect") => "Отключить",
+
+        // Mask profile
+        (Lang::En, "mask_profile") => "Mask Profile",
+        (Lang::Ru, "mask_profile") => "Профиль маски",
+
+        // Autostart
+        (Lang::En, "connect_on_startup") => "Connect on Windows startup",
+        (Lang::Ru, "connect_on_startup") => "Запускать при старте Windows",
+
+        // mTLS certificate
+        (Lang::En, "mtls_cert_path") => "mTLS Certificate path (optional)",
+        (Lang::Ru, "mtls_cert_path") => "Путь к mTLS-сертификату (необязательно)",
+        (Lang::En, "mtls_cert_hint") => "C:\\path\\to\\cert.pem",
+        (Lang::Ru, "mtls_cert_hint") => "C:\\путь\\к\\cert.pem",
+
+        // Diagnostics / benchmark
+        (Lang::En, "run_benchmark") => "Run Benchmark",
+        (Lang::Ru, "run_benchmark") => "Тест скорости",
+        (Lang::En, "bench_running") => "Running...",
+        (Lang::Ru, "bench_running") => "Выполняется...",
+
+        // Bootstrap descriptor discovery (advanced/operator use)
+        (Lang::En, "bootstrap_section") => "Bootstrap discovery (advanced)",
+        (Lang::Ru, "bootstrap_section") => "Обнаружение сервера (доп.)",
+        (Lang::En, "bootstrap_hint") => "For operators only. Finds a server/mask via signed CDN/Telegram/GitHub channels when you don't have a working aivpn:// key yet.",
+        (Lang::Ru, "bootstrap_hint") => "Только для операторов. Поиск сервера/маски через подписанные каналы CDN/Telegram/GitHub, если рабочего ключа aivpn:// ещё нет.",
+        (Lang::En, "bootstrap_cdn_url") => "CDN bootstrap URL",
+        (Lang::Ru, "bootstrap_cdn_url") => "CDN URL для bootstrap",
+        (Lang::En, "bootstrap_telegram_token") => "Telegram bootstrap bot token",
+        (Lang::Ru, "bootstrap_telegram_token") => "Токен Telegram-бота для bootstrap",
+        (Lang::En, "bootstrap_telegram_chat") => "Telegram bootstrap chat/channel ID (optional)",
+        (Lang::Ru, "bootstrap_telegram_chat") => "ID чата/канала Telegram для bootstrap (необязательно)",
+        (Lang::En, "bootstrap_github") => "GitHub bootstrap repo (owner/repo)",
+        (Lang::Ru, "bootstrap_github") => "GitHub-репозиторий для bootstrap (owner/repo)",
+        (Lang::En, "server_signing_key") => "Server signing public key (base64)",
+        (Lang::Ru, "server_signing_key") => "Публичный ключ подписи сервера (base64)",
+
+        // Polymorphic per-session mask variant
+        (Lang::En, "polymorphic_mask") => "Polymorphic (per-session unique)",
+        (Lang::Ru, "polymorphic_mask") => "Полиморфная (уникальна для сессии)",
+        (Lang::En, "polymorphic_mask_hint") => {
+            "Requests a unique per-session variant of the selected mask preset"
+        }
+        (Lang::Ru, "polymorphic_mask_hint") => {
+            "Запрашивает уникальный для сессии вариант выбранного профиля маски"
+        }
+
+        // Crowdsourced mask feedback (opt-in)
+        (Lang::En, "mask_feedback_section") => "Crowdsourced mask feedback (optional)",
+        (Lang::Ru, "mask_feedback_section") => "Общая статистика по маскам (необязательно)",
+        (Lang::En, "mask_feedback_hint") => {
+            "Helps everyone pick working masks faster. No fine-grained location ever leaves the client."
+        }
+        (Lang::Ru, "mask_feedback_hint") => {
+            "Помогает всем быстрее находить рабочие маски. Точное местоположение никогда не покидает клиент."
+        }
+        (Lang::En, "share_mask_feedback") => "Share blocked-mask feedback",
+        (Lang::Ru, "share_mask_feedback") => "Делиться данными о заблокированных масках",
+        (Lang::En, "receive_mask_hints") => "Receive mask hints for my region",
+        (Lang::Ru, "receive_mask_hints") => "Получать подсказки по маскам для моего региона",
+        (Lang::En, "country_code") => "Country code (ISO 3166-1 alpha-2, e.g. DE)",
+        (Lang::Ru, "country_code") => "Код страны (ISO 3166-1 alpha-2, напр. DE)",
 
         // Default fallback
         (_, _) => "???",

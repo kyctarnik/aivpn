@@ -1,0 +1,31 @@
+{
+  "name": "aivpn-web-server",
+  "type": "module",
+  "scripts": {
+    "dev": "bun --watch src/index.ts",
+    "build": "bun build src/index.ts --outdir ../dist --target bun",
+    "start": "bun src/index.ts",
+    "db:generate": "drizzle-kit generate",
+    "db:migrate": "bun src/db/migrate.ts"
+  },
+  "dependencies": {
+    "hono": "^4.7.0",
+    "@hono/node-server": "^1.14.0",
+    "@hono/zod-validator": "^0.4.3",
+    "drizzle-orm": "^0.44.0",
+    "drizzle-kit": "^0.30.0",
+    "@node-rs/argon2": "^2.0.0",
+    "speakeasy": "^2.0.0",
+    "qrcode": "^1.5.0",
+    "@simplewebauthn/server": "^13.0.0",
+    "jose": "^5.10.0",
+    "zod": "^3.25.0",
+    "systeminformation": "^5.25.0",
+    "postgres": "^3.4.5"
+  },
+  "devDependencies": {
+    "@types/speakeasy": "^2.0.10",
+    "@types/qrcode": "^1.5.5",
+    "typescript": "^5.8.0"
+  }
+}

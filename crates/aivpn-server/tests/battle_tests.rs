@@ -17,7 +17,8 @@ use aivpn_common::protocol::{ControlPayload, InnerHeader, InnerType};
 use subtle::ConstantTimeEq;
 
 use aivpn_server::session::{
-    u256, Session, SessionManager, SessionState, IDLE_TIMEOUT, MAX_SESSIONS, TAG_WINDOW_SIZE,
+    ReplayWindow, Session, SessionManager, SessionState, IDLE_TIMEOUT, MAX_SESSIONS,
+    TAG_WINDOW_SIZE,
 };
 
 fn make_session_manager() -> (SessionManager, KeyPair) {
@@ -43,12 +44,97 @@ fn make_unique_addr(index: u16) -> SocketAddr {
 }
 
 // ============================================================================
-// u256 Bitmap Tests
+// QUIC-Initial mimic end-to-end (client builds -> server finds + decrypts)
+// ============================================================================
+
+/// Full QUIC-Initial mimic round trip through the server's decode contract:
+/// the client emits a coalesced RFC 9001 v1 Initial (DCID = resonance tag)
+/// with its real ciphertext appended, and the server (1) finds the session by
+/// the tag it extracts at DCID offset 6, (2) recognizes the QUIC layout to
+/// locate the trailing ciphertext, and (3) decrypts it back to the plaintext.
+#[test]
+fn battle_quic_initial_server_decode_roundtrip() {
+    use aivpn_common::client_wire::build_inner_packet;
+    use aivpn_common::quic_initial::{
+        build_quic_initial, parse_quic_initial, QUIC_MIN_DATAGRAM, QUIC_TAG_OFFSET,
+    };
+
+    let server_kp = KeyPair::generate();
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0x42u8; 32]);
+    let mask = aivpn_common::mask::preset_masks::quic_https_v2();
+    assert_eq!(
+        mask.tag_offset, 6,
+        "QUIC preset embeds tag at DCID offset 6"
+    );
+    let mgr = SessionManager::new(server_kp.clone(), signing_key, mask);
+
+    let client_kp = KeyPair::generate();
+    let addr = make_addr(10000);
+    let session = mgr
+        .create_session(addr, client_kp.public_key_bytes(), None, None)
+        .unwrap();
+
+    // Client derives the same session keys as the server.
+    let client_shared = client_kp
+        .compute_shared(&server_kp.public_key_bytes())
+        .unwrap();
+    let client_keys = derive_session_keys(&client_shared, None, &client_kp.public_key_bytes());
+
+    // ── Client build path (exactly what MimicryEngine::emit does for QUIC) ──
+    let counter: u64 = 0;
+    let inner = build_inner_packet(InnerType::Data, 0, b"quic mimic payload");
+    // Padded inner plaintext: [pad_len u16 LE][inner][pad]; pad_len = 0 here.
+    let mut padded = Vec::new();
+    padded.extend_from_slice(&0u16.to_le_bytes());
+    padded.extend_from_slice(&inner);
+    let mut nonce = [0u8; NONCE_SIZE];
+    nonce[0..8].copy_from_slice(&counter.to_le_bytes());
+    let ciphertext = encrypt_payload(&client_keys.session_key, &nonce, &padded).unwrap();
+    let tw = compute_time_window(current_timestamp_ms(), DEFAULT_WINDOW_MS);
+    let tag = generate_resonance_tag(&client_keys.tag_secret, counter, tw);
+    let mut tag8 = [0u8; TAG_SIZE];
+    tag8.copy_from_slice(&tag);
+    let datagram = build_quic_initial(&tag8, &ciphertext, QUIC_MIN_DATAGRAM);
+
+    // nDPI floor: the coalesced datagram is a valid-sized Initial.
+    assert!(datagram.len() >= QUIC_MIN_DATAGRAM);
+
+    // ── Server decode path ──
+    // (1) Tag lives at DCID offset 6 (the layout-aware lookup extracts it there).
+    let mut recv_tag = [0u8; TAG_SIZE];
+    recv_tag.copy_from_slice(&datagram[QUIC_TAG_OFFSET..QUIC_TAG_OFFSET + TAG_SIZE]);
+    assert_eq!(recv_tag, tag8, "tag must be readable at the DCID offset");
+
+    // (2) Server finds the session by that tag.
+    let found = mgr.get_session_by_tag(&recv_tag);
+    assert!(found.is_some(), "server must find session by DCID tag");
+    {
+        let sess = session.lock();
+        let v = sess.validate_tag(&recv_tag);
+        assert!(v.is_some(), "server must validate the resonance tag");
+        assert_eq!(v.unwrap().0, counter);
+    }
+
+    // (3) Server recognizes the QUIC layout and decrypts the trailing ciphertext.
+    let layout = parse_quic_initial(&datagram).expect("server recognizes QUIC layout");
+    assert_eq!(layout.tag, tag8);
+    let decrypted = decrypt_payload(
+        &client_keys.session_key,
+        &nonce,
+        &datagram[layout.payload_offset..],
+    )
+    .expect("server decrypts trailing ciphertext");
+    // Strip the 2-byte pad-length prefix and confirm the inner survived.
+    assert_eq!(&decrypted[2..], &inner[..], "inner payload must round-trip");
+}
+
+// ============================================================================
+// ReplayWindow Bitmap Tests
 // ============================================================================
 
 #[test]
 fn battle_u256_set_and_get() {
-    let mut bm = u256::default();
+    let mut bm = ReplayWindow::default();
     assert!(!bm.get_bit(0));
     bm.set_bit(0);
     assert!(bm.get_bit(0));
@@ -57,7 +143,7 @@ fn battle_u256_set_and_get() {
 
 #[test]
 fn battle_u256_all_bits() {
-    let mut bm = u256::default();
+    let mut bm = ReplayWindow::default();
     for i in 0..256 {
         assert!(!bm.get_bit(i));
         bm.set_bit(i);
@@ -67,7 +153,7 @@ fn battle_u256_all_bits() {
 
 #[test]
 fn battle_u256_clear() {
-    let mut bm = u256::default();
+    let mut bm = ReplayWindow::default();
     for i in 0..256 {
         bm.set_bit(i);
     }
@@ -79,8 +165,8 @@ fn battle_u256_clear() {
 
 #[test]
 fn battle_u256_boundary_bits() {
-    let mut bm = u256::default();
-    // Test boundary between lo and hi (bits 127 and 128)
+    let mut bm = ReplayWindow::default();
+    // Test a word boundary (bit 127 = top of word 1, bit 128 = bit 0 of word 2)
     bm.set_bit(127);
     bm.set_bit(128);
     assert!(bm.get_bit(127));
@@ -1200,9 +1286,11 @@ fn test_neural_resonance_check_with_data() {
 fn test_neural_anomaly_detector_normal() {
     let config = NeuralConfig::default();
     let mut module = NeuralResonanceModule::new(config).unwrap();
-    // Record normal metrics
-    for _ in 0..20 {
-        module.record_telemetry("webrtc_zoom_v3", 0.005, 30.0);
+    // Record normal metrics from several reporters
+    for r in 0u8..4 {
+        for _ in 0..20 {
+            module.record_telemetry("webrtc_zoom_v3", [r; 16], 0.005, 30.0);
+        }
     }
     assert!(
         !module.is_mask_anomalous("webrtc_zoom_v3"),
@@ -1214,13 +1302,25 @@ fn test_neural_anomaly_detector_normal() {
 fn test_neural_anomaly_detector_high_loss() {
     let config = NeuralConfig::default();
     let mut module = NeuralResonanceModule::new(config).unwrap();
-    // Record anomalous packet loss (5x baseline = 5%)
-    for _ in 0..20 {
-        module.record_telemetry("webrtc_zoom_v3", 0.10, 30.0);
+    // Anomalous packet loss (5x baseline) must be corroborated by multiple
+    // distinct reporters before it counts (anti single-client DoS).
+    for r in 0u8..3 {
+        for _ in 0..20 {
+            module.record_telemetry("webrtc_zoom_v3", [r; 16], 0.10, 30.0);
+        }
     }
     assert!(
         module.is_mask_anomalous("webrtc_zoom_v3"),
-        "10% packet loss must trigger anomaly"
+        "10% packet loss from 3 reporters must trigger anomaly"
+    );
+    // A single reporter alone must NOT.
+    let mut solo = NeuralResonanceModule::new(NeuralConfig::default()).unwrap();
+    for _ in 0..50 {
+        solo.record_telemetry("webrtc_zoom_v3", [42; 16], 0.10, 30.0);
+    }
+    assert!(
+        !solo.is_mask_anomalous("webrtc_zoom_v3"),
+        "single reporter must not be able to forge an anomaly"
     );
 }
 
@@ -1228,13 +1328,15 @@ fn test_neural_anomaly_detector_high_loss() {
 fn test_neural_anomaly_detector_high_rtt() {
     let config = NeuralConfig::default();
     let mut module = NeuralResonanceModule::new(config).unwrap();
-    // Record anomalous RTT (3x baseline = 150ms)
-    for _ in 0..20 {
-        module.record_telemetry("quic_https_v2", 0.001, 200.0);
+    // Anomalous RTT (3x baseline = 150ms) corroborated by multiple reporters.
+    for r in 0u8..3 {
+        for _ in 0..20 {
+            module.record_telemetry("quic_https_v2", [r; 16], 0.001, 200.0);
+        }
     }
     assert!(
         module.is_mask_anomalous("quic_https_v2"),
-        "200ms RTT must trigger anomaly"
+        "200ms RTT from 3 reporters must trigger anomaly"
     );
 }
 
@@ -1470,7 +1572,9 @@ fn test_gateway_config_default_has_neural() {
     let config = GatewayConfig::default();
     assert!(config.enable_neural, "Neural must be enabled by default");
     assert_eq!(config.neural_config.check_interval_secs, 30);
-    assert_eq!(config.neural_config.compromised_threshold, 0.35);
+    // Warm-up default calibrated against realcap2 healthy-traffic MSE
+    // (overall p99 ≈ 0.26, live-stand max ≈ 0.31) — see neural.rs Default impl.
+    assert_eq!(config.neural_config.compromised_threshold, 0.50);
 }
 
 #[test]

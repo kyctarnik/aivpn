@@ -10,16 +10,26 @@
 #include "session_table.h"
 
 /**
- * aivpn_decrypt - decrypt an inbound skb in-place.
- * @s:       session (s->lock held by caller with BH disabled).
- * @skb:     data starts at the 8-byte resonance tag, followed by ciphertext
- *           + 16-byte Poly1305 auth tag.
- * @counter: counter from the tag-window lookup (NOT extracted from wire bytes).
+ * aivpn_decrypt - decrypt an inbound skb, leaving the plaintext in @skb.
+ * @s:        session (s->lock held by caller with BH disabled).
+ * @skb:      full wire packet; the ciphertext + 16-byte Poly1305 tag begin at
+ *            byte offset @ct_start (Variant A layout, per session).
+ * @counter:  counter from the tag-window lookup (NOT extracted from wire bytes).
+ * @ct_start: byte offset of the ciphertext within the packet.
  *
- * On success skb->data points to plaintext IP payload.
- * Returns 0 on success, -errno on failure.
+ * Decrypts OUT OF PLACE into a scratch buffer so the original skb is left
+ * untouched on authentication failure — the caller can then hand the packet to
+ * user-space, which has decode paths (quic-initial coalescing, ratchet
+ * transitions, catalog-mask window) the kernel fast path deliberately does not
+ * replicate.
+ *
+ * Returns:
+ *   0        success — skb->data now holds the decrypted inner plaintext.
+ *   -EBADMSG authentication failed; skb is INTACT — caller should fall back.
+ *   other <0 malformed/allocation error — caller should drop.
  */
-int aivpn_decrypt(struct aivpn_kern_session *s, struct sk_buff *skb, u64 counter);
+int aivpn_decrypt(struct aivpn_kern_session *s, struct sk_buff *skb, u64 counter,
+		  unsigned int ct_start);
 
 /**
  * aivpn_encrypt - encrypt an outbound skb in-place.
@@ -31,5 +41,23 @@ int aivpn_decrypt(struct aivpn_kern_session *s, struct sk_buff *skb, u64 counter
  * Returns 0 on success, -errno on failure.
  */
 int aivpn_encrypt(struct aivpn_kern_session *s, struct sk_buff *skb);
+
+/**
+ * aivpn_downlink_encrypt - build one server->client Data packet into @out.
+ * @s:       session (caller holds rcu_read_lock(); no spinlock held).
+ * @r:       reservation from aivpn_session_dl_reserve() (tag/counter/seq/mdh).
+ * @ip:      inner cleartext IP packet.
+ * @ip_len:  its length (> 0).
+ * @out:     wire buffer of @out_cap bytes.
+ * @out_len: filled with the wire length on success.
+ *
+ * Produces: tag || mdh || AEAD_s2c(pad_len=0 || Data || seq || ip).
+ * Returns 0 on success, -errno otherwise.
+ */
+int aivpn_downlink_encrypt(struct aivpn_kern_session *s,
+			   const struct aivpn_dl_reservation *r,
+			   const u8 *ip, unsigned int ip_len,
+			   u8 *out, unsigned int out_cap,
+			   unsigned int *out_len);
 
 #endif /* AIVPN_CRYPTO_OPS_H */

@@ -23,7 +23,7 @@ const fn iowr(nr: u32, sz: u32) -> u32 { (3 << 30) | (MAGIC << 8) | nr | (sz << 
 const fn io(nr: u32) -> u32            { (MAGIC << 8) | nr }
 
 // Packed struct sizes matching C definitions (see include/uapi/aivpn.h)
-const IOC_SESSION_ADD:         u32 = iow(1,  160);
+const IOC_SESSION_ADD:         u32 = iow(1,  192);
 const IOC_SESSION_DEL:         u32 = iow(2,   16);
 const IOC_SESSION_STAT:        u32 = iowr(3,  52);
 const IOC_SET_TUN:             u32 = iow(4,    4);
@@ -31,7 +31,9 @@ const IOC_SET_UDP_SOCK:        u32 = iow(5,    4);
 const IOC_FLUSH:               u32 = io(6);
 const IOC_GET_VERSION:         u32 = ior(7,    4);
 const IOC_SESSION_UPDATE_TAGS: u32 = iow(8, 4116);
-const API_VERSION:             u32 = 2;
+const IOC_SESSION_DOWNLINK:    u32 = iow(9, 4184);
+const IOC_SET_EGRESS:          u32 = iow(10,  12);
+const API_VERSION:             u32 = 5;
 
 // CAP_NET_ADMIN = 12 (linux/capability.h)
 const CAP_NET_ADMIN: i32 = 12;
@@ -43,9 +45,11 @@ extern "C" {
     fn aivpn_session_remove(session_id: *const u8) -> i32;
     fn aivpn_session_stat(stat: *mut u8) -> i32;
     fn aivpn_session_tags_update(upd: *const u8) -> i32;
+    fn aivpn_session_downlink_update(dl: *const u8) -> i32;
     fn aivpn_session_flush();
     fn aivpn_tun_set_device(ifindex: u32) -> i32;
     fn aivpn_udp_hook_install_by_fd(fd: i32) -> i32;
+    fn aivpn_egress_set(udp_fd: i32, tun_ifindex: u32, enable: u32) -> i32;
 }
 
 // ── Device ────────────────────────────────────────────────────────────────────
@@ -93,8 +97,8 @@ impl MiscDevice for AivpnDev {
     fn ioctl((): (), _file: &File, cmd: u32, arg: usize) -> Result<isize> {
         match cmd {
             n if n == IOC_SESSION_ADD => {
-                let mut buf = [0u8; 160];
-                UserSlice::new(to_user_ptr(arg), 160).reader().read_slice(&mut buf)?;
+                let mut buf = [0u8; 192];
+                UserSlice::new(to_user_ptr(arg), 192).reader().read_slice(&mut buf)?;
                 kernel::error::to_result(unsafe { aivpn_session_insert(buf.as_ptr()) })?;
                 Ok(0)
             }
@@ -145,6 +149,26 @@ impl MiscDevice for AivpnDev {
                     .reader()
                     .read_slice(&mut buf)?;
                 kernel::error::to_result(unsafe { aivpn_session_tags_update(buf.as_ptr()) })?;
+                Ok(0)
+            }
+            n if n == IOC_SESSION_DOWNLINK => {
+                let mut buf = [0u8; 4184];
+                UserSlice::new(to_user_ptr(arg), 4184)
+                    .reader()
+                    .read_slice(&mut buf)?;
+                kernel::error::to_result(unsafe { aivpn_session_downlink_update(buf.as_ptr()) })?;
+                Ok(0)
+            }
+            n if n == IOC_SET_EGRESS => {
+                // struct aivpn_set_egress { u32 udp_fd; u32 tun_ifindex; u32 enable; }
+                let mut b = [0u8; 12];
+                UserSlice::new(to_user_ptr(arg), 12).reader().read_slice(&mut b)?;
+                let udp_fd = i32::from_ne_bytes([b[0], b[1], b[2], b[3]]);
+                let tun_ifindex = u32::from_ne_bytes([b[4], b[5], b[6], b[7]]);
+                let enable = u32::from_ne_bytes([b[8], b[9], b[10], b[11]]);
+                kernel::error::to_result(unsafe {
+                    aivpn_egress_set(udp_fd, tun_ifindex, enable)
+                })?;
                 Ok(0)
             }
             _ => Err(EINVAL),
