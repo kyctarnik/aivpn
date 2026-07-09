@@ -430,7 +430,7 @@ pub struct AivpnClient {
     active_recording_session: Option<[u8; 16]>,
     keepalive_interval: Duration,
     /// Shared keepalive interval in milliseconds with the upload task for dynamic updates.
-    keepalive_interval_ms: Arc<std::sync::atomic::AtomicU64>,
+    keepalive_interval_ms: Arc<AtomicU64>,
     /// Local UDP port used on last successful connect — reused on reconnect to
     /// preserve CGNAT inbound mapping (port-preserving carriers like MTS).
     last_local_port: Option<u16>,
@@ -586,7 +586,7 @@ impl AivpnClient {
             proxy_handle: None,
             active_recording_session: None,
             keepalive_interval: initial_keepalive,
-            keepalive_interval_ms: Arc::new(std::sync::atomic::AtomicU64::new(
+            keepalive_interval_ms: Arc::new(AtomicU64::new(
                 initial_keepalive.as_millis() as u64,
             )),
             last_local_port: None,
@@ -1696,7 +1696,7 @@ impl AivpnClient {
         keepalive_interval: Duration,
         keepalive_sent_ms: Arc<AtomicU64>,
         fec_n: u8,
-        keepalive_interval_ms: Arc<std::sync::atomic::AtomicU64>,
+        keepalive_interval_ms: Arc<AtomicU64>,
         last_tx_ms: Arc<AtomicU64>,
     ) -> Result<()> {
         /// Wraps MimicryEngine to implement the shared PacketEncryptor trait.

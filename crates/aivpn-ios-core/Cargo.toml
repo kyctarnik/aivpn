@@ -18,6 +18,7 @@ client-dpi-gate = ["aivpn-common/client-dpi-gate"]
 aivpn-common = { path = "../aivpn-common", features = ["client-upload"] }
 
 libc       = "0.2"
+portable-atomic = "1"
 tokio      = { version = "1.35", features = ["rt", "net", "time", "io-util", "macros", "sync"] }
 rand       = "0.8"
 log        = "0.4"

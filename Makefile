@@ -308,7 +308,7 @@ z=zipfile.ZipFile('$$ZIP_NAME','w',zipfile.ZIP_DEFLATED); \
 	      "-DOUTPUT_EXE=$$(pwd)/$$INSTALLER_EXE" \
 	      "$$NSI"; \
 	    echo "→ $$INSTALLER_EXE  ($$(du -h $$INSTALLER_EXE | cut -f1))"; \
-	    rm -rf "$$PACKAGE_DIR" "$$ZIP_NAME"; \
+	    rm -rf "$$PACKAGE_DIR"; \
 	else \
 	    echo "makensis not found — keeping zip: $$ZIP_NAME"; \
 	    echo "→ $$ZIP_NAME  ($$(du -h $$ZIP_NAME | cut -f1))"; \

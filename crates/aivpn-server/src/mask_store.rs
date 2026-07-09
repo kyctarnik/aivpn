@@ -54,7 +54,7 @@ pub struct MaskStore {
     /// The gateway pushes a fresh client-facing `MaskCatalog` whenever this
     /// moves past what a session was last sent, so newly auto-generated masks
     /// reach connected clients live (see gateway Keepalive handler).
-    version: std::sync::atomic::AtomicU64,
+    version: portable_atomic::AtomicU64,
     /// R2 Phase B: operator Ed25519 signing key. When `Some`, freshly
     /// generated masks (`mask_gen::generate_and_store_mask`) are signed with
     /// it after the KS self-test passes. `None` = generate unsigned (legacy).
@@ -87,7 +87,7 @@ impl MaskStore {
             storage_dir,
             // Start at 1 so a session that has never been sent a catalog
             // (version_sent = 0) always receives one.
-            version: std::sync::atomic::AtomicU64::new(1),
+            version: portable_atomic::AtomicU64::new(1),
             signing_key,
             operator_pubkey,
             verify_mode,
@@ -429,7 +429,7 @@ mod tests {
             masks: DashMap::new(),
             catalog: Arc::new(MaskCatalog::new()),
             storage_dir: dir,
-            version: std::sync::atomic::AtomicU64::new(1),
+            version: portable_atomic::AtomicU64::new(1),
             signing_key: None,
             operator_pubkey: None,
             verify_mode: MaskVerifyMode::default(),

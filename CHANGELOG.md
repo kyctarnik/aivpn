@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.0.1] - 2026-07-09
+
+### Fixed
+
+- **musl / embedded cross-compilation** — `AtomicU64` now comes from `portable_atomic` in the shared upload pipeline (`aivpn-common`) and the server mask store, instead of `std::sync::atomic::AtomicU64` (absent on 32-bit targets without native 64-bit atomics). The `recvmmsg` flags argument is cast portably (`as _`) for musl. Restores the `server-musl-*` and `client-musl-mipsel` release-asset builds.
+- **Windows release packaging** — `make windows` no longer deletes `aivpn-windows-gui.zip` after building the NSIS installer, so the release workflow publishes both the installer and the portable GUI zip.
+
 ## [1.0.0-RC1] - 2026-07-07
 
 > **Release candidate for 1.0.0.** The apps display this build as version **1.0.0** — “RC1” is only the release label. This entry consolidates everything since 0.9.2, including all work previously staged for a 0.10.0 release that was never shipped (a separate 0.10.0 release does not exist).

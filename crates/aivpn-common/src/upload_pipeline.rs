@@ -27,7 +27,7 @@ pub struct UploadConfig {
     /// Shared keepalive interval in milliseconds; updated dynamically by the client.
     /// When set, the upload loop polls this value each tick and resets the interval
     /// when the value changes (e.g. after KeepaliveAck / AdaptiveHint).
-    pub keepalive_ms: Option<Arc<std::sync::atomic::AtomicU64>>,
+    pub keepalive_ms: Option<Arc<portable_atomic::AtomicU64>>,
 }
 
 impl Default for UploadConfig {
