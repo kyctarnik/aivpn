@@ -16,6 +16,7 @@ use crate::crypto::{self, encrypt_payload, SessionKeys, NONCE_SIZE, POLY1305_TAG
 use crate::error::Result;
 use crate::fec::FecEncoder;
 use crate::mask::{IATDistribution, MaskProfile, PaddingStrategy, SizeDistribution, SpoofProtocol};
+use crate::mimic_protocol::MimicProtocol;
 use crate::protocol::{ControlPayload, InnerType, MAX_PACKET_SIZE};
 use crate::upload_pipeline::PacketEncryptor;
 
@@ -30,6 +31,10 @@ pub struct MimicryState {
     pub size_override: Option<SizeDistribution>,
     pub iat_override: Option<IATDistribution>,
     pub padding_override: Option<PaddingStrategy>,
+    /// R3: when the mask carries a joint size↔IAT distribution, sampling the
+    /// packet size draws the correlated (size, iat) pair together and stashes
+    /// the IAT here for the matching `sample_iat` call, so the two stay coupled.
+    pub pending_joint_iat: Option<f64>,
 }
 
 // ──────────── MimicryEngine ────────────
@@ -52,6 +57,7 @@ impl MimicryEngine {
                 size_override: None,
                 iat_override: None,
                 padding_override: None,
+                pending_joint_iat: None,
             },
             rng: StdRng::from_entropy(),
         }
@@ -71,10 +77,20 @@ impl MimicryEngine {
             size_override: None,
             iat_override: None,
             padding_override: None,
+            pending_joint_iat: None,
         };
     }
 
     pub fn sample_packet_size(&mut self) -> u16 {
+        // R3: a joint size↔IAT model (present only when the recording showed
+        // material correlation) supersedes the independent marginals AND the FSM
+        // per-state override — draw (size, iat) together and stash the IAT for
+        // the paired sample_iat call so their correlation survives on the wire.
+        if let Some(ref joint) = self.mask.size_iat_joint {
+            let (size, iat) = joint.sample(&mut self.rng);
+            self.state.pending_joint_iat = Some(iat);
+            return size;
+        }
         if let Some(ref d) = self.state.size_override {
             d.sample(&mut self.rng)
         } else {
@@ -83,6 +99,10 @@ impl MimicryEngine {
     }
 
     pub fn sample_iat(&mut self) -> f64 {
+        // R3: consume the IAT paired with the most recent joint size sample.
+        if let Some(iat) = self.state.pending_joint_iat.take() {
+            return iat;
+        }
         if let Some(ref d) = self.state.iat_override {
             d.sample(&mut self.rng)
         } else {
@@ -142,7 +162,12 @@ impl MimicryEngine {
             if mdh.len() < required {
                 mdh.resize(required, 0);
             }
-            mdh[offset..offset + len].copy_from_slice(eph);
+            // `eph` is always 32 bytes. A malformed/pushed mask may declare an
+            // eph_pub_length other than 32; copy_from_slice would then panic on
+            // the length mismatch. Copy only the overlapping bytes so a bad mask
+            // can never crash the handshake path (len == 32 stays identical).
+            let copy_len = len.min(eph.len());
+            mdh[offset..offset + copy_len].copy_from_slice(&eph[..copy_len]);
         }
         mdh
     }
@@ -154,12 +179,68 @@ impl MimicryEngine {
         counter: &mut u64,
         eph_pub: Option<&[u8; 32]>,
     ) -> Result<Vec<u8>> {
-        let mdh = self.build_mdh(eph_pub);
+        let mut mdh = self.build_mdh(eph_pub);
+
+        // Variant A wire-layout selection. A new-layout mask (`tag_offset != u16::MAX`)
+        // presents a real protocol header at packet offset 0 and hides the 8-byte
+        // resonance tag INSIDE that header, so there is no separate tag prefix.
+        // We only take the embedded path when the header is long enough to hold
+        // the tag AND the tag slot does not overlap the embedded ephemeral key;
+        // a malformed mask falls back to the byte-identical legacy layout.
+        let embed_tag_offset = match self.mask.embedded_tag_offset() {
+            Some(off)
+                if off + TAG_SIZE <= mdh.len() && !self.mask.tag_overlaps_eph_pub(TAG_SIZE) =>
+            {
+                Some(off)
+            }
+            Some(off) => {
+                debug!(
+                    "mask {} has malformed tag_offset {} (header len {}, eph_pub {}..{}); \
+                     falling back to legacy tag-prefix layout",
+                    self.mask.mask_id,
+                    off,
+                    mdh.len(),
+                    self.mask.eph_pub_offset,
+                    self.mask.eph_pub_offset as usize + self.mask.eph_pub_length as usize,
+                );
+                None
+            }
+            None => None,
+        };
+        // Legacy layout carries an extra TAG_SIZE prefix; the embedded layout does not.
+        let tag_prefix_len = if embed_tag_offset.is_some() {
+            0
+        } else {
+            TAG_SIZE
+        };
+
         let target_size = self.sample_packet_size();
-        let base_overhead = TAG_SIZE + mdh.len() + 2 + plaintext.len() + POLY1305_TAG_SIZE;
+        let base_overhead = tag_prefix_len + mdh.len() + 2 + plaintext.len() + POLY1305_TAG_SIZE;
         let requested_pad_len = self.calc_padding(base_overhead, target_size);
         let packet_budget = SAFE_OUTER_PACKET_BUDGET.min(MAX_PACKET_SIZE);
-        let max_pad_len = packet_budget.saturating_sub(base_overhead) as u16;
+
+        // Budget correction for *constructed* (QUIC) masks. A QUIC DATA packet
+        // (`eph_pub` is None → the `proto.emit()` path below is taken) is NOT
+        // emitted as `[mdh][ciphertext]`: `emit()` discards the mdh and wraps the
+        // ciphertext in a whole RFC 9001 Initial, adding `quic_initial_overhead()`
+        // (~92 B: long header + CRYPTO(ClientHello) frame + AEAD tag) ON TOP.
+        // `base_overhead` (sized for `[mdh][ciphertext]`) never reserved those
+        // bytes, so a near-MTU QUIC packet could pad up to `packet_budget` and
+        // then overflow it by the Initial overhead after `emit()` → fragmentation
+        // (and a DPI anomaly, since real QUIC does PMTUD). Reserve the Initial
+        // overhead here so the FINAL emitted datagram — not the pre-wrap packet —
+        // stays within `packet_budget`. The final QUIC datagram size (before the
+        // 1200-byte QUIC floor) is `quic_overhead + ciphertext_len`, where
+        // `ciphertext_len = 2 + plaintext.len() + pad_len + POLY1305_TAG_SIZE`;
+        // solving `<= packet_budget` for `pad_len` gives this reserved overhead.
+        let emits_quic = eph_pub.is_none()
+            && MimicProtocol::for_spoof(self.mask.spoof_protocol).is_constructed();
+        let budget_overhead = if emits_quic {
+            crate::quic_initial::quic_initial_overhead() + 2 + plaintext.len() + POLY1305_TAG_SIZE
+        } else {
+            base_overhead
+        };
+        let max_pad_len = packet_budget.saturating_sub(budget_overhead) as u16;
         let pad_len = requested_pad_len.min(max_pad_len);
 
         let mut padded = Vec::with_capacity(2 + plaintext.len() + pad_len as usize);
@@ -168,7 +249,11 @@ impl MimicryEngine {
         padded.resize(2 + plaintext.len() + pad_len as usize, 0);
         self.rng.fill_bytes(&mut padded[2 + plaintext.len()..]);
 
+        // Increment counter BEFORE encryption so a failed encrypt_payload call
+        // never allows the same nonce to be reused with the same session key
+        // (nonce-reuse would break ChaCha20-Poly1305 confidentiality).
         let packet_counter = *counter;
+        *counter += 1;
         let nonce = self.generate_nonce(packet_counter);
         let ciphertext = encrypt_payload(&keys.session_key, &nonce, &padded)?;
 
@@ -177,12 +262,45 @@ impl MimicryEngine {
             crate::crypto::DEFAULT_WINDOW_MS,
         );
         let tag = crypto::generate_resonance_tag(&keys.tag_secret, packet_counter, time_window);
-        *counter += 1;
 
-        let mut packet = Vec::with_capacity(TAG_SIZE + mdh.len() + ciphertext.len());
-        packet.extend_from_slice(&tag);
-        packet.extend_from_slice(&mdh);
-        packet.extend_from_slice(&ciphertext);
+        // Constructed protocols (QUIC) build the WHOLE datagram from the tag +
+        // ciphertext (a crypto-built decoy header coalesced with aivpn's real
+        // ciphertext), bypassing the `[mdh][ciphertext]` + finalize layout. The
+        // resonance tag rides inside the decoy header (QUIC: the DCID), so the
+        // server extracts it there and skips the decoy to reach the ciphertext.
+        //
+        // Only DATA packets take this path: a handshake packet (`eph_pub` set)
+        // must carry the obfuscated ephemeral key inside the MDH for the server
+        // to establish the session, so it keeps the standard layout. The flow
+        // still classifies as QUIC because steady-state data packets are valid
+        // RFC 9001 Initials (nDPI's `may_be_initial_pkt` runs per packet).
+        let proto = MimicProtocol::for_spoof(self.mask.spoof_protocol);
+        if eph_pub.is_none() {
+            if let Some(datagram) = proto.emit(&tag, &ciphertext) {
+                return Ok(datagram);
+            }
+        }
+
+        let mut packet = Vec::with_capacity(tag_prefix_len + mdh.len() + ciphertext.len());
+        if let Some(off) = embed_tag_offset {
+            // New layout: real protocol header at offset 0 with the tag embedded
+            // into its opaque carrier field; no separate tag prefix.
+            mdh[off..off + TAG_SIZE].copy_from_slice(&tag);
+            packet.extend_from_slice(&mdh);
+            packet.extend_from_slice(&ciphertext);
+            // Protocol-specific post-assembly DPI fixup: now that the full
+            // `[mdh][ciphertext]` size is known, let the mimicked protocol
+            // reconcile any size-dependent consistency field. For STUN this
+            // patches the Length field to `packet_len - 20` (nDPI's `is_stun()`
+            // demands the exact `msg_len + 20 == udp_payload_len`); other
+            // protocols are a no-op for now. Mirrors the tag embed just above.
+            proto.finalize(&mut packet, &self.mask);
+        } else {
+            // Legacy layout: tag ++ mdh ++ ciphertext (byte-identical to before).
+            packet.extend_from_slice(&tag);
+            packet.extend_from_slice(&mdh);
+            packet.extend_from_slice(&ciphertext);
+        }
         Ok(packet)
     }
 
@@ -234,11 +352,17 @@ impl MimicryEncryptor {
         }
     }
 
-    /// Replaces the session keys used by this encryptor and resets the packet counter.
-    /// Called by the KeyRotate handler to keep the upload task in sync with the new epoch.
+    /// Replaces the session keys used by this encryptor, keeping the packet
+    /// counter MONOTONIC. Called by the mobile inline-rekey handler (via
+    /// `check_key_rotation`, only ever fed from the KeyRotate path — a full
+    /// reconnect builds a fresh encryptor instead). The uplink (c2s) counter must
+    /// NOT reset to 0 here: the server matches inbound tags in a ±TAG_WINDOW_SIZE
+    /// band around the highest received counter, so a from-zero restart under a
+    /// heavy simultaneous upload (first c2s packets lost, client racing past the
+    /// band) strands uplink — killing the tunnel. The key changes, so continuing
+    /// the counter never reuses a (key, nonce) pair.
     pub fn update_keys(&mut self, keys: SessionKeys) {
         self.keys = keys;
-        self.counter = 0;
     }
 
     pub fn set_fec_group(&mut self, group_size: u8) {
@@ -351,6 +475,7 @@ mod tests {
         let mut engine = MimicryEngine::new(mask);
         let keys = SessionKeys {
             session_key: [0u8; 32],
+            session_key_s2c: [0u8; 32],
             tag_secret: [0u8; 32],
             prng_seed: [0u8; 32],
         };
@@ -361,10 +486,330 @@ mod tests {
     }
 
     #[test]
+    fn build_mdh_with_non32_eph_pub_length_does_not_panic() {
+        // A mask that declares eph_pub_length != 32 must not panic build_mdh
+        // when an ephemeral key is embedded during the handshake.
+        let mut mask = webrtc_zoom_v3();
+        mask.eph_pub_length = 16; // malformed / adversarial value
+        mask.eph_pub_offset = 4;
+        mask.header_spec = None;
+        mask.header_template = vec![0u8; 4];
+        let mut engine = MimicryEngine::new(mask);
+        let mdh = engine.build_mdh(Some(&[0xABu8; 32]));
+        assert!(mdh.len() >= 4 + 16);
+    }
+
+    #[test]
+    fn build_mdh_with_oversized_eph_pub_length_does_not_panic() {
+        let mut mask = webrtc_zoom_v3();
+        mask.eph_pub_length = 64; // larger than the 32-byte key
+        mask.eph_pub_offset = 4;
+        mask.header_spec = None;
+        mask.header_template = vec![0u8; 4];
+        let mut engine = MimicryEngine::new(mask);
+        let mdh = engine.build_mdh(Some(&[0xCDu8; 32]));
+        assert!(mdh.len() >= 4 + 64);
+        // First 32 embedded bytes are the key; the declared-but-unused tail is zero.
+        assert_eq!(&mdh[4..4 + 32], &[0xCDu8; 32]);
+        assert_eq!(&mdh[4 + 32..4 + 64], &[0u8; 32]);
+    }
+
+    #[test]
+    fn embedded_stun_packet_roundtrips_and_shows_magic_cookie() {
+        use crate::client_wire::{decode_packet_with_layout, RecvWindow};
+        use crate::crypto::{
+            compute_time_window, current_timestamp_ms, generate_resonance_tag, DEFAULT_WINDOW_MS,
+        };
+        use crate::protocol::InnerType;
+
+        let mask = webrtc_zoom_v3();
+        let tag_offset = mask.tag_offset;
+        assert_eq!(tag_offset, 8);
+        let mdh_len = mask.header_spec.as_ref().unwrap().min_length();
+        assert_eq!(mdh_len, 20);
+
+        let mut engine = MimicryEngine::new(mask);
+        let keys = SessionKeys {
+            session_key: [7u8; 32],
+            session_key_s2c: [7u8; 32],
+            tag_secret: [9u8; 32],
+            prng_seed: [0u8; 32],
+        };
+        let mut counter = 0u64;
+        let inner = build_inner_packet(InnerType::Data, 0, b"payload-abc");
+        let pkt = engine
+            .build_packet(&inner, &keys, &mut counter, None)
+            .unwrap();
+
+        // (b) Real STUN discriminator: magic cookie 0x2112A442 at packet offset 4.
+        assert_eq!(&pkt[4..8], &[0x21, 0x12, 0xA4, 0x42]);
+        // Message type is STUN Binding Request at offset 0.
+        assert_eq!(&pkt[0..2], &[0x00, 0x01]);
+
+        // (c) Tag embedded at packet offset tag_offset (inside the transaction id).
+        let tw = compute_time_window(current_timestamp_ms(), DEFAULT_WINDOW_MS);
+        let expected = generate_resonance_tag(&keys.tag_secret, 0, tw);
+        assert_eq!(
+            &pkt[tag_offset as usize..tag_offset as usize + TAG_SIZE],
+            &expected
+        );
+
+        // (a) Round-trip: decode recovers the SAME tag (counter) and inner payload.
+        let mut win = RecvWindow::new();
+        let decoded =
+            decode_packet_with_layout(&pkt, &keys, &mut win, mdh_len, tag_offset).unwrap();
+        assert_eq!(decoded.counter, 0);
+        assert_eq!(decoded.payload, b"payload-abc");
+    }
+
+    #[test]
+    fn embedded_quic_packet_roundtrips_and_shows_long_header() {
+        use crate::client_wire::{decode_packet_with_layout, RecvWindow};
+        use crate::mask::preset_masks::quic_https_v2;
+        use crate::protocol::InnerType;
+
+        let mask = quic_https_v2();
+        let tag_offset = mask.tag_offset;
+        assert_eq!(tag_offset, 6);
+
+        let mut engine = MimicryEngine::new(mask);
+        let keys = SessionKeys {
+            session_key: [1u8; 32],
+            session_key_s2c: [1u8; 32],
+            tag_secret: [2u8; 32],
+            prng_seed: [0u8; 32],
+        };
+        let mut counter = 0u64;
+        let inner = build_inner_packet(InnerType::Data, 0, b"quic-inner");
+        let pkt = engine
+            .build_packet(&inner, &keys, &mut counter, None)
+            .unwrap();
+
+        // (b) QUIC v1 long-header discriminator: long-header Initial form in the
+        // high nibble (0xC = header-form + fixed-bit + Initial type), and
+        // version 0x00000001. Only the high nibble is asserted: RFC 9001 §5.4.1
+        // header protection masks the 4 LOW bits of the first byte (reserved +
+        // packet-number length), so they vary per packet — asserting the full
+        // 0xC0 byte was nondeterministic.
+        assert_eq!(pkt[0] & 0xf0, 0xc0);
+        assert_eq!(&pkt[1..5], &[0x00, 0x00, 0x00, 0x01]);
+        // DCID length byte.
+        assert_eq!(pkt[5], 8);
+
+        // Round-trip: a QUIC data packet is a coalesced RFC 9001 Initial with
+        // aivpn's ciphertext appended after it, so decode via the Initial parser
+        // (as the server does) to locate the trailing payload, then decrypt it.
+        // The resonance tag sits in the DCID at `tag_offset`.
+        let layout = crate::quic_initial::parse_quic_initial(&pkt).expect("valid QUIC Initial");
+        assert_eq!(
+            &layout.tag[..],
+            &pkt[tag_offset as usize..tag_offset as usize + 8]
+        );
+        let mut win = RecvWindow::new();
+        let decoded =
+            decode_packet_with_layout(&pkt, &keys, &mut win, layout.payload_offset, tag_offset)
+                .unwrap();
+        assert_eq!(decoded.payload, b"quic-inner");
+    }
+
+    #[test]
+    fn legacy_mask_still_prefixes_tag() {
+        use crate::client_wire::{decode_packet_with_mdh_len, RecvWindow};
+        use crate::crypto::{
+            compute_time_window, current_timestamp_ms, generate_resonance_tag, DEFAULT_WINDOW_MS,
+        };
+        use crate::protocol::InnerType;
+
+        // Force the legacy sentinel on an otherwise-STUN mask: the packet must
+        // revert to the byte-identical old layout (tag prefix at offset 0).
+        let mut mask = webrtc_zoom_v3();
+        mask.tag_offset = u16::MAX;
+        let mdh_len = mask.header_spec.as_ref().unwrap().min_length();
+
+        let mut engine = MimicryEngine::new(mask);
+        let keys = SessionKeys {
+            session_key: [3u8; 32],
+            session_key_s2c: [3u8; 32],
+            tag_secret: [4u8; 32],
+            prng_seed: [0u8; 32],
+        };
+        let mut counter = 0u64;
+        let inner = build_inner_packet(InnerType::Data, 0, b"legacy");
+        let pkt = engine
+            .build_packet(&inner, &keys, &mut counter, None)
+            .unwrap();
+
+        // Tag is the prefix at offset 0, header (STUN type) shifted to offset 8.
+        let tw = compute_time_window(current_timestamp_ms(), DEFAULT_WINDOW_MS);
+        let expected = generate_resonance_tag(&keys.tag_secret, 0, tw);
+        assert_eq!(&pkt[0..TAG_SIZE], &expected);
+        assert_eq!(&pkt[TAG_SIZE..TAG_SIZE + 2], &[0x00, 0x01]);
+
+        let mut win = RecvWindow::new();
+        let decoded = decode_packet_with_mdh_len(&pkt, &keys, &mut win, mdh_len).unwrap();
+        assert_eq!(decoded.payload, b"legacy");
+    }
+
+    #[test]
+    fn overlapping_tag_and_eph_falls_back_to_legacy() {
+        use crate::client_wire::{decode_packet_with_mdh_len, RecvWindow};
+        use crate::protocol::InnerType;
+
+        // Malformed mask: tag slot [8,16) overlaps eph_pub slot [10,42).
+        // build_packet must fall back to the legacy tag-prefix layout so the
+        // embedded key is never corrupted.
+        let mut mask = webrtc_zoom_v3();
+        mask.tag_offset = 8;
+        mask.eph_pub_offset = 10;
+        mask.eph_pub_length = 32;
+        assert!(mask.tag_overlaps_eph_pub(TAG_SIZE));
+
+        let mdh_len = mask.header_spec.as_ref().unwrap().min_length();
+        let mut engine = MimicryEngine::new(mask);
+        let keys = SessionKeys {
+            session_key: [5u8; 32],
+            session_key_s2c: [5u8; 32],
+            tag_secret: [6u8; 32],
+            prng_seed: [0u8; 32],
+        };
+        let mut counter = 0u64;
+        let inner = build_inner_packet(InnerType::Data, 0, b"fallback");
+        // eph_pub is None here, so the header is exactly mdh_len; the legacy
+        // decoder must recover the payload (tag prefixed at offset 0).
+        let pkt = engine
+            .build_packet(&inner, &keys, &mut counter, None)
+            .unwrap();
+        let mut win = RecvWindow::new();
+        let decoded = decode_packet_with_mdh_len(&pkt, &keys, &mut win, mdh_len).unwrap();
+        assert_eq!(decoded.payload, b"fallback");
+    }
+
+    #[test]
+    fn embedded_stun_packet_length_field_matches_ndpi_is_stun() {
+        // nDPI's is_stun() requires EXACTLY `msg_len + 20 == udp_payload_len`
+        // (STUN header is 20 bytes). Assert the built webrtc_zoom_v3 packet's
+        // message-length field (bytes[2..4], big-endian) satisfies that for a
+        // range of packet sizes, and that the magic cookie / type stay correct.
+        let mask = webrtc_zoom_v3();
+        assert_eq!(mask.stun_length_field_offset(), Some(2));
+        let mut engine = MimicryEngine::new(mask);
+        let keys = SessionKeys {
+            session_key: [7u8; 32],
+            session_key_s2c: [7u8; 32],
+            tag_secret: [9u8; 32],
+            prng_seed: [0u8; 32],
+        };
+        let mut counter = 0u64;
+        // Several plaintext sizes → several distinct packet sizes.
+        for chunk_len in [1usize, 16, 64, 128, 256, 512, 900, 1100, 1300] {
+            let payload = vec![0x41u8; chunk_len];
+            let inner = build_inner_packet(InnerType::Data, 0, &payload);
+            let pkt = engine
+                .build_packet(&inner, &keys, &mut counter, None)
+                .unwrap();
+            // STUN header must sit at offset 0: type + magic cookie intact.
+            assert_eq!(&pkt[0..2], &[0x00, 0x01], "STUN type at offset 0");
+            assert_eq!(
+                &pkt[4..8],
+                &[0x21, 0x12, 0xA4, 0x42],
+                "STUN magic cookie at offset 4"
+            );
+            // The exact nDPI is_stun() condition.
+            let msg_len = u16::from_be_bytes([pkt[2], pkt[3]]) as usize;
+            assert_eq!(
+                msg_len + 20,
+                pkt.len(),
+                "msg_len({}) + 20 must equal packet len ({}) for chunk_len {}",
+                msg_len,
+                pkt.len(),
+                chunk_len
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_stun_layout_does_not_patch_length_over_tag() {
+        // In the legacy tag-prefix layout the STUN header is shifted past the
+        // 8-byte tag; patch_stun_length must NOT run (it would corrupt the tag).
+        // The packet still round-trips, proving the length patch stayed clear.
+        use crate::client_wire::{decode_packet_with_mdh_len, RecvWindow};
+        let mut mask = webrtc_zoom_v3();
+        mask.tag_offset = u16::MAX;
+        let mdh_len = mask.header_spec.as_ref().unwrap().min_length();
+        let mut engine = MimicryEngine::new(mask);
+        let keys = SessionKeys {
+            session_key: [3u8; 32],
+            session_key_s2c: [3u8; 32],
+            tag_secret: [4u8; 32],
+            prng_seed: [0u8; 32],
+        };
+        let mut counter = 0u64;
+        let inner = build_inner_packet(InnerType::Data, 0, b"legacy-len");
+        let pkt = engine
+            .build_packet(&inner, &keys, &mut counter, None)
+            .unwrap();
+        let mut win = RecvWindow::new();
+        let decoded = decode_packet_with_mdh_len(&pkt, &keys, &mut win, mdh_len).unwrap();
+        assert_eq!(decoded.payload, b"legacy-len");
+    }
+
+    #[test]
+    fn quic_data_packet_stays_within_wan_budget() {
+        // FIX 1: a QUIC DATA packet is re-wrapped by emit() into a full RFC 9001
+        // Initial (adding ~92 B on top of the ciphertext). The mimicry engine
+        // must reserve that overhead so the FINAL emitted datagram never exceeds
+        // the WAN-safe budget — even when padding tries to fill toward the
+        // sampled target size. Loop many times per size because the padding is
+        // randomized (without the reservation, some iterations pad the pre-emit
+        // packet up to ~1380 and then overflow to ~1472 after emit()).
+        use crate::mask::preset_masks::quic_https_v2;
+        let mask = quic_https_v2();
+        assert_eq!(
+            MimicProtocol::for_spoof(mask.spoof_protocol),
+            MimicProtocol::Quic
+        );
+        let mut engine = MimicryEngine::new(mask);
+        let keys = SessionKeys {
+            session_key: [1u8; 32],
+            session_key_s2c: [1u8; 32],
+            tag_secret: [2u8; 32],
+            prng_seed: [0u8; 32],
+        };
+        let mut counter = 0u64;
+        // Payloads that leave padding headroom (<= ~1266 so a zero-pad Initial
+        // still fits the SAFE budget). The fix guarantees padding never pushes
+        // the final datagram past the budget for these.
+        for payload_len in [1usize, 64, 256, 700, 1000, 1200, 1264] {
+            for _ in 0..40 {
+                let inner = build_inner_packet(InnerType::Data, 0, &vec![0x42u8; payload_len]);
+                let pkt = engine
+                    .build_packet(&inner, &keys, &mut counter, None)
+                    .unwrap();
+                engine.update_fsm();
+                // Confirm the QUIC emit() path actually ran (long-header Initial).
+                assert_eq!(pkt[0] & 0xf0, 0xc0, "expected a QUIC Initial datagram");
+                assert!(
+                    pkt.len() <= MAX_PACKET_SIZE,
+                    "QUIC datagram {} exceeds MAX_PACKET_SIZE for payload {}",
+                    pkt.len(),
+                    payload_len
+                );
+                assert!(
+                    pkt.len() <= SAFE_OUTER_PACKET_BUDGET,
+                    "QUIC datagram {} exceeds SAFE_OUTER_PACKET_BUDGET for payload {}",
+                    pkt.len(),
+                    payload_len
+                );
+            }
+        }
+    }
+
+    #[test]
     fn test_mimicry_encryptor_data() {
         let mask = webrtc_zoom_v3();
         let keys = SessionKeys {
             session_key: [0u8; 32],
+            session_key_s2c: [0u8; 32],
             tag_secret: [0u8; 32],
             prng_seed: [0u8; 32],
         };

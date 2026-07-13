@@ -67,8 +67,10 @@ pub struct ServerArgs {
     #[arg(long, env = "AIVPN_SERVER_IP")]
     pub server_ip: Option<String>,
 
-    /// Per-IP packet rate limit for incoming UDP traffic.
-    #[arg(long, env = "AIVPN_PER_IP_PPS_LIMIT", default_value_t = 50000)]
+    /// Per-IP packet rate limit for incoming UDP traffic. Kept generous for
+    /// legitimate high-throughput clients but low enough to bound the pre-auth
+    /// handshake-scan cost from a single non-spoofed source.
+    #[arg(long, env = "AIVPN_PER_IP_PPS_LIMIT", default_value_t = 5000)]
     pub per_ip_pps_limit: u64,
 
     /// Directory for mask file storage.
@@ -164,6 +166,63 @@ pub struct ServerArgs {
     /// forwarded directly without leaving the server. Disabled by default.
     #[arg(long, env = "AIVPN_ALLOW_PEER_ROUTING")]
     pub allow_peer_routing: bool,
+
+    // ── Mask management ────────────────────────────────────────────────────────
+    /// List all mask profiles available in the mask directory.
+    #[arg(long)]
+    pub list_masks: bool,
+
+    /// Set the preferred mask for a client (by name or ID). Use with --mask-name.
+    #[arg(long, value_name = "NAME_OR_ID")]
+    pub set_mask: Option<String>,
+
+    /// Mask name to use with --set-mask (e.g. webrtc_zoom_v3, quic_https_v2).
+    #[arg(long, value_name = "MASK_NAME")]
+    pub mask_name: Option<String>,
+
+    // ── Mask signing / verification (R2 Phase B) ───────────────────────────────
+    /// Path to the operator Ed25519 mask-signing PRIVATE key (32-byte seed,
+    /// raw or base64). When set, auto-generated masks are signed after the KS
+    /// self-test passes. Keep this key SEPARATE from --key-file: it should
+    /// live on the signing/operator host, not on every edge node.
+    #[arg(long, value_name = "PATH", env = "AIVPN_MASK_SIGNING_KEY")]
+    pub mask_signing_key: Option<String>,
+
+    /// Operator Ed25519 mask-verifying PUBLIC key (base64, 32 bytes) used to
+    /// verify the embedded signature of masks loaded from --mask-dir.
+    /// Derived automatically from --mask-signing-key when omitted.
+    #[arg(long, value_name = "BASE64", env = "AIVPN_MASK_OPERATOR_PUBKEY")]
+    pub mask_operator_pubkey: Option<String>,
+
+    /// Mask signature verification mode on disk load: off | warn | enforce.
+    /// warn (default) logs failures but accepts; enforce rejects unsigned or
+    /// badly-signed masks. Overrides server.json "mask_verify_mode".
+    #[arg(long, value_name = "MODE", env = "AIVPN_MASK_VERIFY_MODE")]
+    pub mask_verify_mode: Option<String>,
+
+    /// Generate a new operator Ed25519 mask-signing key: writes the base64
+    /// seed to the given path (0600) and prints the base64 PUBLIC key to
+    /// distribute to servers/clients, then exits.
+    #[arg(long, value_name = "PATH")]
+    pub gen_mask_signing_key: Option<String>,
+
+    /// R2 Phase B: sign every mask JSON in this directory IN PLACE with the
+    /// operator key from --mask-signing-key (or config), then exit. Run once
+    /// over your mask corpus before turning on mask_verify_mode=enforce.
+    #[arg(long, value_name = "DIR")]
+    pub sign_mask_dir: Option<String>,
+
+    // ── Bootstrap descriptor distribution ──────────────────────────────────────
+    /// Print the current signed bootstrap descriptors (previous/current/next
+    /// epoch) as a JSON array, for manual publishing to a CDN/GitHub/Telegram/
+    /// other channel. Requires --key-file (an ephemeral server key cannot be
+    /// used — nobody's client would trust a descriptor signed by it).
+    #[arg(long)]
+    pub export_bootstrap_descriptor: bool,
+
+    /// Write --export-bootstrap-descriptor output to this file instead of stdout.
+    #[arg(long, value_name = "PATH")]
+    pub bootstrap_output: Option<String>,
 }
 
 /// AIVPN Server instance
@@ -188,9 +247,32 @@ impl AivpnServer {
         self.gateway.catalog_mdh()
     }
 
+    /// Return a live reference to the mask catalog so pool sync reads MDH after rotation.
+    pub fn mask_catalog(&self) -> &std::sync::Arc<crate::gateway::MaskCatalog> {
+        self.gateway.mask_catalog()
+    }
+
+    /// Return a shared handle to the live bootstrap descriptors, kept fresh
+    /// by the gateway's rotation task — for the management API's export
+    /// endpoint. Must be called before `run()` consumes the gateway.
+    pub fn bootstrap_descriptors(
+        &self,
+    ) -> Arc<parking_lot::RwLock<Vec<aivpn_common::mask::BootstrapDescriptor>>> {
+        self.gateway.bootstrap_descriptors()
+    }
+
     /// Set multi-hop chain forwarder.  Must be called before `run()`.
     pub fn set_chain_forwarder(&mut self, cf: Arc<crate::chain_forwarder::ChainForwarder>) {
         self.gateway.set_chain_forwarder(cf);
+    }
+
+    /// Return a shared handle to the live Prometheus metrics collector, for
+    /// the management API's SSE `state` event enrichment. Always
+    /// constructible: `MetricsCollector` degrades to a no-op when the crate
+    /// is built without the `metrics` feature, so callers on that side don't
+    /// need to cfg-gate this accessor — only whether they *use* the values.
+    pub fn metrics(&self) -> Arc<crate::metrics::MetricsCollector> {
+        self.gateway.metrics().clone()
     }
 
     /// Run the server

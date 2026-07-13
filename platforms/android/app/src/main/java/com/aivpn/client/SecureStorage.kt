@@ -10,46 +10,162 @@ import org.json.JSONObject
 /**
  * Secure storage using EncryptedSharedPreferences.
  * Keys are encrypted with Android Keystore — safe from root access.
+ *
+ * Corruption recovery: after a backup restore, OTA, or Keystore wipe the master key
+ * no longer matches the on-disk keyset/values, and every access throws
+ * AEADBadTagException / KeyStoreException (both [java.security.GeneralSecurityException]s).
+ * The data is unrecoverable at that point — the only way forward is to delete the
+ * prefs file (and stale master key) and start fresh, otherwise the app crashes on the
+ * first write (Connect / saveDeviceKey) or loops forever on reads.
  */
 object SecureStorage {
 
+    private const val TAG = "SecureStorage"
     private const val PREFS_FILE = "aivpn_secure_prefs"
 
     @Volatile private var cachedPrefs: SharedPreferences? = null
+
+    private fun createPrefs(context: Context): SharedPreferences {
+        val appContext = context.applicationContext
+        val masterKey = MasterKey.Builder(appContext)
+            .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
+            .build()
+        return EncryptedSharedPreferences.create(
+            appContext,
+            PREFS_FILE,
+            masterKey,
+            EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
+            EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
+        )
+    }
 
     private fun getPrefs(context: Context): SharedPreferences {
         cachedPrefs?.let { return it }
         synchronized(this) {
             cachedPrefs?.let { return it }
-            val masterKey = MasterKey.Builder(context.applicationContext)
-                .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
-                .build()
-            val prefs = EncryptedSharedPreferences.create(
-                context.applicationContext,
-                PREFS_FILE,
-                masterKey,
-                EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
-                EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
-            )
+            val prefs = try {
+                createPrefs(context)
+            } catch (e: Exception) {
+                if (!isCorruption(e) || !isUserUnlocked(context)) {
+                    // Transient failure — locked user (Direct Boot / always-on VPN
+                    // before first unlock), flaky Keystore, etc. The on-disk data is
+                    // likely fine; propagate instead of wiping so callers hit their
+                    // "storage unavailable" branches and retry after unlock.
+                    android.util.Log.w(TAG, "EncryptedSharedPreferences unavailable — not resetting: ${e.message}")
+                    throw e
+                }
+                // Master key / keyset mismatch (restore, OTA) — the stored data is
+                // unreadable no matter what. Wipe and recreate so the app stays usable.
+                android.util.Log.e(TAG, "EncryptedSharedPreferences unusable — resetting storage", e)
+                resetStorage(context)
+                createPrefs(context) // let a second failure propagate to the caller's catch
+            }
             cachedPrefs = prefs
             return prefs
         }
     }
 
+    /** True only when [t] (or a cause up the chain) is GENUINELY unrecoverable keyset
+     *  corruption — the master key/keyset no longer decrypts the stored data and a wipe
+     *  is the only recovery. Deliberately NARROW (MEDIUM-2): descriptor I/O now runs on
+     *  every reconnect and after every session, so a *transient* Keystore hiccup
+     *  (BACKEND_BUSY / SYSTEM_ERROR / binder death under memory pressure) must NEVER be
+     *  treated as corruption — that would nuke every stored profile + the device-binding
+     *  key. Such transient failures surface as [android.security.KeyStoreException]s,
+     *  which are also GeneralSecurityExceptions, so the old "any GeneralSecurityException
+     *  = corruption" test was far too broad. */
+    private fun isCorruption(t: Throwable?): Boolean {
+        var cause = t
+        var depth = 0
+        while (cause != null && depth < 6) {
+            // Transient Android Keystore failure — data on disk is fine; never wipe.
+            if (cause is android.security.KeyStoreException) return false
+            // AEAD tag mismatch: the keyset/master key genuinely no longer decrypts
+            // the ciphertext (backup restore, OTA, Keystore wipe) — unrecoverable.
+            if (cause is javax.crypto.AEADBadTagException) return true
+            // Tink raises a keyset parse/decrypt failure as one of its own
+            // GeneralSecurityException subclasses — also genuine corruption.
+            if (cause.javaClass.name.startsWith("com.google.crypto.tink")) return true
+            cause = cause.cause
+            depth++
+        }
+        return false
+    }
+
+    /** True when the user has unlocked the device at least once since boot — i.e.
+     *  credential-encrypted storage and Keystore keys are actually available. Before
+     *  the first unlock (Direct Boot, always-on VPN cold start) every Keystore access
+     *  fails with errors indistinguishable from real corruption; resetting then would
+     *  destroy perfectly good profiles and the device-binding key. */
+    private fun isUserUnlocked(context: Context): Boolean {
+        return try {
+            val um = context.applicationContext
+                .getSystemService(Context.USER_SERVICE) as? android.os.UserManager
+            um?.isUserUnlocked ?: true
+        } catch (e: Exception) {
+            true
+        }
+    }
+
+    /** Deletes the encrypted prefs file and the stale AndroidX master key so the next
+     *  [getPrefs] call recreates both from scratch. All stored data is lost — but it
+     *  was already unreadable when this is called. */
+    private fun resetStorage(context: Context) {
+        val appContext = context.applicationContext
+        cachedPrefs = null
+        try {
+            appContext.deleteSharedPreferences(PREFS_FILE)
+        } catch (e: Exception) {
+            android.util.Log.w(TAG, "deleteSharedPreferences failed: ${e.message}")
+        }
+        try {
+            val ks = java.security.KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
+            ks.deleteEntry(MasterKey.DEFAULT_MASTER_KEY_ALIAS)
+        } catch (e: Exception) {
+            android.util.Log.w(TAG, "Master key delete failed: ${e.message}")
+        }
+    }
+
     fun saveString(context: Context, key: String, value: String) {
-        getPrefs(context).edit().putString(key, value).apply()
+        try {
+            getPrefs(context).edit().putString(key, value).apply()
+        } catch (e: Exception) {
+            android.util.Log.e(TAG, "saveString failed for key '$key': ${e.message}", e)
+            if (!isCorruption(e) || !isUserUnlocked(context)) return
+            // Corrupted store (AEADBadTagException & co) — reset and retry once so the
+            // first Connect after a restore works instead of crashing.
+            synchronized(this) { resetStorage(context) }
+            try {
+                getPrefs(context).edit().putString(key, value).apply()
+            } catch (e2: Exception) {
+                android.util.Log.e(TAG, "saveString retry failed for key '$key': ${e2.message}", e2)
+            }
+        }
     }
 
     fun loadString(context: Context, key: String, defaultValue: String = ""): String {
         return try {
             getPrefs(context).getString(key, defaultValue) ?: defaultValue
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            android.util.Log.e(TAG, "Keystore access failed for key '$key': ${e.message}", e)
+            if (isCorruption(e) && isUserUnlocked(context)) {
+                // Values are permanently undecryptable — reset now so subsequent
+                // reads/writes recreate a working (empty) store instead of failing forever.
+                synchronized(this) { resetStorage(context) }
+            }
             defaultValue
         }
     }
 
     fun remove(context: Context, key: String) {
-        getPrefs(context).edit().remove(key).apply()
+        try {
+            getPrefs(context).edit().remove(key).apply()
+        } catch (e: Exception) {
+            android.util.Log.e(TAG, "remove failed for key '$key': ${e.message}", e)
+            if (isCorruption(e) && isUserUnlocked(context)) {
+                synchronized(this) { resetStorage(context) }
+            }
+        }
     }
 
     // Connection key helpers (legacy single-key, kept for migration)
@@ -77,6 +193,9 @@ object SecureStorage {
         val name: String,
         val key: String,
         val mtlsCertBase64: String? = null,
+        val dnsServers: List<String>? = null,
+        /** Preferred mask profile name (e.g. "webrtc_zoom_v3"). null/"auto" = server default. */
+        val maskProfile: String? = null,
     )
 
     fun saveProfiles(context: Context, profiles: List<ConnectionProfile>) {
@@ -87,12 +206,20 @@ object SecureStorage {
                 put("name", p.name)
                 put("key", p.key)
                 if (p.mtlsCertBase64 != null) put("mtlsCertBase64", p.mtlsCertBase64)
+                if (!p.dnsServers.isNullOrEmpty()) {
+                    val dnsArr = JSONArray()
+                    p.dnsServers.forEach { dnsArr.put(it) }
+                    put("dns", dnsArr)
+                }
+                if (!p.maskProfile.isNullOrEmpty() && p.maskProfile != "auto") {
+                    put("maskProfile", p.maskProfile)
+                }
             })
         }
         saveString(context, "profiles", arr.toString())
     }
 
-    fun loadProfiles(context: Context): MutableList<ConnectionProfile> {
+    fun loadProfiles(context: Context): List<ConnectionProfile> {
         val raw = loadString(context, "profiles")
         if (raw.isEmpty()) return mutableListOf()
         return try {
@@ -100,15 +227,24 @@ object SecureStorage {
             val result = mutableListOf<ConnectionProfile>()
             for (i in 0 until arr.length()) {
                 val obj = arr.getJSONObject(i)
+                val dnsArr = obj.optJSONArray("dns")
+                val dnsServers: List<String>? = if (dnsArr != null) {
+                    (0 until dnsArr.length()).map { dnsArr.getString(it) }
+                        .filter { it.isNotBlank() }.takeIf { it.isNotEmpty() }
+                } else null
+                val maskProfile = obj.optString("maskProfile").ifEmpty { null }
                 result.add(ConnectionProfile(
                     id = obj.getString("id"),
                     name = obj.getString("name"),
                     key = obj.getString("key"),
                     mtlsCertBase64 = obj.optString("mtlsCertBase64").ifEmpty { null },
+                    dnsServers = dnsServers,
+                    maskProfile = maskProfile,
                 ))
             }
             result
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            android.util.Log.e("SecureStorage", "loadProfiles parse error: ${e.message}", e)
             mutableListOf()
         }
     }
@@ -141,6 +277,62 @@ object SecureStorage {
         }
     }
 
+    // ──────────── Bootstrap descriptors (covert handshake persistence) ────────────
+
+    private const val KEY_BOOTSTRAP_DESCRIPTORS = "bootstrap_descriptors_json_v1"
+
+    /** LOW-5: hard cap on the persisted descriptor blob. The core caps the store at
+     *  8 descriptors but each may carry embedded masks, so an unbounded blob could
+     *  reach multiple MB in EncryptedSharedPreferences. A blob larger than this is a
+     *  bug or abuse — refuse to persist it rather than bloat the prefs file. */
+    private const val MAX_DESCRIPTOR_BLOB_BYTES = 256 * 1024
+
+    /** M1: scope the persisted descriptor blob PER SERVER so a profile switch never
+     *  loads server A's descriptors when connecting to server B (which would invert
+     *  the covertness benefit and can mis-frame B's opening packet). The key is
+     *  suffixed with a short hash of the server's base64 public key. A null/blank
+     *  server key falls back to the legacy global key (best-effort). */
+    private fun bootstrapDescriptorsKey(serverKeyBase64: String?): String {
+        if (serverKeyBase64.isNullOrBlank()) return KEY_BOOTSTRAP_DESCRIPTORS
+        return try {
+            val md = java.security.MessageDigest.getInstance("SHA-256")
+            val hash = md.digest(serverKeyBase64.toByteArray(Charsets.UTF_8))
+            val suffix = android.util.Base64.encodeToString(
+                hash,
+                android.util.Base64.URL_SAFE or android.util.Base64.NO_PADDING or android.util.Base64.NO_WRAP,
+            ).take(16)
+            "$KEY_BOOTSTRAP_DESCRIPTORS:$suffix"
+        } catch (_: Exception) {
+            KEY_BOOTSTRAP_DESCRIPTORS
+        }
+    }
+
+    /**
+     * Persist the raw JSON array of ed25519-signed bootstrap descriptors received
+     * from the server this session. They are self-authenticating and re-verified
+     * on load in the Rust core, so storing the raw blobs is safe. Persisting them
+     * lets the very next COLD START shape its first handshake with a COVERT
+     * rotated descriptor mask instead of a fingerprintable public preset. Scoped
+     * per [serverKeyBase64] (M1). A blank or "[]" value clears this server's blob.
+     */
+    fun saveBootstrapDescriptors(context: Context, json: String, serverKeyBase64: String? = null) {
+        val key = bootstrapDescriptorsKey(serverKeyBase64)
+        if (json.isBlank() || json == "[]") {
+            remove(context, key)
+        } else if (json.toByteArray(Charsets.UTF_8).size > MAX_DESCRIPTOR_BLOB_BYTES) {
+            // LOW-5: refuse an oversized blob rather than bloat the prefs file.
+            android.util.Log.w(TAG, "Bootstrap descriptor blob too large — not persisting")
+        } else {
+            saveString(context, key, json)
+        }
+    }
+
+    /** Load this server's persisted bootstrap-descriptor JSON array, or null if none. */
+    fun loadBootstrapDescriptors(context: Context, serverKeyBase64: String? = null): String? {
+        val raw = loadString(context, bootstrapDescriptorsKey(serverKeyBase64))
+        return raw.ifBlank { null }
+    }
+
     // ──────────── Split tunneling ────────────
 
     private const val KEY_ALLOWED_APPS = "split_tunnel_allowed_apps"
@@ -151,7 +343,7 @@ object SecureStorage {
         saveString(context, KEY_ALLOWED_APPS, arr.toString())
     }
 
-    fun loadAllowedApps(context: Context): MutableSet<String> {
+    fun loadAllowedApps(context: Context): Set<String> {
         val raw = loadString(context, KEY_ALLOWED_APPS)
         if (raw.isEmpty()) return mutableSetOf()
         return try {
@@ -174,7 +366,7 @@ object SecureStorage {
         saveString(context, KEY_EXCLUDED_DOMAINS, arr.toString())
     }
 
-    fun loadExcludedDomains(context: Context): MutableList<String> {
+    fun loadExcludedDomains(context: Context): List<String> {
         val raw = loadString(context, KEY_EXCLUDED_DOMAINS)
         if (raw.isEmpty()) return mutableListOf()
         return try {

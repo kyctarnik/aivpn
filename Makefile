@@ -23,8 +23,8 @@ TEAM_ID ?=
 # MikroTik image tag — make mikrotik IMAGE=myrepo/aivpn-mikrotik:latest
 IMAGE    ?= infosave2007/aivpn-mikrotik:latest
 
-.PHONY: help setup check test clippy fmt \
-        server client server-docker \
+.PHONY: help setup check test clippy fmt mask-gate \
+        server server-tiny client server-docker \
         server-arm64 client-arm64 \
         server-musl-armv7 server-musl-mipsel server-musl-aarch64 \
         client-musl-armv7 client-musl-mipsel client-musl-aarch64 \
@@ -33,6 +33,7 @@ IMAGE    ?= infosave2007/aivpn-mikrotik:latest
         mikrotik mikrotik-local \
         openwrt \
         android \
+        web web-docker web-dev \
         deploy server-deploy test-docker clean clean-releases
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -46,8 +47,10 @@ help:
 	@printf "    %-40s %s\n" "make test"                "cargo test --workspace"
 	@printf "    %-40s %s\n" "make clippy"              "cargo clippy --all-targets"
 	@printf "    %-40s %s\n" "make fmt"                 "cargo fmt --all"
+	@printf "    %-40s %s\n" "make mask-gate"           "nDPI-gate every assets/masks/*.json (R2 Phase A)"
 	@printf "\n  Server / Client — Linux x86_64\n"
-	@printf "    %-40s %s\n" "make server"              "→ releases/aivpn-server-linux-x86_64"
+	@printf "    %-40s %s\n" "make server"              "Full server [management-api,metrics,neural]"
+	@printf "    %-40s %s\n" "make server-tiny"         "Minimal server (bare VPN gateway)"
 	@printf "    %-40s %s\n" "make client"              "→ releases/aivpn-client-linux-x86_64"
 	@printf "    %-40s %s\n" "make server-docker"       "Build server via Docker (minimal deps)"
 	@printf "\n  Cross-compile — Linux ARM / MUSL\n"
@@ -74,6 +77,10 @@ help:
 	@printf "    %-40s %s\n" "make openwrt"             "Build musl client binaries for ARMv7/MIPSel/AArch64"
 	@printf "\n  Android\n"
 	@printf "    %-40s %s\n" "make android"             "Build Android APK (requires SDK+NDK)"
+	@printf "\n  Web management panel\n"
+	@printf "    %-40s %s\n" "make web"                 "Build aivpn-web panel → platforms/aivpn-web/dist/"
+	@printf "    %-40s %s\n" "make web-docker"          "Build aivpn-web:latest Docker image"
+	@printf "    %-40s %s\n" "make web-dev"             "Start aivpn-web dev servers (Hono + SvelteKit)"
 	@printf "\n  Deploy\n"
 	@printf "    %-40s %s\n" "make deploy"              "Deploy server to VPS via Docker"
 	@printf "\n  Clean\n"
@@ -108,17 +115,38 @@ clippy:
 fmt:
 	cargo fmt --all
 
+# Offline nDPI provenance gate (R2 Phase A). Synthesises every mask's real
+# uplink packets and fails if nDPI does not classify a mask as its declared
+# target protocol. Gracefully SKIPS (exit 0) when the research DPI toolchain
+# (nDPI + maskpcap under the gitignored research/ tree) is not built, so devs
+# without it are not blocked. See docs/R2_PHASE_A.md.
+mask-gate:
+	scripts/ci-mask-gate.sh
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Server / Client — Linux x86_64
 # ─────────────────────────────────────────────────────────────────────────────
 releases/:
 	@mkdir -p releases
 
+# Full server: the features a real deployment needs — management-api (web panel
+# + /run/aivpn/api.sock), metrics (dashboard time-series), neural (DPI-driven
+# mask rotation). This is the canonical release artifact. Use `make server-tiny`
+# for a bare VPN-gateway build with none of these.
 server: releases/
-	cargo build --release -p aivpn-server
+	cargo build --release --bin aivpn-server --features "management-api,metrics,neural" -p aivpn-server
 	cp target/release/aivpn-server releases/aivpn-server-linux-x86_64
 	chmod +x releases/aivpn-server-linux-x86_64
-	@echo "→ releases/aivpn-server-linux-x86_64  ($$(du -h releases/aivpn-server-linux-x86_64 | cut -f1))"
+	@echo "→ releases/aivpn-server-linux-x86_64  [management-api,metrics,neural]  ($$(du -h releases/aivpn-server-linux-x86_64 | cut -f1))"
+
+# Minimal server: default features only (no management-api/metrics/neural) — a
+# lean pure VPN gateway. The web panel and metrics dashboard will NOT work
+# against this build; use `make server` for those.
+server-tiny: releases/
+	cargo build --release --bin aivpn-server -p aivpn-server
+	cp target/release/aivpn-server releases/aivpn-server-linux-x86_64-tiny
+	chmod +x releases/aivpn-server-linux-x86_64-tiny
+	@echo "→ releases/aivpn-server-linux-x86_64-tiny  [minimal]  ($$(du -h releases/aivpn-server-linux-x86_64-tiny | cut -f1))"
 
 client: releases/
 	cargo build --release -p aivpn-client
@@ -262,7 +290,7 @@ windows: releases/
 	    unzip -o "$$WINTUN_ZIP" "wintun/bin/amd64/wintun.dll" -d /tmp/; \
 	    cp /tmp/wintun/bin/amd64/wintun.dll "$$WINTUN_DLL"; \
 	fi; \
-	cp crates/aivpn-windows/assets/aivpn.ico "$$PACKAGE_DIR/aivpn.ico"; \
+	cp assets/brand/win/aivpn.ico "$$PACKAGE_DIR/aivpn.ico"; \
 	if command -v zip >/dev/null 2>&1; then \
 	    (cd "$$PACKAGE_DIR" && zip -r "../aivpn-windows-gui.zip" ./*); \
 	else \
@@ -279,11 +307,12 @@ z=zipfile.ZipFile('$$ZIP_NAME','w',zipfile.ZIP_DEFLATED); \
 	      "-DSTAGE_DIR=$$(pwd)/$$PACKAGE_DIR" \
 	      "-DOUTPUT_EXE=$$(pwd)/$$INSTALLER_EXE" \
 	      "$$NSI"; \
-	    echo "→ $$INSTALLER_EXE"; \
+	    echo "→ $$INSTALLER_EXE  ($$(du -h $$INSTALLER_EXE | cut -f1))"; \
+	    rm -rf "$$PACKAGE_DIR"; \
 	else \
-	    echo "makensis not found — skipping installer"; \
-	fi; \
-	echo "→ $$ZIP_NAME  ($$(du -h $$ZIP_NAME | cut -f1))"
+	    echo "makensis not found — keeping zip: $$ZIP_NAME"; \
+	    echo "→ $$ZIP_NAME  ($$(du -h $$ZIP_NAME | cut -f1))"; \
+	fi
 
 # ─────────────────────────────────────────────────────────────────────────────
 # iOS IPA (macOS + Xcode 15+ required)
@@ -342,6 +371,7 @@ ios:
 	    -configuration "$$CONFIGURATION" \
 	    -destination "generic/platform=iOS" \
 	    -archivePath "$$ARCHIVE" \
+	    -allowProvisioningUpdates \
 	    $$SIGN_ARGS SKIP_INSTALL=NO BUILD_LIBRARY_FOR_DISTRIBUTION=NO; \
 	mkdir -p "$$REPO_ROOT/releases"; \
 	DEST="$$REPO_ROOT/releases/aivpn-ios.ipa"; \
@@ -387,6 +417,18 @@ macos:
 	@echo "→ releases/aivpn-macos.dmg"
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Linux GUI binary (no extra tools required)
+# ─────────────────────────────────────────────────────────────────────────────
+linux: releases/
+	cargo build --release -p aivpn-linux
+	cargo build --release -p aivpn-client --bin aivpn-client --bin aivpn-ip-helper
+	cp target/release/aivpn-linux      releases/aivpn-linux-x86_64
+	cp target/release/aivpn-client     releases/aivpn-client-linux-x86_64
+	cp target/release/aivpn-ip-helper  releases/aivpn-ip-helper-linux-x86_64
+	chmod +x releases/aivpn-linux-x86_64 releases/aivpn-client-linux-x86_64 releases/aivpn-ip-helper-linux-x86_64
+	@echo "→ releases/aivpn-linux-x86_64  ($$(du -h releases/aivpn-linux-x86_64 | cut -f1))"
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Linux AppImage
 # Requires: appimagetool (https://github.com/AppImage/AppImageKit/releases)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -396,14 +438,15 @@ linux-appimage:
 	APPDIR=AppDir-aivpn-linux; \
 	echo "==> Building aivpn-linux release binary..."; \
 	cargo build --release -p aivpn-linux; \
-	echo "==> Building aivpn-client release binary..."; \
-	cargo build --release -p aivpn-client; \
+	echo "==> Building aivpn-client + aivpn-ip-helper release binaries..."; \
+	cargo build --release -p aivpn-client --bin aivpn-client --bin aivpn-ip-helper; \
 	echo "==> Setting up AppDir..."; \
 	rm -rf "$$APPDIR"; \
 	mkdir -p "$$APPDIR/usr/bin" "$$APPDIR/usr/share/applications" \
 	         "$$APPDIR/usr/share/icons/hicolor/256x256/apps"; \
-	cp target/release/aivpn-linux  "$$APPDIR/usr/bin/"; \
-	cp target/release/aivpn-client "$$APPDIR/usr/bin/"; \
+	cp target/release/aivpn-linux     "$$APPDIR/usr/bin/"; \
+	cp target/release/aivpn-client    "$$APPDIR/usr/bin/"; \
+	cp target/release/aivpn-ip-helper "$$APPDIR/usr/bin/"; \
 	printf '[Desktop Entry]\nName=AIVPN\nComment=AI-powered VPN\nExec=aivpn-linux\nIcon=aivpn\nType=Application\nCategories=Network;\n' \
 	    > "$$APPDIR/usr/share/applications/aivpn.desktop"; \
 	cp "$$APPDIR/usr/share/applications/aivpn.desktop" "$$APPDIR/"; \
@@ -420,12 +463,23 @@ linux-appimage:
 	    > "$$APPDIR/AppRun"; \
 	chmod +x "$$APPDIR/AppRun"; \
 	echo "==> Packaging AppImage..."; \
-	APPIMAGETOOL=$${APPIMAGETOOL:-appimagetool}; \
-	command -v "$$APPIMAGETOOL" >/dev/null 2>&1 || \
-	    { echo "ERROR: appimagetool not found. Download from https://github.com/AppImage/AppImageKit/releases" >&2; exit 1; }; \
 	OUTPUT="releases/aivpn-linux-$$ARCH.AppImage"; \
 	mkdir -p releases; \
-	ARCH="$$ARCH" "$$APPIMAGETOOL" "$$APPDIR" "$$OUTPUT"; \
+	if [ -n "$${APPIMAGETOOL:-}" ] && command -v "$$APPIMAGETOOL" >/dev/null 2>&1; then \
+	    ARCH="$$ARCH" "$$APPIMAGETOOL" "$$APPDIR" "$$OUTPUT"; \
+	elif command -v appimagetool >/dev/null 2>&1; then \
+	    ARCH="$$ARCH" appimagetool "$$APPDIR" "$$OUTPUT"; \
+	else \
+	    echo "==> appimagetool not found — fetching a local copy (no system install needed)..."; \
+	    TOOL="build/.tools/appimagetool-$$ARCH.AppImage"; \
+	    mkdir -p build/.tools; \
+	    if [ ! -x "$$TOOL" ]; then \
+	        curl -fsSL -o "$$TOOL" "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-$$ARCH.AppImage" \
+	            || { echo "ERROR: could not download appimagetool. Install it manually or set APPIMAGETOOL=/path/to/appimagetool." >&2; exit 1; }; \
+	        chmod +x "$$TOOL"; \
+	    fi; \
+	    ARCH="$$ARCH" "$$TOOL" --appimage-extract-and-run "$$APPDIR" "$$OUTPUT"; \
+	fi; \
 	echo "→ $$OUTPUT"
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -636,11 +690,48 @@ android:
 	echo "==> Building Android APK (release)..."; \
 	(cd platforms/android && bash build-rust-android.sh release); \
 	if [ -f releases/aivpn-client.apk ]; then \
-	    cp releases/aivpn-client.apk releases/aivpn-android.apk; \
-	    echo "→ releases/aivpn-android.apk"; \
+	    mv releases/aivpn-client.apk releases/aivpn-android.apk; \
+	    echo "→ releases/aivpn-android.apk  ($$(du -h releases/aivpn-android.apk | cut -f1))"; \
 	else \
 	    echo "ERROR: APK not found at releases/aivpn-client.apk"; exit 1; \
 	fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Web management panel (Hono 4 + SvelteKit 2 + Svelte 5)
+# Requires: Bun (installed automatically if absent)
+# ─────────────────────────────────────────────────────────────────────────────
+web:
+	@set -e; \
+	if ! command -v bun >/dev/null 2>&1; then \
+	    echo "==> Installing Bun..."; \
+	    curl -fsSL https://bun.sh/install | bash; \
+	    export PATH="$$HOME/.bun/bin:$$PATH"; \
+	fi; \
+	echo "==> Installing web dependencies..."; \
+	bun install --frozen-lockfile --cwd platforms/aivpn-web; \
+	echo "==> Building aivpn-web..."; \
+	bun run --cwd platforms/aivpn-web build; \
+	echo "→ platforms/aivpn-web/dist/"
+
+web-docker:
+	@echo "==> Building aivpn-web Docker image..."
+	docker build -t aivpn-web:latest -f platforms/aivpn-web/Dockerfile .
+	@echo "→ aivpn-web:latest"
+	@echo ""
+	@echo "Run with:"
+	@echo "  docker run -d --name aivpn-web -p 3000:3000 \\"
+	@echo "    -v /run/aivpn/api.sock:/run/aivpn/api.sock \\"
+	@echo "    aivpn-web:latest"
+
+web-dev:
+	@set -e; \
+	if ! command -v bun >/dev/null 2>&1; then \
+	    echo "==> Installing Bun..."; \
+	    curl -fsSL https://bun.sh/install | bash; \
+	    export PATH="$$HOME/.bun/bin:$$PATH"; \
+	fi; \
+	echo "==> Starting aivpn-web dev servers (Hono backend + SvelteKit frontend)..."; \
+	bun run --cwd platforms/aivpn-web dev
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Clean

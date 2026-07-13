@@ -502,6 +502,7 @@ fn battle_wire_format_multiple_packets() {
 fn battle_wire_format_zero_padding() {
     let keys = SessionKeys {
         session_key: crypto::blake3_hash(b"key"),
+        session_key_s2c: crypto::blake3_hash(b"key"),
         tag_secret: crypto::blake3_hash(b"tag"),
         prng_seed: [0u8; 32],
     };
@@ -527,6 +528,7 @@ fn battle_wire_format_zero_padding() {
 fn battle_wire_format_max_padding() {
     let keys = SessionKeys {
         session_key: crypto::blake3_hash(b"key"),
+        session_key_s2c: crypto::blake3_hash(b"key"),
         tag_secret: crypto::blake3_hash(b"tag"),
         prng_seed: [0u8; 32],
     };
@@ -699,22 +701,14 @@ fn battle_all_preset_masks_valid() {
 
 #[test]
 fn battle_mask_signature_verification() {
-    use ed25519_dalek::{Signer, SigningKey};
+    use ed25519_dalek::SigningKey;
 
     let mut mask = webrtc_zoom_v3();
 
-    // Create signing key and sign the mask
+    // Sign the whole mask (signature now covers every field via signing_message).
     let signing_key = SigningKey::from_bytes(&[0x42u8; 32]);
     let verifying_key = signing_key.verifying_key();
-
-    // Build canonical message: mask_id || version || header_template
-    let mut message = Vec::new();
-    message.extend_from_slice(mask.mask_id.as_bytes());
-    message.extend_from_slice(&mask.version.to_le_bytes());
-    message.extend_from_slice(&mask.header_template);
-
-    let sig = signing_key.sign(&message);
-    mask.signature = sig.to_bytes();
+    mask.sign(&signing_key);
 
     // Verify with correct key
     assert!(mask.verify_signature(&verifying_key.to_bytes()).unwrap());
@@ -728,19 +722,12 @@ fn battle_mask_signature_verification() {
 
 #[test]
 fn battle_mask_signature_tamper_detected() {
-    use ed25519_dalek::{Signer, SigningKey};
+    use ed25519_dalek::SigningKey;
 
     let mut mask = webrtc_zoom_v3();
     let signing_key = SigningKey::from_bytes(&[0x42u8; 32]);
     let verifying_key = signing_key.verifying_key();
-
-    let mut message = Vec::new();
-    message.extend_from_slice(mask.mask_id.as_bytes());
-    message.extend_from_slice(&mask.version.to_le_bytes());
-    message.extend_from_slice(&mask.header_template);
-
-    let sig = signing_key.sign(&message);
-    mask.signature = sig.to_bytes();
+    mask.sign(&signing_key);
 
     // Tamper with mask_id
     mask.mask_id = "tampered".to_string();
@@ -770,14 +757,33 @@ fn battle_mask_iat_distribution_sampling() {
 
 #[test]
 fn battle_mask_fsm_transitions() {
+    // The bundled masks carry corpus-derived temporal-Markov FSMs (R4), whose
+    // transitions use Random(prob) conditions rather than a hand-authored
+    // AfterDuration graph, so this validates the transition MECHANISM
+    // structure-agnostically: process_transition must always return a state_id
+    // that exists in the mask (either the current state on no-op, or a declared
+    // next_state) and must never panic for any (state, packets, duration).
     let mask = webrtc_zoom_v3();
-    // Start in state 0
-    let (next, _, _, _) = mask.process_transition(0, 0, 0);
-    assert_eq!(next, 0, "Should stay in state 0 initially");
-
-    // After 5000ms should transition
-    let (next, _, _, _) = mask.process_transition(0, 100, 6000);
-    assert_eq!(next, 1, "Should transition to state 1 after 5s");
+    let valid: std::collections::HashSet<u16> =
+        mask.fsm_states.iter().map(|s| s.state_id).collect();
+    assert!(
+        !mask.fsm_states.is_empty(),
+        "R4: mask must carry fsm_states"
+    );
+    assert!(
+        valid.contains(&mask.fsm_initial_state),
+        "fsm_initial_state must be a declared state"
+    );
+    for &state in &[mask.fsm_initial_state, 0, 1, 2, 99] {
+        for &(pkts, dur) in &[(0u32, 0u64), (1, 100), (100, 6000), (10_000, 600_000)] {
+            let (next, _, _, _) = mask.process_transition(state, pkts, dur);
+            // Either a declared state, or the input state echoed back (no match).
+            assert!(
+                valid.contains(&next) || next == state,
+                "process_transition({state},{pkts},{dur}) -> {next} is not a valid state"
+            );
+        }
+    }
 }
 
 #[test]

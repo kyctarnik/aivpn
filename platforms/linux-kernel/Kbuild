@@ -4,6 +4,8 @@ aivpn-y    := src/session_table.o \
                src/crypto_ops.o   \
                src/udp_hook.o     \
                src/tun_inject.o   \
+               src/egress.o       \
+               src/stats.o        \
                src/dev.o          \
                src/main.o
 

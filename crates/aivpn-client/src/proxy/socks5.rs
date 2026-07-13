@@ -25,7 +25,7 @@ pub enum TargetAddr {
 
 #[derive(Clone, Debug)]
 pub enum Socks5Command {
-    Connect(TargetAddr),          // было Connect(SocketAddr)
+    Connect(TargetAddr), // было Connect(SocketAddr)
     UdpAssociate(SocketAddr),
 }
 
@@ -118,7 +118,7 @@ impl Socks5Session {
                 let mut port_buf = [0u8; 2];
                 self.stream.read_exact(&mut port_buf).await?;
                 let port = u16::from_be_bytes(port_buf);
-                TargetAddr::Domain(host, port)          // ← резолв убрали, отдаём домен
+                TargetAddr::Domain(host, port) // ← резолв убрали, отдаём домен
             }
             ATYP_IPV6 => {
                 let mut a = [0u8; 16];
@@ -208,7 +208,12 @@ pub fn parse_udp_request(packet: &[u8]) -> std::io::Result<Socks5UdpPacket> {
                     "SOCKS5 UDP IPv4 header too short",
                 ));
             }
-            let ip = std::net::Ipv4Addr::new(packet[idx], packet[idx + 1], packet[idx + 2], packet[idx + 3]);
+            let ip = std::net::Ipv4Addr::new(
+                packet[idx],
+                packet[idx + 1],
+                packet[idx + 2],
+                packet[idx + 3],
+            );
             idx += 4;
             let port = u16::from_be_bytes([packet[idx], packet[idx + 1]]);
             idx += 2;
@@ -226,7 +231,10 @@ pub fn parse_udp_request(packet: &[u8]) -> std::io::Result<Socks5UdpPacket> {
             idx += 16;
             let port = u16::from_be_bytes([packet[idx], packet[idx + 1]]);
             idx += 2;
-            Socks5UdpTarget::Ip(SocketAddr::new(std::net::IpAddr::V6(std::net::Ipv6Addr::from(oct)), port))
+            Socks5UdpTarget::Ip(SocketAddr::new(
+                std::net::IpAddr::V6(std::net::Ipv6Addr::from(oct)),
+                port,
+            ))
         }
         ATYP_DOMAIN => {
             if packet.len() < idx + 1 {
@@ -310,9 +318,11 @@ pub async fn resolve_udp_target(target: &Socks5UdpTarget) -> std::io::Result<Soc
         Socks5UdpTarget::Domain(host, port) => tokio::net::lookup_host((host.as_str(), *port))
             .await?
             .find(|a| a.is_ipv4())
-            .ok_or_else(|| std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("DNS: no IPv4 result for {host}:{port}"),
-            )),
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("DNS: no IPv4 result for {host}:{port}"),
+                )
+            }),
     }
 }

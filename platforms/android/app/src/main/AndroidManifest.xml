@@ -8,6 +8,11 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <!-- Lets the Background Health screen fire ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS
+         (direct Allow/Deny dialog). Without the exemption, Android 12+/OEM power managers
+         kill the VPN foreground service in the background. -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 
     <application
         android:allowBackup="false"
@@ -38,6 +43,12 @@
             android:exported="false"
             android:parentActivityName=".MainActivity" />
 
+        <!-- Background reliability & permissions health check -->
+        <activity
+            android:name=".BackgroundHealthActivity"
+            android:exported="false"
+            android:parentActivityName=".MainActivity" />
+
         <service
             android:name=".AivpnService"
             android:permission="android.permission.BIND_VPN_SERVICE"
@@ -50,6 +61,9 @@
             <meta-data
                 android:name="android.net.VpnService.SUPPORTS_ALWAYS_ON"
                 android:value="true" />
+            <meta-data
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="VPN service for censorship circumvention" />
         </service>
 
         <!-- Quick Settings tile — lets users toggle VPN from the notification shade.
@@ -65,6 +79,17 @@
                 <action android:name="android.service.quicksettings.action.QS_TILE" />
             </intent-filter>
         </service>
+
+        <!-- Boot receiver — auto-connects VPN after device reboot when preference is set. -->
+        <receiver
+            android:name=".BootReceiver"
+            android:exported="false"
+            android:directBootAware="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.LOCKED_BOOT_COMPLETED" />
+            </intent-filter>
+        </receiver>
 
         <provider
             android:name="androidx.core.content.FileProvider"

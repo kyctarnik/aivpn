@@ -19,11 +19,12 @@
  * Configuration (BPF ARRAY map "xdp_config", pinned at
  *   /sys/fs/bpf/aivpn/xdp_config):
  *   key 0 → u64  VPN UDP destination port (host byte order; 0 = pass all UDP)
- *   key 1 → u64  tag acceptance window in milliseconds (default 10 000 ms)
+ *   key 1 → u64  reserved (was: tag window ms — removed; tag validation is in kernel module)
  *
  * Protocol layout at UDP payload offset 0:
- *   [8 bytes]  resonance tag  (first 8 bytes = LE u64 millisecond timestamp)
- *   [1 byte]   pad_len
+ *   [8 bytes]  resonance tag  (BLAKE3 keyed hash — opaque to XDP)
+ *   [N bytes]  mask-dependent header (MDH, variable length per active mask)
+ *   [2 bytes]  pad_len
  *   [1 byte]   inner_type / control sub-type
  *   [...]      encrypted payload + Poly1305 tag
  *
@@ -151,26 +152,10 @@ int aivpn_xdp_filter(struct xdp_md *ctx)
 		return XDP_DROP;
 	}
 
-	/* ── Resonance-tag timestamp check ───────────────────────────── */
-	__u8 *payload = (void *)(udp + 1);
-	if ((void *)(payload + 8) > data_end)
-		return XDP_DROP;
-
-	__u64 tag_ts = 0;
-	__builtin_memcpy(&tag_ts, payload, 8); /* LE u64 milliseconds */
-
-	__u64 now_ms = bpf_ktime_get_ns() / 1000000ULL;
-
-	__u32  key1   = 1;
-	__u64 *wcfg   = bpf_map_lookup_elem(&xdp_config, &key1);
-	__u64  win_ms = (wcfg && *wcfg) ? *wcfg : 10000ULL;
-
-	__u64 delta = now_ms > tag_ts ? now_ms - tag_ts : tag_ts - now_ms;
-	if (delta > win_ms) {
-		record_drop(DROP_TAG_EXPIRED);
-		return XDP_DROP;
-	}
-
+	/* Resonance-tag validation requires the session key and is performed
+	 * by the kernel module's sk_data_ready hook.  XDP only checks port
+	 * and minimum payload size — both already done above.
+	 */
 	return XDP_PASS;
 }
 

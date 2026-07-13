@@ -1,5 +1,7 @@
 import NetworkExtension
 import Darwin
+import Security
+import os.log
 
 // PacketTunnelProvider bridges NEPacketTunnelProvider to the Rust aivpn-ios-core
 // static library via a socketpair.
@@ -14,25 +16,115 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
 
     private var sp: [Int32] = [-1, -1]
     private var rustThread: Thread?
-    private var outboundTask: Task<Void, Never>?
-    private var isStopped = false
+    // Outbound bridge: event-driven read source on sp[0]. Created, fired and
+    // cancelled on bridgeQueue; its cancel handler owns closing sp[0].
+    private var outboundSource: DispatchSourceRead?
+    // isStopped is read on the cooperative thread pool (Task.detached) and written
+    // on the extension main thread (stopTunnel). Protect it with a lock.
+    private let stopLock = NSLock()
+    private var _isStopped = false
+    private var isStopped: Bool {
+        get { stopLock.withLock { _isStopped } }
+        set { stopLock.withLock { _isStopped = newValue } }
+    }
+    /// Atomically flips isStopped to true and returns the PREVIOUS value, so
+    /// error paths can distinguish "this path initiated the stop" (false)
+    /// from "a stop was already in progress" (true) without a
+    /// check-then-set race against stopTunnel.
+    private func markStopped() -> Bool {
+        stopLock.withLock {
+            let was = _isStopped
+            _isStopped = true
+            return was
+        }
+    }
     private let appGroup = "group.com.aivpn.client"
-    private let canRecord: Bool = true
+    private var canRecord: Bool = false
+    private let bridgeQueue = DispatchQueue(label: "com.aivpn.tunnel.bridge")
+    private var recordingPhase: String = "idle"
+    private var recordingServiceName: String = ""
+    private var preferredMask: String = "auto"
+    // M1: the persisted App-Group descriptor blob is scoped PER SERVER (keyed by a
+    // suffix derived from the server pubkey) so switching profiles never loads
+    // another server's descriptors — which would invert the covertness benefit and
+    // can mis-frame server B's opening packet. Set from the connection key's server
+    // pubkey in startTunnel; defaults to the legacy global key until then.
+    private var descriptorStoreKey: String = PacketTunnelProvider.bootstrapDescriptorsKey
+    // §3 Polymorphic masks / §2 crowdsourced mask feedback — threaded through
+    // providerConfiguration exactly like preferredMask above (see VPNManager.swift
+    // connect() and startTunnel() below), then forwarded to the Rust FFI.
+    private var polymorphicBase: String?
+    private var shareMaskFeedback: Bool = false
+    private var receiveMaskHints: Bool = false
+    private var countryCode: String = ""
+    // Mask-recording feedback from the server (RecordingAck/RecordingComplete/
+    // RecordingFailed/RecordingStatus), surfaced via the aivpn_get_recording_*
+    // FFI getters in aivpn-ios-core and polled from the get_traffic handler.
+    private var recordingMaskId: String = ""
+    private var recordingFailureReason: String = ""
+    private var lastSeenRecordingFeedbackSeq: Int64 = 0
+
+    // Public DNS fallback used alongside the VPN's internal resolver (10.8.0.1) so that
+    // hostnames outside the VPN's own zone still resolve in full-tunnel mode. There is no
+    // field for this in the connection key / providerConfiguration today (see
+    // ConnectionKey.swift, network_config.rs) — adding one would be a wire-format change
+    // spanning every platform, which is out of scope here. Named as a constant so the
+    // literal isn't duplicated/buried, and so a future config-driven value is a one-line change.
+    private static let fallbackPublicDNS = "1.1.1.1"
 
     // MARK: - Start
 
     override func startTunnel(options: [String: NSObject]?,
                               completionHandler: @escaping (Error?) -> Void) {
+        // A stop that raced a previous (aborted) setup can leave the Rust core's
+        // STOP_PENDING flag set; activate_session() would propagate it into this
+        // fresh session and kill it immediately. This start is an intentional new
+        // connection, so clear the stale flag first (mirrors Android's
+        // clearPendingStop-on-connect).
+        aivpn_clear_pending_stop()
+
         guard let proto = protocolConfiguration as? NETunnelProviderProtocol,
-              let cfg   = proto.providerConfiguration,
-              let keyStr = cfg["key"] as? String else {
+              let cfg   = proto.providerConfiguration else {
             completionHandler(makeError("missing provider configuration"))
+            return
+        }
+        // Resolve the connection key.
+        // Priority order:
+        //   1. One-time handoff token from providerConfiguration — a token that is
+        //      still retrievable means the app just wrote a FRESH key for this
+        //      start (new profile / changed server). It must win over any
+        //      previously persisted key, otherwise switching profiles would be
+        //      silently ignored forever after the first successful start.
+        //   2. Persistent Keychain entry — written on every successful resolution
+        //      below. Covers tunnel reassertion (WiFi→cellular, signal loss) where
+        //      providerConfiguration is replayed but the one-time token has
+        //      already been consumed.
+        //   3. Direct embed in providerConfiguration as final fallback (also
+        //      fresh from the current connect(), so it overwrites the persistent
+        //      copy too).
+        let keyStr: String
+        if let token = cfg["keyToken"] as? String,
+           let secret = retrieveHandoffSecret(token: token) {
+            keyStr = secret
+            storePersistentKey(secret)
+        } else if let persistent = retrievePersistentKey() {
+            keyStr = persistent
+        } else if let direct = cfg["keyDirect"] as? String, !direct.isEmpty {
+            keyStr = direct
+            storePersistentKey(direct)
+        } else {
+            completionHandler(makeError("missing connection key"))
             return
         }
 
         let fullTunnel = cfg["fullTunnel"] as? Bool ?? true
         let adaptiveLevel = cfg["adaptiveLevel"] as? Int ?? 0
         let killSwitch = cfg["killSwitch"] as? Bool ?? false
+        self.preferredMask = cfg["preferred_mask"] as? String ?? "auto"
+        self.polymorphicBase = cfg["polymorphic_base"] as? String
+        self.shareMaskFeedback = cfg["share_mask_feedback"] as? Bool ?? false
+        self.receiveMaskHints = cfg["receive_mask_hints"] as? Bool ?? false
+        self.countryCode = cfg["country_code"] as? String ?? ""
 
         // Split-tunnel lists forwarded by VPNManager from App Group UserDefaults.
         let excludedRoutes = (cfg["excluded_routes"] as? String ?? "")
@@ -48,6 +140,39 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             completionHandler(makeError("invalid connection key"))
             return
         }
+        self.canRecord = key.canRecord ?? false
+
+        // M1: scope the persisted descriptor blob to THIS server so a profile switch
+        // never loads another server's descriptors.
+        self.descriptorStoreKey = Self.perServerDescriptorsKey(key.serverKey)
+        // M3: if the connection key carried freshly-discovered descriptors ("bd",
+        // written by BootstrapDiscovery) and this server has none cached yet, seed
+        // the per-server App-Group blob so the VERY FIRST connect to this server is
+        // covert instead of using a public preset. `descriptorsJson` is already a
+        // validated JSON array string (see TunnelConnectionKey).
+        if let bd = key.descriptorsJson, !bd.isEmpty,
+           (self.appGroupDefaults?.string(forKey: self.descriptorStoreKey) ?? "").isEmpty {
+            self.appGroupDefaults?.set(bd, forKey: self.descriptorStoreKey)
+        }
+
+        // Operator's ed25519 verifying key for ServerHello/MaskUpdate signature
+        // checks (base64, exactly 32 bytes — same encoding as desktop's
+        // --server-signing-key and macOS ConnectionKey.serverSigningKey).
+        // Absent/empty = verification skipped, matching the opt-in behavior of
+        // desktop (no --server-signing-key) and Android (null serverSigningKey).
+        // Present but malformed = fail closed rather than silently connecting
+        // without the verification the user asked for.
+        let signingKeyB64 = (cfg["server_signing_key"] as? String ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let serverSigningKey: [UInt8]?
+        if signingKeyB64.isEmpty {
+            serverSigningKey = nil
+        } else if let data = Data(base64Encoded: signingKeyB64), data.count == 32 {
+            serverSigningKey = Array(data)
+        } else {
+            completionHandler(makeError("invalid server signing key (expected base64-encoded 32 bytes)"))
+            return
+        }
 
         // Create socketpair: sp[0] = Swift side, sp[1] = Rust side
         var fds: [Int32] = [-1, -1]
@@ -59,15 +184,27 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         isStopped = false
 
         var bufSize: Int32 = 65536
-        setsockopt(sp[0], SOL_SOCKET, SO_SNDBUF, &bufSize, socklen_t(MemoryLayout<Int32>.size))
-        setsockopt(sp[0], SOL_SOCKET, SO_RCVBUF, &bufSize, socklen_t(MemoryLayout<Int32>.size))
-        setsockopt(sp[1], SOL_SOCKET, SO_SNDBUF, &bufSize, socklen_t(MemoryLayout<Int32>.size))
-        setsockopt(sp[1], SOL_SOCKET, SO_RCVBUF, &bufSize, socklen_t(MemoryLayout<Int32>.size))
+        if setsockopt(sp[0], SOL_SOCKET, SO_SNDBUF, &bufSize, socklen_t(MemoryLayout<Int32>.size)) != 0 {
+            os_log(.error, "setsockopt SO_SNDBUF sp[0] failed: %d", errno)
+        }
+        if setsockopt(sp[0], SOL_SOCKET, SO_RCVBUF, &bufSize, socklen_t(MemoryLayout<Int32>.size)) != 0 {
+            os_log(.error, "setsockopt SO_RCVBUF sp[0] failed: %d", errno)
+        }
+        if setsockopt(sp[1], SOL_SOCKET, SO_SNDBUF, &bufSize, socklen_t(MemoryLayout<Int32>.size)) != 0 {
+            os_log(.error, "setsockopt SO_SNDBUF sp[1] failed: %d", errno)
+        }
+        if setsockopt(sp[1], SOL_SOCKET, SO_RCVBUF, &bufSize, socklen_t(MemoryLayout<Int32>.size)) != 0 {
+            os_log(.error, "setsockopt SO_RCVBUF sp[1] failed: %d", errno)
+        }
 
-        // sp[0] must be non-blocking so Darwin.read in the outbound loop returns
-        // EAGAIN instead of blocking the cooperative thread-pool thread.
+        // sp[0] must be non-blocking so the outbound drain loop (DispatchSourceRead
+        // event handler in startBridge) returns EAGAIN once the socket buffer is
+        // empty instead of blocking bridgeQueue.
         let flags = fcntl(sp[0], F_GETFL)
-        _ = fcntl(sp[0], F_SETFL, flags | O_NONBLOCK)
+        guard fcntl(sp[0], F_SETFL, flags | O_NONBLOCK) >= 0 else {
+            completionHandler(makeError("fcntl F_SETFL failed: \(errno)"))
+            return
+        }
 
         let vpnIP    = key.vpnIP ?? "10.8.0.2"
         let settings = buildSettings(vpnIP: vpnIP, serverHost: key.serverHost,
@@ -84,26 +221,79 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                 return
             }
 
-            let host    = key.serverHost
-            let port    = key.serverPort
-            let sKeyArr = key.serverKey
-            let pskArr  = key.psk
-            let rustFd  = self.sp[1]
-
-            // Decode optional base64-encoded mTLS cert
-            let certBytes: [UInt8]? = (cfg["mtlsCert"] as? String).flatMap {
-                guard let data = Data(base64Encoded: $0), !data.isEmpty else { return nil }
-                return Array(data)
+            // Guard against an early stopTunnel racing this async callback:
+            // if the tunnel was already stopped, sp[] is closed (or about to
+            // be) — starting the Rust thread / bridge now would hand a closed
+            // or recycled fd to dup()/makeReadSource. Claim sp[1] atomically
+            // under bridgeQueue: once claimed (set to -1), stopTunnel will not
+            // close it — the Rust thread below owns and closes it instead.
+            let claimedRustFd: Int32 = self.bridgeQueue.sync {
+                guard !self.isStopped, self.sp[1] >= 0 else { return -1 }
+                let fd = self.sp[1]
+                self.sp[1] = -1 // ownership transferred to the Rust thread
+                return fd
             }
+            guard claimedRustFd >= 0 else {
+                completionHandler(self.makeError("tunnel stopped during startup"))
+                return
+            }
+
+            let host       = key.serverHost
+            let port       = key.serverPort
+            var sKeyArr    = key.serverKey
+            var pskArr     = key.psk
+            let rustFd     = claimedRustFd
+            let mask       = self.preferredMask
+            let polymorphicBase = self.polymorphicBase
+            // §2 crowdsourced blocking feedback — honor the server-pushed minimum
+            // spacing between MaskFeedback sends (persisted in the shared App Group
+            // UserDefaults across reconnects, since a fresh Rust instance is created
+            // every attempt). A hints-only probe is cheap but still respects the
+            // interval so a reconnect storm can't spam the server (mirrors desktop
+            // client.rs's `maybe_send_mask_feedback`).
+            let nowUnix = Date().timeIntervalSince1970
+            let intervalOk = self.feedbackIntervalElapsed(now: nowUnix)
+            let shareFeedback   = self.shareMaskFeedback && intervalOk
+            let receiveHints    = self.receiveMaskHints && intervalOk
+            let country         = self.countryCode
+            let priorOutcomesJson: String? = shareFeedback
+                ? self.appGroupDefaults?.string(forKey: Self.feedbackOutcomesKey).flatMap { $0 == "[]" ? nil : $0 }
+                : nil
+
+            // Covert first handshake: hand the Rust core the descriptors we
+            // persisted from a PRIOR session so a COLD-START first handshake
+            // resolves a COVERT rotated descriptor mask instead of a public
+            // preset. A truly-first-ever connect (nothing cached yet) passes nil
+            // and falls back to the preset — acceptable residual.
+            let cachedDescriptorsJson: String? = self.appGroupDefaults?
+                .string(forKey: self.descriptorStoreKey)
+                .flatMap { $0.isEmpty || $0 == "[]" ? nil : $0 }
+
+            // Retrieve mTLS cert: prefer shared-Keychain token, fall back to direct embed.
+            let certBytes: [UInt8]? = {
+                let certStr: String?
+                if let token = cfg["mtlsCertToken"] as? String {
+                    certStr = self.retrieveHandoffSecret(token: token)
+                } else {
+                    certStr = cfg["mtlsCertDirect"] as? String
+                }
+                return certStr.flatMap {
+                    guard let data = Data(base64Encoded: $0), !data.isEmpty else { return nil }
+                    return Array(data)
+                }
+            }()
 
             // Load or generate the device private key for JIT Device Enrollment.
             let deviceKey = loadOrCreateDeviceKey()
 
             // Wire on_ready → completionHandler via C-compatible trampoline.
+            // passUnretained: the thread closure captures readyBox strongly, so the
+            // box outlives the entire aivpn_run_tunnel call — no extra retain needed.
             let readyBox = TunnelReadyBox(completionHandler)
-            let readyCtx = Unmanaged.passRetained(readyBox).toOpaque()
+            let readyCtx = Unmanaged.passUnretained(readyBox).toOpaque()
 
             let thread = Thread {
+                // Run the tunnel; withUnsafeBufferPointer closures end before zeroing.
                 sKeyArr.withUnsafeBufferPointer { sKeyPtr in
                     deviceKey.withUnsafeBufferPointer { dkPtr in
                         let certCount = Int32(certBytes?.count ?? 0)
@@ -116,18 +306,114 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                                 body(nil)
                             }
                         }
+                        // Same collapse for optional/empty C strings (polymorphic base
+                        // mask id, country code) — nil or empty both map to NULL, which
+                        // aivpn_run_tunnel treats as "not set" on the Rust side.
+                        func withOptionalCString(_ s: String?, body: (UnsafePointer<CChar>?) -> Void) {
+                            if let s = s, !s.isEmpty {
+                                s.withCString { body($0) }
+                            } else {
+                                body(nil)
+                            }
+                        }
 
                         withOptional(pskArr) { pskPtr in
                             withOptional(certBytes) { certPtr in
-                                _ = aivpn_run_tunnel(rustFd, host, Int32(port),
-                                                     sKeyPtr.baseAddress!, pskPtr,
-                                                     certPtr, certCount,
-                                                     dkPtr.baseAddress!, Int32(32),
-                                                     Int32(adaptiveLevel),
-                                                     tunnelOnReady, readyCtx)
+                                // Forward preferred mask to the Rust runtime via env var.
+                                // aivpn_run_tunnel's C signature has no mask parameter, so
+                                // the environment variable is the least-invasive ABI extension.
+                                //
+                                // §3 privacy: in polymorphic mode, do NOT forward the concrete
+                                // preset — the opening burst would otherwise be fingerprintable
+                                // as e.g. "webrtc_zoom_v3" for a full RTT until the server's
+                                // polymorphic MaskUpdate arrives. Only set the env var when
+                                // polymorphic mode is not active for a concrete mask, mirroring
+                                // the desktop CLI GUIs which omit --preferred-mask when
+                                // --polymorphic-base is set. Leaving it unset lets the Rust
+                                // side's initial_mask fall back to bootstrap_mask_for_psk.
+                                // unsetenv covers tunnel reassertion within the same extension
+                                // process, so a prior run's value can't leak into this one.
+                                let polymorphicActive = !(polymorphicBase?.isEmpty ?? true)
+                                if polymorphicActive {
+                                    unsetenv("AIVPN_PREFERRED_MASK")
+                                } else {
+                                    mask.withCString { setenv("AIVPN_PREFERRED_MASK", $0, 1) }
+                                }
+                                withOptional(serverSigningKey) { signingKeyPtr in
+                                    withOptionalCString(polymorphicBase) { polyPtr in
+                                        withOptionalCString(country) { countryPtr in
+                                            withOptionalCString(priorOutcomesJson) { priorPtr in
+                                                // §3 privacy: in polymorphic mode pass NULL (not the
+                                                // concrete preset) so the opening burst isn't
+                                                // fingerprintable until the server's polymorphic
+                                                // MaskUpdate lands — same rule the AIVPN_PREFERRED_MASK
+                                                // unsetenv above enforces.
+                                                withOptionalCString(polymorphicActive ? nil : mask) { maskPtr in
+                                                withOptionalCString(cachedDescriptorsJson) { cachedDescPtr in
+                                                _ = aivpn_run_tunnel(rustFd, host, Int32(port),
+                                                                     sKeyPtr.baseAddress!, pskPtr,
+                                                                     certPtr, certCount,
+                                                                     dkPtr.baseAddress!, Int32(32),
+                                                                     Int32(adaptiveLevel),
+                                                                     tunnelOnReady, readyCtx,
+                                                                     signingKeyPtr,
+                                                                     polyPtr,
+                                                                     shareFeedback ? 1 : 0,
+                                                                     receiveHints ? 1 : 0,
+                                                                     countryPtr,
+                                                                     priorPtr,
+                                                                     maskPtr,
+                                                                     cachedDescPtr)
+                                                }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                // §2 crowdsourced blocking feedback — record this attempt's
+                                // outcome (success/failure attribution, server-pushed tuning,
+                                // regional hints) via the FFI getters, now that the call above
+                                // has returned. See recordFeedbackOutcome()'s doc comment.
+                                self.recordFeedbackOutcome()
+                                // Persist any bootstrap descriptors the server pushed this
+                                // session (deduped/validity-filtered in the core) so the next
+                                // COLD START can be covert. The store is process-global and
+                                // survives the call above, so reading it here captures them.
+                                self.persistBootstrapDescriptors()
                             }
                         }
                     }
+                }
+                // Zeroize key material *after* all withUnsafeBufferPointer closures
+                // have returned — calling withUnsafeMutableBufferPointer while the
+                // immutable variant is still on the stack is undefined behaviour.
+                sKeyArr.withUnsafeMutableBufferPointer { buf in
+                    _ = memset(buf.baseAddress, 0, buf.count * MemoryLayout<UInt8>.size)
+                }
+                pskArr?.withUnsafeMutableBufferPointer { buf in
+                    _ = memset(buf.baseAddress, 0, buf.count * MemoryLayout<UInt8>.size)
+                }
+                // This thread owns rustFd (claimed from sp[1] above, so stopTunnel
+                // no longer closes it). Rust dup()ed its own copy on entry and has
+                // already closed it by the time aivpn_run_tunnel returns.
+                Darwin.close(rustFd)
+                // Fallback: if aivpn_run_tunnel exited without calling on_ready
+                // (e.g. connection refused, bad key, OS killed the thread), call
+                // completionHandler with a failure so startTunnel is never stranded
+                // in "Connecting" forever. TunnelReadyBox.complete is idempotent —
+                // the call is a no-op if on_ready already fired successfully.
+                let completedNow = readyBox.complete(error: NSError(
+                    domain: "com.aivpn.tunnel", code: -2,
+                    userInfo: [NSLocalizedDescriptionKey: "Tunnel exited before connecting"]))
+                // complete() returning false means on_ready already fired: the
+                // OS believes the tunnel is up, yet aivpn_run_tunnel has now
+                // returned, so the data path is dead. Unless this return is
+                // part of a user/OS-initiated stop (isStopped — set before
+                // aivpn_stop_tunnel in stopTunnel), report the failure so NE
+                // tears the tunnel down instead of blackholing in .connected.
+                if !completedNow && !self.isStopped {
+                    self.cancelTunnelWithError(
+                        self.makeError("tunnel exited after connecting"))
                 }
             }
             thread.name = "aivpn-rust-tunnel"
@@ -145,22 +431,32 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     //   1. Set isStopped — packetFlow inbound loop will not re-queue after its
     //      current readPackets call returns.
     //   2. aivpn_stop_tunnel() — signals Rust to exit its event loop.
-    //   3. Close sp[0] — causes Darwin.read in the outbound task to return EBADF,
-    //      which breaks the loop and lets the Task finish.
-    //   4. Close sp[1] — safe because Rust dup()d it; its copy is already being
-    //      closed by step 2.
-    //   5. Cancel / nil the outbound task.
-    //   6. Call completionHandler — iOS tears down the extension process shortly
+    //   3. Cancel the outbound read source (inside bridgeQueue.sync, so no event
+    //      handler is mid-flight on the serial queue). Its cancel handler — which
+    //      runs on bridgeQueue right after — closes sp[0]. Closing the fd only
+    //      after cancellation is the required DispatchSource discipline; closing
+    //      it while the source is armed could let it fire on a recycled fd.
+    //   4. Close sp[1] if still owned here — the setTunnelNetworkSettings
+    //      callback claims sp[1] (setting it to -1) before spawning the Rust
+    //      thread, which then owns and closes it. sp[1] >= 0 here only when
+    //      startup failed (or was raced) before that claim happened.
+    //   5. Call completionHandler — iOS tears down the extension process shortly
     //      after, so we don't need to join the Rust thread.
 
     override func stopTunnel(with reason: NEProviderStopReason,
                              completionHandler: @escaping () -> Void) {
         isStopped = true
         aivpn_stop_tunnel()
-        if sp[0] >= 0 { Darwin.close(sp[0]); sp[0] = -1 }
-        if sp[1] >= 0 { Darwin.close(sp[1]); sp[1] = -1 }
-        outboundTask?.cancel()
-        outboundTask = nil
+        bridgeQueue.sync {
+            if let source = outboundSource {
+                source.cancel() // cancel handler closes sp[0] and sets it to -1
+                outboundSource = nil
+            } else if sp[0] >= 0 {
+                // startBridge never ran (startup failed early) — close directly.
+                Darwin.close(sp[0]); sp[0] = -1
+            }
+            if sp[1] >= 0 { Darwin.close(sp[1]); sp[1] = -1 }
+        }
         completionHandler()
     }
 
@@ -174,8 +470,18 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             return
         }
 
+        func serialize(_ obj: [String: Any]) -> Data? {
+            do {
+                return try JSONSerialization.data(withJSONObject: obj)
+            } catch {
+                os_log(.error, "handleAppMessage: serialization failed for type %@: %@", type, error.localizedDescription)
+                return try? JSONSerialization.data(withJSONObject: ["error": "serialization failed"])
+            }
+        }
+
         switch type {
         case "get_traffic":
+            applyPendingRecordingFeedback()
             let up      = (NSNumber(value: aivpn_get_upload_bytes())).int64Value
             let down    = (NSNumber(value: aivpn_get_download_bytes())).int64Value
             let quality = Int(aivpn_get_quality_score())
@@ -183,31 +489,53 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                 "upload":          up,
                 "download":        down,
                 "can_record":      canRecord,
-                "recording_state": "idle",
+                "recording_state": recordingPhase,
+                "service":         recordingServiceName,
+                "mask_id":         recordingMaskId,
+                "message":         recordingFailureReason,
                 "quality_score":   quality,
+                "adaptive_level":  Int(aivpn_get_adaptive_level_hint()),
+                // Server-pushed mask catalog (JSON array string, "" until received)
+                // so the app's Picker can render a live list + "(авто)" marker.
+                "mask_catalog":    readCString(capacity: 8192) { aivpn_get_mask_catalog_json($0, $1) } ?? "",
             ]
-            completionHandler?(try? JSONSerialization.data(withJSONObject: resp))
+            completionHandler?(serialize(resp))
 
         case "record_start":
             let service = json["service"] as? String ?? ""
+            // Mirror the macOS helper's record_start validation (bounded
+            // length + restricted charset, main.swift) before the name
+            // crosses the FFI boundary — isEmpty alone puts no bound on
+            // what reaches aivpn_start_recording / the wire.
+            let serviceOk = service.range(of: #"^[a-zA-Z0-9 _\-]{1,128}$"#,
+                                          options: .regularExpression) != nil
             let ok: Bool
-            if service.isEmpty {
+            if !serviceOk {
                 ok = false
             } else {
                 ok = service.withCString { ptr in
                     aivpn_start_recording(ptr) != 0
                 }
             }
-            let resp: [String: Any] = ["started": ok]
-            completionHandler?(try? JSONSerialization.data(withJSONObject: resp))
+            if ok {
+                recordingPhase = "recording"
+                recordingServiceName = service
+            }
+            completionHandler?(serialize(["started": ok]))
 
         case "record_stop":
+            // Don't jump straight to "idle": the server still needs to send
+            // RecordingAck(status: "analyzing") followed by RecordingComplete
+            // or RecordingFailed. applyPendingRecordingFeedback() (polled from
+            // get_traffic) drives the real phase transition from here on;
+            // recordingServiceName is kept so those later messages can still
+            // report which service was being recorded.
+            recordingPhase = "stopping"
             aivpn_stop_recording()
-            completionHandler?(try? JSONSerialization.data(withJSONObject: ["stopped": true]))
+            completionHandler?(serialize(["stopped": true]))
 
         case "record_status":
-            let resp: [String: Any] = ["can_record": canRecord]
-            completionHandler?(try? JSONSerialization.data(withJSONObject: resp))
+            completionHandler?(serialize(["can_record": canRecord]))
 
         default:
             completionHandler?(nil)
@@ -217,12 +545,91 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     // MARK: - Swift <-> Rust bridge
 
     private func startBridge() {
-        let swiftFd = sp[0]
         let mtu = 1500
+
+        // Outbound: sp[0] → packetFlow.
+        // Event-driven: a DispatchSourceRead fires only when sp[0] becomes
+        // readable, so the extension sleeps at ~0% CPU when idle instead of
+        // busy-polling. sp[0] is O_NONBLOCK, so the drain loop below exits on
+        // EAGAIN once the socket buffer is empty and waits for the next event.
+        //
+        // The whole setup runs inside bridgeQueue.sync and re-checks
+        // isStopped/sp[0] there: an early stopTunnel that raced the async
+        // startTunnel path may already have closed sp[0], and creating a
+        // read source on a closed (possibly recycled) fd would be undefined.
+        let claimedSwiftFd: Int32 = bridgeQueue.sync {
+            guard !isStopped, sp[0] >= 0 else { return -1 }
+            let swiftFd = sp[0]
+            let source = DispatchSource.makeReadSource(fileDescriptor: swiftFd,
+                                                       queue: bridgeQueue)
+            source.setEventHandler { [weak self] in
+                guard let self = self, !self.isStopped else { return }
+                var buf = [UInt8](repeating: 0, count: mtu + 4)
+                while true {
+                    let n = Darwin.read(swiftFd, &buf, mtu + 4)
+                    if n > 0 {
+                        let data = Data(buf[0..<n])
+                        let af: NSNumber = (buf[0] >> 4 == 6)
+                            ? NSNumber(value: AF_INET6) : NSNumber(value: AF_INET)
+                        self.packetFlow.writePackets([data], withProtocols: [af])
+                        continue
+                    }
+                    if n < 0 && errno == EINTR { continue }
+                    if n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) {
+                        break // drained — wait for the next readable event
+                    }
+                    // n == 0 (peer closed; SOCK_DGRAM never carries empty
+                    // datagrams here) or fatal errno (EBADF/ENOTSOCK/…):
+                    // the bridge is going down. Set isStopped FIRST so the
+                    // inbound packetFlow loop stops writing to swiftFd —
+                    // otherwise it could keep write()ing into a closed and
+                    // then recycled descriptor (plaintext VPN packets into a
+                    // foreign fd). Only then cancel the source; its cancel
+                    // handler closes sp[0].
+                    let wasAlreadyStopping = self.markStopped()
+                    self.outboundSource?.cancel()
+                    self.outboundSource = nil
+                    // If this EOF was NOT part of a user/OS-initiated stop,
+                    // the Rust data path died on its own. Report it via
+                    // cancelTunnelWithError — otherwise NE keeps the tunnel
+                    // in .connected while all traffic blackholes and never
+                    // restarts the extension. Dispatched off bridgeQueue:
+                    // the stopTunnel this triggers does bridgeQueue.sync and
+                    // must not be entered from bridgeQueue itself.
+                    if !wasAlreadyStopping {
+                        DispatchQueue.main.async {
+                            self.cancelTunnelWithError(
+                                self.makeError("tunnel data path closed"))
+                        }
+                    }
+                    break
+                }
+            }
+            // DispatchSource discipline: the fd is closed in the cancel handler,
+            // i.e. only after the source can no longer fire — never while it is
+            // still active (that could hit a recycled descriptor).
+            source.setCancelHandler { [weak self] in
+                // Close only while still owned: if stopTunnel's direct-close
+                // branch ran first (racing an EOF-path cancel), sp[0] is
+                // already -1 and swiftFd may have been recycled — closing it
+                // again would hit a foreign descriptor.
+                if let self = self, self.sp[0] == swiftFd {
+                    self.sp[0] = -1
+                    Darwin.close(swiftFd)
+                }
+            }
+            outboundSource = source
+            source.resume()
+            return swiftFd
+        }
+        guard claimedSwiftFd >= 0 else { return }
+        let swiftFd = claimedSwiftFd
 
         // Inbound: packetFlow → sp[0] → Rust.
         // Uses isStopped rather than Task cancellation because readPackets uses
         // a callback that does not observe Swift concurrency cancellation.
+        // isStopped is re-checked before every write so that the outbound error
+        // path above (which flips it before closing sp[0]) halts this loop too.
         Task.detached { [weak self] in
             guard let self = self else { return }
             while !self.isStopped {
@@ -233,30 +640,22 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                 }
                 guard !self.isStopped else { break }
                 for pkt in packets {
-                    pkt.withUnsafeBytes { buf in
-                        _ = Darwin.write(swiftFd, buf.baseAddress!, buf.count)
+                    // The write must run on bridgeQueue — the same serial
+                    // queue whose cancel handler closes sp[0] — so the fd
+                    // cannot be closed (and recycled) between the isStopped
+                    // check and the write. sp[0] still equaling swiftFd
+                    // proves the cancel handler has not run yet; this is the
+                    // same closed-then-recycled-fd hazard the outbound error
+                    // path documents, applied to the inbound writer.
+                    let bridgeDown = self.bridgeQueue.sync { () -> Bool in
+                        guard !self.isStopped, self.sp[0] == swiftFd else { return true }
+                        pkt.withUnsafeBytes { buf in
+                            guard let base = buf.baseAddress, buf.count > 0 else { return }
+                            _ = Darwin.write(swiftFd, base, buf.count)
+                        }
+                        return false
                     }
-                }
-            }
-        }
-
-        // Outbound: sp[0] → packetFlow.
-        // sp[0] is O_NONBLOCK so read() returns EAGAIN (no data) or EBADF (closed).
-        outboundTask = Task.detached { [weak self] in
-            guard let self = self else { return }
-            var buf = [UInt8](repeating: 0, count: mtu + 4)
-            while !Task.isCancelled {
-                let n = Darwin.read(swiftFd, &buf, mtu + 4)
-                if n > 0 {
-                    let data = Data(buf[0..<n])
-                    let af: NSNumber = (buf[0] >> 4 == 6)
-                        ? NSNumber(value: AF_INET6) : NSNumber(value: AF_INET)
-                    self.packetFlow.writePackets([data], withProtocols: [af])
-                } else {
-                    let e = errno
-                    if e == EBADF || e == ENOTSOCK || e == EINVAL { break }
-                    // EAGAIN — no data yet; yield and retry
-                    try? await Task.sleep(nanoseconds: 500_000)
+                    if bridgeDown { break }
                 }
             }
         }
@@ -291,10 +690,28 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         }
         settings.ipv4Settings = ipv4
 
+        // DNS is intentionally only forced through the VPN in full-tunnel mode.
+        // In split-tunnel mode (fullTunnel == false) only the 10.8.0.0/24 VPN subnet is
+        // routed (see the `else` branch above) — general internet traffic stays on the
+        // regular interface, so forcing all system DNS through the VPN's resolver here
+        // would not match where the traffic actually goes (and 10.8.0.1 is not known to
+        // be a general-purpose recursive resolver for arbitrary internet domains, only
+        // for the VPN's own zone). This is the same reason `excludedRoutes` is only
+        // applied in full-tunnel mode just above. This is a deliberate design choice, not
+        // an oversight — changing it needs a product decision plus on-device verification,
+        // since it can't be validated from this sandbox (no Xcode/macOS toolchain here).
         if fullTunnel {
-            let dns = NEDNSSettings(servers: ["10.8.0.1", "1.1.1.1"])
-            // matchDomains = nil routes ALL domains through VPN DNS (correct for full-tunnel).
-            // excludedRoutes controls traffic bypass; DNS always goes through VPN to avoid leaks.
+            let dns = NEDNSSettings(servers: ["10.8.0.1", Self.fallbackPublicDNS])
+            // matchDomains = nil routes ALL domains through VPN DNS (full-tunnel DNS behaviour).
+            // NEDNSSettings has no matchExcludedDomains — domain-level DNS exclusion is not
+            // supported by the iOS NetworkExtension API (confirmed by a real Xcode compile
+            // error when this was previously attempted — not a guess). Route-level split
+            // tunnel (excludedRoutes, CIDR-based) still applies; see buildSettings above.
+            // `excludedDomains` is threaded through from providerConfiguration but is NOT
+            // applied here for that reason — see PacketTunnelProvider.startTunnel and
+            // SplitTunnelView.swift. True domain-based exclusion would require resolving
+            // each domain to its current IP(s) and adding those as excludedRoutes, which is
+            // a much larger, ongoing-resolution feature outside this fix's scope.
             settings.dnsSettings = dns
         }
         return settings
@@ -349,7 +766,10 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         }
 
         var keyBytes = [UInt8](repeating: 0, count: 32)
-        _ = SecRandomCopyBytes(kSecRandomDefault, 32, &keyBytes)
+        let rngStatus = SecRandomCopyBytes(kSecRandomDefault, 32, &keyBytes)
+        if rngStatus != errSecSuccess {
+            os_log(.error, "SecRandomCopyBytes failed: %d — device key entropy may be degraded", rngStatus)
+        }
         let keyData = Data(keyBytes)
 
         let deleteQuery: [String: Any] = [
@@ -364,11 +784,278 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             kSecAttrAccount as String:      account,
             kSecAttrService as String:      service,
             kSecValueData as String:        keyData,
-            kSecAttrAccessible as String:   kSecAttrAccessibleAfterFirstUnlock,
+            // ThisDeviceOnly: this is the per-DEVICE enrollment identity. Without
+            // it the item is eligible for iCloud Keychain sync and encrypted
+            // backups, so two devices sharing an iCloud account would end up with
+            // the SAME device key — defeating per-device attribution/pinning.
+            // AfterFirstUnlock (not WhenUnlocked) is kept so the tunnel extension
+            // can still read it while reasserting in the background on a locked device.
+            kSecAttrAccessible as String:   kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
         ]
-        SecItemAdd(addQuery as CFDictionary, nil)
+        let addStatus = SecItemAdd(addQuery as CFDictionary, nil)
+        if addStatus != errSecSuccess {
+            os_log(.error, "Failed to save device key to Keychain: %d", addStatus)
+        }
 
         return keyBytes
+    }
+
+    // MARK: - Recording feedback (RecordingAck/RecordingComplete/RecordingFailed/RecordingStatus)
+
+    /// Polls aivpn_get_recording_feedback_seq() and, if a new mask-recording
+    /// feedback message has arrived since the last call, reads its kind and
+    /// fields via the aivpn_get_recording_* FFI getters and updates
+    /// recordingPhase/recordingServiceName/recordingMaskId/recordingFailureReason
+    /// accordingly. Called from the "get_traffic" IPC handler, which the app
+    /// polls once per second (see VPNManager.fetchTrafficStats) — there is no
+    /// separate timer here to avoid duplicating that poll loop.
+    private func applyPendingRecordingFeedback() {
+        let seq = aivpn_get_recording_feedback_seq()
+        guard seq != lastSeenRecordingFeedbackSeq else { return }
+        lastSeenRecordingFeedbackSeq = seq
+
+        switch aivpn_get_recording_feedback_kind() {
+        case 1: // RecordingAck { session_id, status }
+            let status = readCString(capacity: 64) { aivpn_get_recording_message($0, $1) }
+            switch status {
+            case "started":   recordingPhase = "recording"
+            case "analyzing": recordingPhase = "analyzing"
+            default: break // unrecognized status string; leave phase untouched
+            }
+
+        case 2: // RecordingComplete { service, mask_id, confidence }
+            let service = readCString(capacity: 128) { aivpn_get_recording_service($0, $1) }
+            let maskId  = readCString(capacity: 128) { aivpn_get_recording_message($0, $1) }
+            if !service.isEmpty { recordingServiceName = service }
+            recordingMaskId = maskId
+            recordingPhase = "success"
+
+        case 3: // RecordingFailed { reason }
+            recordingFailureReason = readCString(capacity: 256) { aivpn_get_recording_message($0, $1) }
+            recordingPhase = "failed"
+
+        case 4: // RecordingStatus { can_record, active_service }
+            canRecord = aivpn_recording_can_record() != 0
+
+        default:
+            break // 0 = no feedback yet
+        }
+    }
+
+    /// Calls a C function that fills a buffer with a NUL-terminated UTF-8
+    /// string and returns the number of bytes written (or a negative value on
+    /// failure/no-data), and converts the result to a Swift String. Mirrors
+    /// the withUnsafeMutableBufferPointer idiom already used elsewhere in this
+    /// file for FFI byte buffers.
+    private func readCString(capacity: Int, _ fill: (UnsafeMutablePointer<CChar>, Int32) -> Int32) -> String {
+        var buf = [CChar](repeating: 0, count: capacity)
+        let n: Int32 = buf.withUnsafeMutableBufferPointer { ptr -> Int32 in
+            guard let base = ptr.baseAddress else { return -1 }
+            return fill(base, Int32(ptr.count))
+        }
+        guard n >= 0 else { return "" }
+        // Defensive: force NUL termination even if the Rust side ever fills the
+        // buffer without a trailing NUL — String(cString:) would otherwise read
+        // past the end of the array.
+        buf[buf.count - 1] = 0
+        return String(cString: buf)
+    }
+
+    // MARK: - §2 crowdsourced blocking feedback — persisted outcome log
+    //
+    // `aivpn_run_tunnel` handles exactly one connection attempt per call, so this
+    // extension — which is the only thing that ever calls it — is responsible for
+    // everything the desktop CLI's `main.rs` + `mask_feedback_log.rs` do together:
+    // tracking consecutive per-family failures across attempts, batching unreported
+    // outcomes, honoring the server-pushed report interval/threshold, and persisting
+    // all of it. Stored in the shared App Group UserDefaults (same suite used for the
+    // split-tunnel lists above) rather than this process's memory, since the
+    // extension process can be killed and respawned between connection attempts.
+
+    /// App Group key for the persisted, ed25519-signed bootstrap descriptors
+    /// (raw JSON array) saved from a prior session's BootstrapDescriptorUpdate
+    /// messages. Fed back into aivpn_run_tunnel(cached_descriptors_json=…) so a
+    /// COLD-START first handshake is shaped with a COVERT rotated descriptor mask
+    /// instead of a public preset. Self-authenticating and re-verified on load.
+    private static let bootstrapDescriptorsKey = "aivpn.bootstrap.descriptors_json"
+
+    /// Per-server scoping for the descriptor blob (M1): suffix the base key with a
+    /// hex of the (public) server pubkey so each profile keeps its own descriptors
+    /// and a profile switch loads only that server's. The pubkey is not secret, so
+    /// embedding a truncated hex of it in a UserDefaults key name is fine and needs
+    /// no crypto dependency. 16 bytes → 32 hex chars, ample to separate servers.
+    private static func perServerDescriptorsKey(_ serverKey: [UInt8]) -> String {
+        let suffix = serverKey.prefix(16).map { String(format: "%02x", $0) }.joined()
+        return "\(bootstrapDescriptorsKey).\(suffix)"
+    }
+
+    private static let feedbackOutcomesKey = "aivpn.feedback.outcomes_json"
+    private static let feedbackLastReportKey = "aivpn.feedback.last_report_unix"
+    private static let feedbackThresholdKey = "aivpn.feedback.failure_threshold"
+    private static let feedbackIntervalKey = "aivpn.feedback.interval_secs"
+    private static let feedbackConsecutiveFailsKey = "aivpn.feedback.consecutive_fails_json"
+    private static let regionalHintsKey = "aivpn.feedback.regional_hints_json"
+    // Mirrors desktop's `MaskFeedbackLog::MAX_ENTRIES`.
+    private static let feedbackOutcomesMaxEntries = 128
+    // Upper bounds on server-pushed `FeedbackConfig` tuning, mirroring
+    // desktop's `MAX_REPORT_INTERVAL_SECS` / `MAX_FAILURE_THRESHOLD`
+    // (`mask_feedback_log.rs`). A malicious or misconfigured server could
+    // otherwise push a pathologically large interval or threshold; clamp
+    // both so the feature stays meaningfully bounded.
+    private static let feedbackMaxIntervalSecs: Double = 7 * 24 * 3600
+    private static let feedbackMaxFailureThreshold = 10
+
+    private var appGroupDefaults: UserDefaults? { UserDefaults(suiteName: appGroup) }
+
+    private func feedbackFailureThreshold() -> Int {
+        let v = appGroupDefaults?.integer(forKey: Self.feedbackThresholdKey) ?? 0
+        return v > 0 ? min(v, Self.feedbackMaxFailureThreshold) : 3
+    }
+
+    private func feedbackIntervalSecs() -> Double {
+        let v = appGroupDefaults?.double(forKey: Self.feedbackIntervalKey) ?? 0
+        return v > 0 ? min(v, Self.feedbackMaxIntervalSecs) : 3600
+    }
+
+    private func feedbackIntervalElapsed(now: Double) -> Bool {
+        let last = appGroupDefaults?.double(forKey: Self.feedbackLastReportKey) ?? 0
+        return (now - last) >= feedbackIntervalSecs()
+    }
+
+    private func loadConsecutiveFails() -> [String: Int] {
+        guard let json = appGroupDefaults?.string(forKey: Self.feedbackConsecutiveFailsKey),
+              let data = json.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Int] else {
+            return [:]
+        }
+        return obj
+    }
+
+    private func saveConsecutiveFails(_ fails: [String: Int]) {
+        guard let data = try? JSONSerialization.data(withJSONObject: fails),
+              let json = String(data: data, encoding: .utf8) else { return }
+        appGroupDefaults?.set(json, forKey: Self.feedbackConsecutiveFailsKey)
+    }
+
+    /// Appends one outcome entry for `family`, bounded to
+    /// `feedbackOutcomesMaxEntries` (oldest evicted first, mirroring desktop's
+    /// `MaskFeedbackLog::MAX_ENTRIES`). Entries are summed per mask family by
+    /// the Rust core (`merge_mask_outcomes`) when a batch is sent, so appending
+    /// one small entry per outcome — rather than merging here — matches
+    /// desktop's append-then-aggregate-at-send-time design.
+    private func appendFeedbackOutcome(family: String, success: Bool) {
+        var current: [[String: Any]] = []
+        if let json = appGroupDefaults?.string(forKey: Self.feedbackOutcomesKey),
+           let data = json.data(using: .utf8),
+           let arr = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] {
+            current = arr
+        }
+        current.append(["mask_id": family, "success": success ? 1 : 0, "fail": success ? 0 : 1])
+        if current.count > Self.feedbackOutcomesMaxEntries {
+            current.removeFirst(current.count - Self.feedbackOutcomesMaxEntries)
+        }
+        guard let data = try? JSONSerialization.data(withJSONObject: current),
+              let json = String(data: data, encoding: .utf8) else { return }
+        appGroupDefaults?.set(json, forKey: Self.feedbackOutcomesKey)
+    }
+
+    /// Read the descriptors the core holds after a session and persist them into
+    /// the shared App Group so the next COLD START can shape its first handshake
+    /// with a COVERT rotated descriptor mask. Called right after
+    /// `aivpn_run_tunnel` returns (the descriptor store is process-global and
+    /// survives the call). Best-effort — a storage miss never breaks the tunnel.
+    /// An empty ("[]") result leaves any previously-persisted blob in place so a
+    /// session that received no update doesn't wipe a still-valid descriptor.
+    private func persistBootstrapDescriptors() {
+        let json = readCString(capacity: 65536) { aivpn_get_bootstrap_descriptors_json($0, $1) }
+        guard !json.isEmpty, json != "[]" else { return }
+        // L1: a descriptor blob larger than the readCString buffer would be
+        // truncated to invalid JSON, and persisting that would silently defeat the
+        // next cold start (accept_persisted_descriptors → empty → preset). Only
+        // persist when the string actually parses as a JSON array, so a truncated
+        // (or otherwise malformed) blob is dropped instead of poisoning the cache.
+        guard let data = json.data(using: .utf8),
+              (try? JSONSerialization.jsonObject(with: data)) is [Any] else {
+            os_log(.error, "persistBootstrapDescriptors: getter JSON invalid/truncated — not persisting")
+            return
+        }
+        // M1: keyed per server so a profile switch never loads another server's blob.
+        appGroupDefaults?.set(json, forKey: descriptorStoreKey)
+    }
+
+    /// Called right after `aivpn_run_tunnel` returns (success or error) to
+    /// process this attempt's §2 outcome. Order of operations mirrors
+    /// desktop's split between `client.rs` (tuning/hints/success bookkeeping,
+    /// live during a session) and `main.rs`'s reconnect loop (failure
+    /// attribution, after the session ends):
+    ///  1. Persist any server-pushed `FeedbackConfig` tuning from this session.
+    ///  2. Persist any `RegionalMaskHints` received this session.
+    ///  3. If a `MaskFeedback` was actually sent, this attempt's own outcome
+    ///     was already folded into that batch by Rust — clear the local
+    ///     buffer and record the send time.
+    ///  4. Otherwise: on success, buffer a success entry locally so a future
+    ///     send reports it; on failure, bump the family's consecutive-fail
+    ///     counter and, at the server-pushed threshold, buffer a failure
+    ///     entry and reset it.
+    private func recordFeedbackOutcome() {
+        let defaults = appGroupDefaults
+        let nowUnix = Date().timeIntervalSince1970
+
+        let threshold = aivpn_get_feedback_threshold()
+        let intervalSecs = aivpn_get_feedback_interval_secs()
+        if threshold > 0 {
+            // Upper-clamp a server-pushed threshold — a malicious server
+            // could otherwise push a value so high failure reporting is
+            // effectively disabled.
+            let clamped = min(max(Int(threshold), 1), Self.feedbackMaxFailureThreshold)
+            defaults?.set(clamped, forKey: Self.feedbackThresholdKey)
+        }
+        if intervalSecs > 0 {
+            // Upper-clamp a server-pushed interval — a malicious server
+            // could otherwise push a value of years, effectively disabling
+            // reporting.
+            let clamped = min(Double(intervalSecs), Self.feedbackMaxIntervalSecs)
+            defaults?.set(clamped, forKey: Self.feedbackIntervalKey)
+        }
+
+        if aivpn_get_regional_hints_seq() > 0 {
+            let hintsJson = readCString(capacity: 4096) { aivpn_get_regional_hints_json($0, $1) }
+            if !hintsJson.isEmpty {
+                defaults?.set(hintsJson, forKey: Self.regionalHintsKey)
+            }
+        }
+
+        let sent = aivpn_mask_feedback_sent() != 0
+        if sent {
+            defaults?.set("[]", forKey: Self.feedbackOutcomesKey)
+            defaults?.set(nowUnix, forKey: Self.feedbackLastReportKey)
+        }
+
+        // Failure attribution + local outcome bookkeeping only applies when the
+        // user opted in to sharing and a region is configured (mirrors desktop
+        // main.rs's `feedback_share_enabled = args.share_mask_feedback &&
+        // country_code.is_some()`), independent of whether THIS attempt's send
+        // was suppressed by the interval gate.
+        guard shareMaskFeedback, !countryCode.isEmpty else { return }
+        let family = readCString(capacity: 128) { aivpn_get_attempted_mask_family($0, $1) }
+        guard !family.isEmpty else { return }
+
+        var fails = loadConsecutiveFails()
+        if aivpn_ever_connected() != 0 {
+            if fails.removeValue(forKey: family) != nil { saveConsecutiveFails(fails) }
+            if !sent { appendFeedbackOutcome(family: family, success: true) }
+            return
+        }
+        if sent { return } // sent implies a connected attempt; nothing more to do on failure
+        let count = (fails[family] ?? 0) + 1
+        if count >= feedbackFailureThreshold() {
+            appendFeedbackOutcome(family: family, success: false)
+            fails.removeValue(forKey: family)
+            os_log(.debug, "aivpn: §2 recorded mask FAILURE for family '%@' (%d consecutive failed attempts)", family, count)
+        } else {
+            fails[family] = count
+        }
+        saveConsecutiveFails(fails)
     }
 
     // MARK: - Helpers
@@ -381,15 +1068,40 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
 
 // MARK: - on_ready trampoline (bridges Rust C callback → Swift completionHandler)
 
+// TunnelReadyBox ensures startTunnel's completionHandler is called exactly once:
+// • on_ready (Rust connect success) fires complete(error: nil)
+// • Thread fallback fires complete(error: ...) if Rust exits without connecting
+// Both paths are idempotent — the first caller wins, subsequent calls are no-ops.
 private final class TunnelReadyBox {
-    let handler: (Error?) -> Void
+    private let handler: (Error?) -> Void
+    private let lock = NSLock()
+    private var fired = false
+
     init(_ h: @escaping (Error?) -> Void) { handler = h }
+
+    /// Thread-safe one-shot delivery — only the first call wins.
+    /// Returns true when THIS call delivered the handler, false when it had
+    /// already fired earlier (so callers can tell "startTunnel already
+    /// completed successfully" apart from "this call reported the failure").
+    @discardableResult
+    func complete(error: Error?) -> Bool {
+        lock.lock()
+        guard !fired else { lock.unlock(); return false }
+        fired = true
+        lock.unlock()
+        let h = handler
+        DispatchQueue.main.async { h(error) }
+        return true
+    }
 }
 
+// Rust calls this C-compatible function when the tunnel becomes ready.
+// ctx is a passUnretained pointer — the thread closure owns the strong reference,
+// keeping the box alive for the entire duration of aivpn_run_tunnel.
 private func tunnelOnReady(_: UnsafePointer<CChar>?, _ ctx: UnsafeMutableRawPointer?) {
     guard let ctx else { return }
-    let box = Unmanaged<TunnelReadyBox>.fromOpaque(ctx).takeRetainedValue()
-    DispatchQueue.main.async { box.handler(nil) }
+    let box = Unmanaged<TunnelReadyBox>.fromOpaque(ctx).takeUnretainedValue()
+    box.complete(error: nil)
 }
 
 // MARK: - Minimal connection key parser (tunnel extension cannot import App target)
@@ -401,6 +1113,11 @@ private struct TunnelConnectionKey {
     let psk: [UInt8]?
     let vpnIP: String?
     let canRecord: Bool?
+    // M3: descriptors ("bd") that BootstrapDiscovery fetched + verified and embedded
+    // in the connection key, re-serialized as a JSON array string. Seeded into the
+    // per-server descriptor cache in startTunnel so a truly-first-ever connect is
+    // covert. nil when the key carries no "bd" field.
+    let descriptorsJson: String?
 
     init?(rawKey: String) {
         var b64 = rawKey
@@ -416,17 +1133,29 @@ private struct TunnelConnectionKey {
 
         let parts = s.split(separator: ":").map(String.init)
         guard parts.count >= 2, let port = UInt16(parts.last ?? "") else { return nil }
-        serverHost = parts.dropLast().joined(separator: ":")
+        var host = parts.dropLast().joined(separator: ":")
+        // Strip IPv6 brackets: "[::1]" → "::1" (aivpn_run_tunnel expects a bare address)
+        if host.hasPrefix("[") && host.hasSuffix("]") {
+            host = String(host.dropFirst().dropLast())
+        }
+        serverHost = host
         serverPort = port
 
-        guard let pkHex = json["k"] as? String,
-              pkHex.count == 64,
-              let keyBytes = Data(hexString: pkHex) else { return nil }
+        // `k` (server X25519 pubkey) and `p` (PSK) are 32 bytes each, encoded as
+        // STANDARD base64 by the server (crates/aivpn-server/src/main.rs
+        // build_connection_key — 44 chars incl. '='), which is also what the Rust
+        // CLI (decode_base64_key) and Android decode. 64-char hex is accepted as
+        // a legacy/manual fallback. The decoded raw bytes are exactly what
+        // aivpn_run_tunnel expects (it does from_raw_parts(ptr, 32)).
+        guard let pkStr = json["k"] as? String,
+              let keyBytes = Self.decode32ByteKey(pkStr) else { return nil }
         serverKey = Array(keyBytes)
 
-        if let pskHex = json["p"] as? String,
-           pskHex.count == 64,
-           let pskBytes = Data(hexString: pskHex) {
+        if let pskStr = json["p"] as? String, !pskStr.isEmpty {
+            // A present-but-malformed PSK is a hard error: silently dropping it
+            // would send an unauthenticated handshake the server rejects, which
+            // surfaces as an opaque timeout instead of "invalid connection key".
+            guard let pskBytes = Self.decode32ByteKey(pskStr) else { return nil }
             psk = Array(pskBytes)
         } else {
             psk = nil
@@ -434,18 +1163,130 @@ private struct TunnelConnectionKey {
 
         vpnIP     = json["i"] as? String
         canRecord = json["can_record"] as? Bool
+
+        // M3: capture "bd" (an array of signed BootstrapDescriptor objects that
+        // BootstrapDiscovery fetched + verified) and re-serialize it to the JSON
+        // array string the core expects. Validity/signature are re-checked in Rust
+        // on load, so an unusable payload just degrades to the preset.
+        if let bd = json["bd"] as? [Any], !bd.isEmpty,
+           JSONSerialization.isValidJSONObject(bd),
+           let bdData = try? JSONSerialization.data(withJSONObject: bd),
+           let bdStr = String(data: bdData, encoding: .utf8) {
+            descriptorsJson = bdStr
+        } else {
+            descriptorsJson = nil
+        }
+    }
+
+    /// Decodes a 32-byte key from either STANDARD base64 (44 chars — the
+    /// server's real output format) or 64-char ASCII hex (legacy/manual).
+    /// Base64 is tried first; a 64-char hex string can never be mistaken for
+    /// base64 because 64 base64 chars would decode to 48 bytes, not 32.
+    static func decode32ByteKey(_ s: String) -> Data? {
+        if let data = Data(base64Encoded: s), data.count == 32 { return data }
+        if s.utf8.count == 64, let data = Data(hexString: s), data.count == 32 { return data }
+        return nil
+    }
+}
+
+// MARK: - Keychain tunnel handoff
+
+extension PacketTunnelProvider {
+    /// Reads and deletes a one-time secret stored by the app via the shared app group keychain.
+    /// Mirrors KeychainStorage.retrieveForTunnel — duplicated here so the tunnel extension
+    /// target compiles without access to the App target's ConnectionKey.swift.
+    fileprivate func retrieveHandoffSecret(token: String) -> String? {
+        let service = "com.aivpn.client.tunnel-handoff"
+        let query: [CFString: Any] = [
+            kSecClass:           kSecClassGenericPassword,
+            kSecAttrService:     service,
+            kSecAttrAccount:     token,
+            kSecAttrAccessGroup: appGroup,
+            kSecMatchLimit:      kSecMatchLimitOne,
+            kSecReturnData:      true,
+        ]
+        var result: CFTypeRef?
+        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
+              let data = result as? Data,
+              let secret = String(data: data, encoding: .utf8) else { return nil }
+        let del: [CFString: Any] = [
+            kSecClass:           kSecClassGenericPassword,
+            kSecAttrService:     service,
+            kSecAttrAccount:     token,
+            kSecAttrAccessGroup: appGroup,
+        ]
+        SecItemDelete(del as CFDictionary)
+        return secret
+    }
+
+    /// Writes the connection key to a stable Keychain entry that survives tunnel reassertion.
+    /// Called after the key is first resolved from a one-time token or direct embed so that
+    /// subsequent reassertions (WiFi→cellular, signal loss) can retrieve it directly.
+    fileprivate func storePersistentKey(_ keyStr: String) {
+        guard let data = keyStr.data(using: .utf8) else { return }
+        let service = "com.aivpn.client.tunnel-handoff"
+        let account = "aivpn_persistent_connection_key"
+        let del: [CFString: Any] = [
+            kSecClass:           kSecClassGenericPassword,
+            kSecAttrService:     service,
+            kSecAttrAccount:     account,
+            kSecAttrAccessGroup: appGroup,
+        ]
+        SecItemDelete(del as CFDictionary)
+        let attrs: [CFString: Any] = [
+            kSecClass:           kSecClassGenericPassword,
+            kSecAttrService:     service,
+            kSecAttrAccount:     account,
+            kSecAttrAccessGroup: appGroup,
+            kSecAttrAccessible:  kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
+            kSecValueData:       data,
+        ]
+        SecItemAdd(attrs as CFDictionary, nil)
+    }
+
+    /// Retrieves the persistent connection key written by storePersistentKey.
+    /// Returns nil on the very first tunnel start (before any key has been persisted).
+    fileprivate func retrievePersistentKey() -> String? {
+        let service = "com.aivpn.client.tunnel-handoff"
+        let account = "aivpn_persistent_connection_key"
+        let query: [CFString: Any] = [
+            kSecClass:           kSecClassGenericPassword,
+            kSecAttrService:     service,
+            kSecAttrAccount:     account,
+            kSecAttrAccessGroup: appGroup,
+            kSecMatchLimit:      kSecMatchLimitOne,
+            kSecReturnData:      true,
+        ]
+        var result: CFTypeRef?
+        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
+              let data = result as? Data,
+              let key = String(data: data, encoding: .utf8) else { return nil }
+        return key
     }
 }
 
 private extension Data {
+    /// Strict ASCII-only hex decoder (byte-based over UTF-8). Deliberately does
+    /// NOT use Character.hexDigitValue, which also matches fullwidth Unicode
+    /// digits that the Rust side would reject.
     init?(hexString: String) {
-        let chars = Array(hexString)
-        guard hexString.count % 2 == 0 else { return nil }
+        let ascii = Array(hexString.utf8)
+        guard ascii.count % 2 == 0 else { return nil }
+        func nibble(_ b: UInt8) -> UInt8? {
+            switch b {
+            case 0x30...0x39: return b - 0x30            // '0'-'9'
+            case 0x41...0x46: return b - 0x41 + 10       // 'A'-'F'
+            case 0x61...0x66: return b - 0x61 + 10       // 'a'-'f'
+            default: return nil
+            }
+        }
         var bytes = [UInt8]()
-        for i in stride(from: 0, to: chars.count, by: 2) {
-            guard let hi = chars[i].hexDigitValue,
-                  let lo = chars[i + 1].hexDigitValue else { return nil }
-            bytes.append(UInt8(hi << 4 | lo))
+        bytes.reserveCapacity(ascii.count / 2)
+        var i = 0
+        while i < ascii.count {
+            guard let hi = nibble(ascii[i]), let lo = nibble(ascii[i + 1]) else { return nil }
+            bytes.append(hi << 4 | lo)
+            i += 2
         }
         self.init(bytes)
     }

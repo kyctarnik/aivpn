@@ -1,0 +1,10 @@
+node_modules/
+dist/
+client/build/
+client/.svelte-kit/
+server/drizzle/
+data/
+.env
+*.db
+*.db-wal
+*.db-shm

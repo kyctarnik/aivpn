@@ -13,6 +13,9 @@ x25519-dalek.workspace = true
 blake3.workspace = true
 hmac.workspace = true
 sha2.workspace = true
+hkdf = "0.12"
+aes-gcm = "0.10"
+aes = "0.8"
 
 # Serialization
 serde.workspace = true
@@ -33,9 +36,13 @@ hex = "0.4"
 bytes.workspace = true
 chrono.workspace = true
 tracing.workspace = true
+portable-atomic = "1"
 
 # Async (optional — needed for upload_pipeline)
 tokio = { workspace = true, optional = true }
+
+# Concurrency — optional, only pulled in by the inline ML-DPI gate (dpi-gate).
+dashmap = { workspace = true, optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -43,3 +50,9 @@ libc = "0.2"
 [features]
 default = []
 client-upload = ["tokio"]
+# Inline ML-DPI "reads-as-tunnel" GBDT gate (R2 Phase D). Pure: dashmap + std,
+# no async. Shared by the server (`neural` feature) and the client self-gate.
+dpi-gate = ["dep:dashmap"]
+# Client-side inline self-detection gate: the `ClientSelfGate` outbound inspector
+# wired into `run_upload_loop`. Needs the pipeline + tokio (control-plane types).
+client-dpi-gate = ["dpi-gate", "client-upload"]

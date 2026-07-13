@@ -48,11 +48,31 @@ class SplitTunnelManager: ObservableObject {
 
     // MARK: - Route management (CIDR strings, e.g. "192.168.1.0/24")
 
-    func addRoute(_ cidr: String) {
+    @discardableResult
+    func addRoute(_ cidr: String) -> Bool {
         let r = cidr.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !r.isEmpty, !excludedRoutes.contains(r) else { return }
+        guard !r.isEmpty, !excludedRoutes.contains(r), isValidCIDR(r) else { return false }
         excludedRoutes.append(r)
         saveRoutes()
+        return true
+    }
+
+    private func isValidCIDR(_ cidr: String) -> Bool {
+        let parts = cidr.split(separator: "/")
+        guard parts.count == 2,
+              let prefix = Int(parts[1]), prefix >= 0 else { return false }
+        let addr = String(parts[0])
+        if addr.contains(":") {
+            // IPv6 CIDRs are not supported — the tunnel only installs NEIPv4Route
+            // entries, so any IPv6 exclude would be silently dropped. Reject here
+            // so the user sees the "invalid_cidr" error instead of a silent no-op.
+            return false
+        }
+        // IPv4 CIDR — valid prefix lengths are 0–32.
+        guard prefix <= 32 else { return false }
+        let octets = addr.split(separator: ".")
+        guard octets.count == 4 else { return false }
+        return octets.allSatisfy { Int($0).map { $0 >= 0 && $0 <= 255 } ?? false }
     }
 
     func removeRoute(at offsets: IndexSet) {
@@ -70,8 +90,8 @@ struct SplitTunnelView: View {
     @EnvironmentObject private var loc: LocalizationManager
     @Environment(\.dismiss) private var dismiss
 
-    @State private var newDomain: String = ""
     @State private var newRoute: String  = ""
+    @State private var routeError: String?
 
     var body: some View {
         NavigationStack {
@@ -92,52 +112,31 @@ struct SplitTunnelView: View {
                     HStack {
                         TextField("192.168.1.0/24", text: $newRoute)
                             .autocorrectionDisabled()
-                            .autocapitalization(.none)
+                            .textInputAutocapitalization(.never)
                             .keyboardType(.numbersAndPunctuation)
+                            .onChange(of: newRoute) { _ in routeError = nil }
                         Button {
-                            mgr.addRoute(newRoute)
-                            newRoute = ""
+                            if mgr.addRoute(newRoute) {
+                                newRoute = ""
+                                routeError = nil
+                            } else {
+                                routeError = loc.t("invalid_cidr")
+                            }
                         } label: {
                             Image(systemName: "plus.circle.fill")
                                 .foregroundColor(.accentColor)
                         }
                         .disabled(newRoute.trimmingCharacters(in: .whitespaces).isEmpty)
                     }
+                    if let err = routeError {
+                        Text(err)
+                            .font(.caption)
+                            .foregroundColor(.red)
+                    }
                 }
 
-                // MARK: Excluded domains (split DNS)
-                Section(header: Text(loc.t("split_tunnel")),
-                        footer: Text("Domain and route lists are stored in App Group UserDefaults and are not cryptographically verified.")
-                            .font(.caption2)
-                            .foregroundColor(.secondary)) {
-                    if mgr.excludedDomains.isEmpty {
-                        Text(loc.t("split_tunnel_none"))
-                            .foregroundColor(.secondary)
-                            .font(.subheadline)
-                    } else {
-                        ForEach(mgr.excludedDomains, id: \.self) { domain in
-                            Text(domain)
-                                .font(.system(.body, design: .monospaced))
-                        }
-                        .onDelete { mgr.removeDomain(at: $0) }
-                    }
-                    HStack {
-                        TextField("example.com", text: $newDomain)
-                            .autocorrectionDisabled()
-                            .autocapitalization(.none)
-                            .keyboardType(.URL)
-                        Button {
-                            mgr.addDomain(newDomain)
-                            newDomain = ""
-                        } label: {
-                            Image(systemName: "plus.circle.fill")
-                                .foregroundColor(.accentColor)
-                        }
-                        .disabled(newDomain.trimmingCharacters(in: .whitespaces).isEmpty)
-                    }
-                }
             }
-            .navigationTitle(loc.t("split_tunnel"))
+            .navigationTitle(loc.t("split_tunnel_title"))
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {

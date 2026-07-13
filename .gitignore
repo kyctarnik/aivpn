@@ -7,6 +7,9 @@ Cargo.lock
 # ── Build output ─────────────────────────────────────────────────────────────
 /releases/
 
+# ── R&D sandbox (neural-mask generation prototype; never committed) ───────────
+research/
+
 # Windows GUI build staging (make windows)
 aivpn-windows-gui-package/
 aivpn-windows-gui.zip
@@ -92,3 +95,11 @@ coverage/
 
 # ── Internal docs (not for public distribution) ──────────────────────────────
 docs/
+
+# ── Makefile linux-appimage tool cache ───────────────────────────────────────
+/build/
+
+# Release signing keystore — NEVER commit
+aivpn-android/
+*.jks
+*.keystore

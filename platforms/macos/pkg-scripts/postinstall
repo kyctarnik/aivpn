@@ -6,6 +6,15 @@ HELPER_PATH="/Library/PrivilegedHelperTools/aivpn-helper"
 PLIST_PATH="/Library/LaunchDaemons/com.aivpn.helper.plist"
 CLIENT_DIR="/Library/Application Support/AIVPN"
 RUN_DIR="/var/run/aivpn"
+LOG_FILE="/var/log/aivpn-postinstall.log"
+HELPER_LOG="/var/log/aivpn-helper.log"
+
+# Mirror everything this script prints (including launchctl errors we used to
+# swallow with 2>/dev/null) to a persistent log file. The installer's own
+# stdout/stderr capture (/var/log/install.log) can be hard to find; this
+# gives a stable, dedicated place to check after a failed bootstrap.
+exec > >(tee -a "$LOG_FILE") 2>&1
+echo "=== postinstall run at $(date) ==="
 
 # Remove quarantine attributes (macOS Sequoia provenance tracking)
 echo "Removing quarantine attributes..."
@@ -47,12 +56,21 @@ sleep 1
 
 # Load the LaunchDaemon using modern API (macOS 11+)
 echo "Starting AIVPN helper daemon..."
-if launchctl bootstrap system "$PLIST_PATH" 2>/dev/null; then
+BOOTSTRAP_ERR="$(launchctl bootstrap system "$PLIST_PATH" 2>&1 1>/dev/null)"
+BOOTSTRAP_STATUS=$?
+if [ "$BOOTSTRAP_STATUS" -eq 0 ]; then
     echo "✅ Loaded via launchctl bootstrap"
 else
+    echo "⚠️  launchctl bootstrap failed (exit $BOOTSTRAP_STATUS): ${BOOTSTRAP_ERR:-<no output>}"
     # Fallback for older macOS
-    launchctl load -w "$PLIST_PATH" 2>/dev/null && echo "✅ Loaded via launchctl load" || \
+    LOAD_ERR="$(launchctl load -w "$PLIST_PATH" 2>&1 1>/dev/null)"
+    LOAD_STATUS=$?
+    if [ "$LOAD_STATUS" -eq 0 ]; then
+        echo "✅ Loaded via launchctl load"
+    else
+        echo "⚠️  launchctl load also failed (exit $LOAD_STATUS): ${LOAD_ERR:-<no output>}"
         echo "⚠️  launchctl failed, starting helper directly"
+    fi
 fi
 
 # Wait for daemon to start
@@ -65,11 +83,21 @@ elif pgrep -x "aivpn-helper" &>/dev/null; then
     echo "✅ AIVPN helper daemon is running"
 else
     echo "⚠️  Helper daemon may not have started"
-    # Try starting directly as fallback
-    "$HELPER_PATH" &
+    echo "--- launchctl print system/com.aivpn.helper (diagnostic) ---"
+    launchctl print system/com.aivpn.helper 2>&1 || echo "(job not known to launchd at all)"
+    echo "--- end diagnostic ---"
+    # Try starting directly as fallback. Fully detach stdio from this script
+    # (which is about to exit) so the child doesn't block/die on a closed
+    # pipe, and disown it so it isn't tied to this script's job table.
+    # Log to /var/log (persists across reboots) — same path as the LaunchDaemon
+    # plist's StandardOutPath/StandardErrorPath, so all helper output is in one place.
+    nohup "$HELPER_PATH" </dev/null >>"$HELPER_LOG" 2>&1 &
+    disown
     sleep 1
     if pgrep -x "aivpn-helper" &>/dev/null; then
-        echo "✅ Helper started directly (fallback)"
+        echo "✅ Helper started directly (fallback, not launchd-managed)"
+    else
+        echo "❌ Helper failed to start even via direct fallback — see $HELPER_LOG and $LOG_FILE"
     fi
 fi
 

@@ -232,6 +232,9 @@ fn test_recording_manager_lifecycle() {
     let store = Arc::new(MaskStore::new(
         catalog,
         std::path::PathBuf::from("/tmp/aivpn-test-masks"),
+        None,
+        None,
+        aivpn_common::mask::MaskVerifyMode::default(),
     ));
     let manager = RecordingManager::new(store);
 
@@ -280,6 +283,9 @@ fn test_mask_store_crud() {
     let store = MaskStore::new(
         catalog.clone(),
         std::path::PathBuf::from("/tmp/aivpn-test-masks-crud"),
+        None,
+        None,
+        aivpn_common::mask::MaskVerifyMode::default(),
     );
 
     // Create a dummy mask entry
@@ -352,7 +358,13 @@ async fn test_full_mask_generation_pipeline() {
     let storage_dir = std::path::PathBuf::from("/tmp/aivpn-test-mask-gen");
     let _ = std::fs::remove_dir_all(&storage_dir);
 
-    let store = Arc::new(MaskStore::new(catalog.clone(), storage_dir.clone()));
+    let store = Arc::new(MaskStore::new(
+        catalog.clone(),
+        storage_dir.clone(),
+        None,
+        None,
+        aivpn_common::mask::MaskVerifyMode::default(),
+    ));
 
     // Generate enough packets for a realistic recording (2000 packets)
     let packets = generate_video_call_packets(2000);
@@ -451,7 +463,13 @@ async fn test_end_to_end_recording() {
     let storage_dir = std::path::PathBuf::from("/tmp/aivpn-test-e2e");
     let _ = std::fs::remove_dir_all(&storage_dir);
 
-    let store = Arc::new(MaskStore::new(catalog.clone(), storage_dir.clone()));
+    let store = Arc::new(MaskStore::new(
+        catalog.clone(),
+        storage_dir.clone(),
+        None,
+        None,
+        aivpn_common::mask::MaskVerifyMode::default(),
+    ));
     let manager = RecordingManager::new(store.clone());
 
     let session_id = [0xE2u8; 16];

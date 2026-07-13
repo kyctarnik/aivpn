@@ -35,13 +35,58 @@ pub const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// expiration is unnecessary and causes reconnect failures.
 pub const HARD_TIMEOUT: Duration = Duration::ZERO;
 
-/// Tag window size (allow out-of-order packets)
-pub const TAG_WINDOW_SIZE: usize = 256;
+/// Tag window size (allow out-of-order packets).
+///
+/// Doubled from 256 to 512: at high pps a 256-tag window is only a few ms of
+/// history, so GRO batches / reordering could push a legitimate packet out of
+/// the anti-replay window and cause a false drop. 512 doubles the reorder
+/// tolerance. Per-packet CPU stays flat because the refresh cadence in the
+/// gateway is halved in step (refresh every 128 packets instead of 64), so the
+/// amortised precompute/tag_map churn per packet is unchanged.
+pub const TAG_WINDOW_SIZE: usize = 512;
+
+/// Number of u64 words backing the anti-replay bitmap (one bit per counter of
+/// history, covering exactly `TAG_WINDOW_SIZE` counters behind the newest one).
+const REPLAY_WORDS: usize = TAG_WINDOW_SIZE / 64;
+
+/// Time-window offsets accepted for the 0-RTT handshake (clock-skew tolerance).
+/// ±2 windows (~±25 s at the default 10 s window) so mobile clients with a poor
+/// RTC can still establish. The data plane keeps the tighter ±1 in `validate_tag`.
+const HANDSHAKE_SKEW_WINDOWS: [i64; 5] = [0, -1, 1, -2, 2];
 
 /// How often to rotate session keys (in-flight, no reconnect).
 pub const REKEY_INTERVAL_SECS: u64 = 120;
 /// Rotate after this many bytes even if the time interval hasn't elapsed.
-pub const REKEY_BYTES_THRESHOLD: u64 = 1_000_000;
+///
+/// The 120 s interval above is the primary trigger; this byte cap only exists
+/// to bound keystream volume per key on bulk transfers. The former 1 MB value
+/// forced a full DH rekey roughly every 0.7 s at line rate (~5.7 MB/s) — pure
+/// churn that burned CPU and re-armed counters constantly. With per-direction
+/// keys (nonce-reuse fix) already in place, 64 MB is safely conservative:
+/// ~11 s between rekeys at line rate instead of sub-second.
+pub const REKEY_BYTES_THRESHOLD: u64 = 64 * 1024 * 1024;
+
+/// Maximum number of times a single pending rekey's `KeyRotate` is sent
+/// (1 initial + up to 4 fast retransmits, one every `REKEY_RETRANSMIT_SECS`)
+/// before the server gives up, clears the stuck pending state, and lets a
+/// fresh rekey re-initiate after the normal interval.
+///
+/// KeyRotate rides plain UDP with no delivery guarantee: with a single
+/// one-shot send, a lost KeyRotate left `pending_rekey_keypair` set forever —
+/// `start_rekeying_sessions` skipped the session on every subsequent tick, so
+/// PFS rotation silently stopped for the rest of the session's life.
+pub const MAX_REKEY_SEND_ATTEMPTS: u32 = 5;
+
+/// Minimum seconds between KeyRotate retransmits for a pending rekey.
+///
+/// This MUST stay well under the client's RX-silence watchdog floor (12 s,
+/// `3 × keepalive` clamped to 12–45 s): if the KeyRotate (or the client's
+/// rekey response) is lost, the retransmit must reach the client and re-sync
+/// the tunnel BEFORE the watchdog declares the path dead and reconnects.
+/// Riding the 30 s rekey-initiation tick was too slow — one lost packet
+/// still cost a full reconnect. With a 3 s cadence swept by a ~2 s gateway
+/// tick, all `MAX_REKEY_SEND_ATTEMPTS` sends land within ~12 s of initiation.
+pub const REKEY_RETRANSMIT_SECS: u64 = 3;
 
 /// Session state
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,7 +141,7 @@ pub struct Session {
     /// Counter value used as the base for the currently precomputed tag window.
     pub tag_window_base: u64,
     /// Received tag bitmap (for anti-replay)
-    pub received_bitmap: u256,
+    pub received_bitmap: ReplayWindow,
     /// Accumulated inbound bytes to flush into client_db in batches.
     pub pending_bytes_in: u64,
     /// Accumulated outbound (downlink) bytes to flush into client_db in batches.
@@ -124,9 +169,13 @@ pub struct Session {
     pub pre_ratchet_tags: HashMap<u64, [u8; TAG_SIZE]>,
     /// Deadline until which pre_ratchet_tags are still accepted.
     pub pre_ratchet_expire: Option<Instant>,
-    /// Anti-replay bitmap for pre_ratchet_tags — prevents replaying old-key
-    /// packets during the grace window (C-S-2).
-    pub pre_ratchet_bitmap: u256,
+    /// Anti-replay set for pre_ratchet_tags — prevents replaying old-key packets
+    /// during the grace window (C-S-2). Keyed by the raw packet counter: a 256-bit
+    /// bitmap aliased counters 256 apart within the 511-wide tag window, so two
+    /// distinct in-flight packets could be falsely rejected as replays. A set
+    /// keyed by counter cannot alias; it is cleared each ratchet and bounded by
+    /// the ~2s grace window, so it stays small.
+    pub pre_ratchet_received: std::collections::HashSet<u64>,
 
     /// mTLS certificate gate — true means the client is cleared to send Data.
     /// Defaults to true (non-mTLS deployments are unaffected). When the
@@ -148,12 +197,25 @@ pub struct Session {
     /// Pending keypair for in-flight key rotation. Set when server sends KeyRotate,
     /// cleared when client responds.
     pub pending_rekey_keypair: Option<KeyPair>,
+    /// How many times the CURRENT pending rekey's `KeyRotate` has been sent
+    /// (initial send + retransmits). Bounded by `MAX_REKEY_SEND_ATTEMPTS`;
+    /// reset to 0 on commit or when the stuck pending state is cleared.
+    pub pending_rekey_attempts: u32,
+    /// When the CURRENT pending rekey's `KeyRotate` was last sent. Drives the
+    /// fast retransmit sweep (`rekey_retransmits_due`): a pending rekey whose
+    /// last send is ≥ `REKEY_RETRANSMIT_SECS` old is re-sent so a lost
+    /// KeyRotate heals before the client's RX-silence watchdog reconnects.
+    pub last_keyrotate_sent_at: Instant,
     /// Timestamp of the last successful key rotation (or session creation).
     pub last_rekey_at: Instant,
     /// Bytes sent+received since last rekey (for data-triggered rotation).
     pub bytes_since_rekey: u64,
     /// Last reported client-side quality score (0–100). Updated via QualityReport (0.9.0+).
     pub client_quality: u8,
+    /// Smoothed client RTT in ms (EWMA of QualityReport rtt_ms). 0 = unknown.
+    /// Used to scale the rekey/ratchet grace window so high-latency links
+    /// (e.g. satellite) don't silently drop in-flight packets at the key seam.
+    pub client_srtt_ms: u32,
 
     // --- FEC server-side recovery state (0.9.0+) ---
     /// Data packets received in the current FEC group (reset on each FecRepair).
@@ -165,54 +227,104 @@ pub struct Session {
     /// Next expected FEC group_seq. Mismatches indicate a lost FecRepair
     /// and mean the XOR buffer is stale — recovery must be skipped.
     pub fec_pending_seq: u16,
+    /// Highest mask-catalog version already pushed to this client. The gateway
+    /// bumps a global catalog version whenever the mask set changes; when this
+    /// lags behind, the next Keepalive triggers a fresh `MaskCatalog` push.
+    /// Starts at 0 so the catalog is sent once shortly after connect.
+    pub mask_catalog_version_sent: u64,
+
+    /// Signature of the session state last pushed to the kernel accelerator
+    /// (c2s key + wire offsets). 0 = never installed. When the live state
+    /// diverges (mask switch, key rotation) the kernel session is re-installed
+    /// so its frozen key/offsets don't silently fail every decrypt.
+    pub kernel_install_sig: u64,
+
+    /// Time window (`current_timestamp_ms / DEFAULT_WINDOW_MS`) that the current
+    /// kernel-downlink reservation's pre-computed resonance tags were derived
+    /// for. The kernel stamps these frozen tags verbatim (no in-kernel BLAKE3),
+    /// and the client only accepts a downlink tag whose window is within ±1 of
+    /// its own. So when the wall-clock window advances past this value we must
+    /// re-arm the reservation with fresh tags, or every kernel-egress downlink
+    /// packet is rejected as "Invalid resonance tag". 0 = never armed.
+    pub kernel_dl_window: u64,
+
+    /// Time window (`current_timestamp_ms / DEFAULT_WINDOW_MS`) that
+    /// `expected_tags` was last precomputed for. Lets the fallback scan skip
+    /// rebuilding windows that are already current (a fallback miss used to
+    /// rebuild EVERY session's window — O(sessions × window) BLAKE3 per miss).
+    /// 0 = never built.
+    pub tag_window_tw: u64,
 }
 
-/// 256-bit bitmap for tracking received packets
-#[derive(Debug, Clone, Copy, Default)]
-#[allow(non_camel_case_types)]
-pub struct u256 {
-    lo: u128,
-    hi: u128,
+/// Anti-replay bitmap tracking which of the last `TAG_WINDOW_SIZE` counters
+/// (relative to the newest seen) have already been received. Bit 0 is the
+/// newest counter; higher bit indices are older. Backed by `REPLAY_WORDS`
+/// little-endian u64 words so the window width scales with `TAG_WINDOW_SIZE`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReplayWindow {
+    words: [u64; REPLAY_WORDS],
 }
 
-impl u256 {
-    pub fn set_bit(&mut self, bit: usize) {
-        if bit < 128 {
-            self.lo |= 1u128 << bit;
-        } else {
-            self.hi |= 1u128 << (bit - 128);
+impl Default for ReplayWindow {
+    fn default() -> Self {
+        Self {
+            words: [0u64; REPLAY_WORDS],
         }
     }
+}
 
+impl ReplayWindow {
+    pub fn set_bit(&mut self, bit: usize) {
+        if bit >= TAG_WINDOW_SIZE {
+            return;
+        }
+        self.words[bit / 64] |= 1u64 << (bit % 64);
+    }
+
+    /// Shift all bits toward higher indices (older) by `shift` positions.
+    /// Called when the newest counter advances: history slides down and the
+    /// oldest bits fall off the end of the window.
     pub fn shift_left(&mut self, shift: usize) {
         if shift == 0 {
             return;
         }
-        if shift >= 256 {
+        if shift >= TAG_WINDOW_SIZE {
             self.clear();
             return;
         }
-        if shift >= 128 {
-            self.hi = self.lo << (shift - 128);
-            self.lo = 0;
-            return;
+        let word_shift = shift / 64;
+        let bit_shift = shift % 64;
+        if bit_shift == 0 {
+            for i in (0..REPLAY_WORDS).rev() {
+                self.words[i] = if i >= word_shift {
+                    self.words[i - word_shift]
+                } else {
+                    0
+                };
+            }
+        } else {
+            for i in (0..REPLAY_WORDS).rev() {
+                let mut v = 0u64;
+                if i >= word_shift {
+                    v = self.words[i - word_shift] << bit_shift;
+                    if i > word_shift {
+                        v |= self.words[i - word_shift - 1] >> (64 - bit_shift);
+                    }
+                }
+                self.words[i] = v;
+            }
         }
-
-        self.hi = (self.hi << shift) | (self.lo >> (128 - shift));
-        self.lo <<= shift;
     }
 
     pub fn get_bit(&self, bit: usize) -> bool {
-        if bit < 128 {
-            (self.lo & (1u128 << bit)) != 0
-        } else {
-            (self.hi & (1u128 << (bit - 128))) != 0
+        if bit >= TAG_WINDOW_SIZE {
+            return false;
         }
+        (self.words[bit / 64] & (1u64 << (bit % 64))) != 0
     }
 
     pub fn clear(&mut self) {
-        self.lo = 0;
-        self.hi = 0;
+        self.words = [0u64; REPLAY_WORDS];
     }
 }
 
@@ -244,7 +356,7 @@ impl Session {
             send_counter: 0,
             expected_tags: HashMap::with_capacity(TAG_WINDOW_SIZE),
             tag_window_base: 0,
-            received_bitmap: u256::default(),
+            received_bitmap: ReplayWindow::default(),
             pending_bytes_in: 0,
             pending_bytes_out: 0,
             server_eph_pub: None,
@@ -256,18 +368,25 @@ impl Session {
             client_id: None,
             pre_ratchet_tags: HashMap::new(),
             pre_ratchet_expire: None,
-            pre_ratchet_bitmap: u256::default(),
+            pre_ratchet_received: std::collections::HashSet::new(),
             mtls_ok: true,
             is_site_peer: false,
             is_pool_peer: false,
             pending_rekey_keypair: None,
+            pending_rekey_attempts: 0,
+            last_keyrotate_sent_at: now,
             last_rekey_at: now,
             bytes_since_rekey: 0,
             client_quality: 100,
+            client_srtt_ms: 0,
             fec_recv_count: 0,
             fec_xor_buf: Vec::new(),
             fec_xor_len: 0,
             fec_pending_seq: 0,
+            mask_catalog_version_sent: 0,
+            kernel_install_sig: 0,
+            kernel_dl_window: 0,
+            tag_window_tw: 0,
         }
     }
 
@@ -300,6 +419,7 @@ impl Session {
                 crypto::generate_resonance_tag(&self.keys.tag_secret, counter_val, time_window);
             self.expected_tags.insert(counter_val, tag);
         }
+        self.tag_window_tw = time_window;
     }
 
     /// Validate received tag (constant-time)
@@ -313,7 +433,18 @@ impl Session {
             }
 
             let bit_index = (self.counter - counter_val) as usize;
-            bit_index < TAG_WINDOW_SIZE && self.received_bitmap.get_bit(bit_index)
+            // A counter older than the replay bitmap can hold cannot be proven
+            // fresh, so it must be rejected as a replay. Returning false here
+            // would accept it: the precomputed `expected_tags` window reaches
+            // slightly further back than the bitmap (base is pinned at refresh
+            // time while `counter` drifts up to the refresh stride), so a tag
+            // just past the bitmap edge still matches `ct_eq` and, with the
+            // bit permanently unmarkable, would be replayable until the next
+            // refresh.
+            if bit_index >= TAG_WINDOW_SIZE {
+                return true;
+            }
+            self.received_bitmap.get_bit(bit_index)
         };
 
         let history_window = TAG_WINDOW_SIZE as u64 - 1;
@@ -350,10 +481,9 @@ impl Session {
             if Instant::now() < expire {
                 for (counter, expected) in &self.pre_ratchet_tags {
                     if bool::from(expected.ct_eq(tag)) {
-                        // C-S-2: use the dedicated pre-ratchet bitmap to detect
-                        // replay of old-key packets during the grace window.
-                        let bit = (*counter).min(255) as usize;
-                        if self.pre_ratchet_bitmap.get_bit(bit) {
+                        // C-S-2: dedicated pre-ratchet replay set (keyed by raw
+                        // counter — see field doc for why a bitmap aliased here).
+                        if self.pre_ratchet_received.contains(counter) {
                             return None; // Already received — replay
                         }
                         return Some((*counter, false));
@@ -388,6 +518,29 @@ impl Session {
         None
     }
 
+    /// Validate the first handshake packet against the session's initial keys,
+    /// tolerating ±2 time windows of client clock skew (data-plane `validate_tag`
+    /// only tolerates ±1). Used exclusively at session-creation time, mirroring
+    /// `handshake_tag_precheck`'s skew budget so a client that passes the cheap
+    /// pre-check is not then rejected by a narrower post-create validation.
+    pub fn validate_handshake_tag(&self, tag: &[u8; TAG_SIZE]) -> Option<(u64, bool)> {
+        const HANDSHAKE_TAG_SEARCH: u64 = 16;
+        let base_tw =
+            crypto::compute_time_window(crypto::current_timestamp_ms(), DEFAULT_WINDOW_MS);
+        for tw in HANDSHAKE_SKEW_WINDOWS
+            .iter()
+            .map(|d| base_tw.wrapping_add(*d as u64))
+        {
+            for counter in 0..=HANDSHAKE_TAG_SEARCH {
+                let expected = crypto::generate_resonance_tag(&self.keys.tag_secret, counter, tw);
+                if bool::from(expected.ct_eq(tag)) {
+                    return Some((counter, false));
+                }
+            }
+        }
+        None
+    }
+
     /// Mark tag as received
     pub fn mark_tag_received(&mut self, counter: u64) {
         if counter > self.counter {
@@ -399,7 +552,7 @@ impl Session {
         }
 
         let bit_index = (self.counter - counter) as usize;
-        if bit_index < 256 {
+        if bit_index < TAG_WINDOW_SIZE {
             self.received_bitmap.set_bit(bit_index);
         }
     }
@@ -412,8 +565,7 @@ impl Session {
 
     /// Mark a pre-ratchet counter as received so it cannot be replayed (C-S-2).
     pub fn mark_pre_ratchet_received(&mut self, counter: u64) {
-        let bit = counter.min(255) as usize;
-        self.pre_ratchet_bitmap.set_bit(bit);
+        self.pre_ratchet_received.insert(counter);
     }
 
     /// Get next sequence number for inner header
@@ -462,14 +614,42 @@ impl Session {
         }
     }
 
+    /// Fold a fresh client-reported RTT sample into the smoothed estimate
+    /// (EWMA, 1/8 weight). Clamped to a sane range to reject bogus reports.
+    pub fn observe_client_rtt(&mut self, rtt_ms: u32) {
+        let sample = rtt_ms.clamp(1, 60_000);
+        self.client_srtt_ms = if self.client_srtt_ms == 0 {
+            sample
+        } else {
+            ((self.client_srtt_ms as u64 * 7 + sample as u64) / 8) as u32
+        };
+    }
+
+    /// Grace window during which pre-ratchet keys stay valid so in-flight
+    /// packets encrypted with the old keys are not dropped at a rekey/ratchet
+    /// seam. Scales with RTT (`4 × srtt`) so high-latency links (satellite,
+    /// RTT+jitter > 2 s) don't silently lose packets, with a 2 s floor and a
+    /// 30 s cap so stale keys are not retained indefinitely.
+    pub fn rekey_grace(&self) -> Duration {
+        const FLOOR: Duration = Duration::from_secs(2);
+        const CAP: Duration = Duration::from_secs(30);
+        if self.client_srtt_ms == 0 {
+            return FLOOR;
+        }
+        let scaled = Duration::from_millis(self.client_srtt_ms as u64 * 4);
+        scaled.clamp(FLOOR, CAP)
+    }
+
     /// Complete PFS ratchet: switch to ratcheted keys, zeroize old ones
     pub fn complete_ratchet(&mut self) {
         if let Some(ratcheted_keys) = self.ratcheted_keys.take() {
-            // Preserve old expected_tags for 2 s so client packets that were
-            // already in-flight with the pre-ratchet keys are not dropped.
+            // Preserve old expected_tags for an RTT-scaled grace so client
+            // packets already in-flight with the pre-ratchet keys are not
+            // dropped (see rekey_grace).
+            let grace = self.rekey_grace();
             self.pre_ratchet_tags = std::mem::take(&mut self.expected_tags);
-            self.pre_ratchet_expire = Some(Instant::now() + Duration::from_secs(2));
-            self.pre_ratchet_bitmap.clear();
+            self.pre_ratchet_expire = Some(Instant::now() + grace);
+            self.pre_ratchet_received.clear();
 
             self.keys = ratcheted_keys;
             self.counter = 0;
@@ -564,6 +744,56 @@ impl SessionManager {
         }
     }
 
+    /// Cheap handshake tag pre-check used to gate the expensive `create_session`
+    /// during the pre-auth handshake scan (DoS hardening).
+    ///
+    /// `create_session` does two X25519 DHs, an Ed25519 signature, ~767 keyed
+    /// hashes to populate the tag windows, and three O(session_count) scans of
+    /// the session table — all before the tag is even checked. The handshake
+    /// scan runs it for every (registered client × candidate mask) pair per
+    /// admitted packet, so a spoofed-source UDP flood against a server with many
+    /// registered clients drove CPU cost as O(clients × masks) per packet.
+    ///
+    /// This does only ONE DH + key derivation + a handful of tag computations.
+    /// A handshake init packet is always sent with counter 0, so checking a small
+    /// counter range across the current ±1 time windows matches every legitimate
+    /// handshake (mirroring `Session::validate_tag`'s window logic) while letting
+    /// the scan skip `create_session` entirely for the overwhelming majority of
+    /// non-matching (client, mask) candidates.
+    pub fn handshake_tag_precheck(
+        &self,
+        eph_pub: &[u8; X25519_PUBLIC_KEY_SIZE],
+        preshared_key: Option<[u8; 32]>,
+        cand_tag: &[u8; TAG_SIZE],
+    ) -> bool {
+        // Small counter window — init is counter 0; a few extra tolerate the rare
+        // case where the very first datagram reordered ahead of the init is the
+        // one that reaches the scan.
+        const HANDSHAKE_TAG_SEARCH: u64 = 16;
+        let Ok(dh1) = self.server_keys.compute_shared(eph_pub) else {
+            return false;
+        };
+        let keys = crypto::derive_session_keys(&dh1, preshared_key.as_ref(), eph_pub);
+        let now = crypto::current_timestamp_ms();
+        let base_tw = crypto::compute_time_window(now, DEFAULT_WINDOW_MS);
+        // ±2 windows of clock-skew tolerance for the 0-RTT handshake. Data-plane
+        // validation stays at ±1 (see validate_tag); handshakes get an extra
+        // window because mobile clients with a poor RTC otherwise fail to
+        // establish at all — a one-time cost bounded by HANDSHAKE_TAG_SEARCH.
+        for tw in HANDSHAKE_SKEW_WINDOWS
+            .iter()
+            .map(|d| base_tw.wrapping_add(*d as u64))
+        {
+            for counter in 0..=HANDSHAKE_TAG_SEARCH {
+                let expected = crypto::generate_resonance_tag(&keys.tag_secret, counter, tw);
+                if bool::from(expected.ct_eq(cand_tag)) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// Create new session from initial packet.
     /// NOTE: Does NOT remove old sessions for the same client IP.
     /// The caller must call `cleanup_old_sessions_for_ip()` after
@@ -631,17 +861,14 @@ impl SessionManager {
 
         // DH1: server_static * client_eph → initial keys (0-RTT)
         let dh1 = self.server_keys.compute_shared(&eph_pub)?;
-        trace!("Server DH result: {}", hex::encode(&dh1));
+        // Never log key material (DH shared secret, PSK, tag_secret) — even at
+        // trace, RUST_LOG is operator-controllable and these secrets are what
+        // make sessions unlinkable. eph_pub is a public key, so it is safe to log.
         trace!(
             "Server eph_pub (after deobfuscation): {}",
             hex::encode(&eph_pub)
         );
-        trace!("Server PSK: {:?}", preshared_key.as_ref().map(hex::encode));
         let initial_keys = crypto::derive_session_keys(&dh1, preshared_key.as_ref(), &eph_pub);
-        trace!(
-            "Server tag_secret: {}",
-            hex::encode(&initial_keys.tag_secret)
-        );
 
         // --- CRIT-3 + HIGH-6: PFS ratchet preparation ---
         // Generate server ephemeral keypair
@@ -865,6 +1092,7 @@ impl SessionManager {
     ) -> [u8; 16] {
         let keys = aivpn_common::crypto::SessionKeys {
             session_key: blake3::derive_key("aivpn-pool-enc-v1", sync_key),
+            session_key_s2c: blake3::derive_key("aivpn-pool-enc-v1", sync_key),
             tag_secret: blake3::derive_key("aivpn-pool-tag-v1", sync_key),
             prng_seed: blake3::derive_key("aivpn-pool-prng-v1", sync_key),
         };
@@ -914,6 +1142,7 @@ impl SessionManager {
     ) -> [u8; 16] {
         let keys = aivpn_common::crypto::SessionKeys {
             session_key: blake3::derive_key("aivpn-pool-enc-v1", sync_key),
+            session_key_s2c: blake3::derive_key("aivpn-pool-enc-v1", sync_key),
             tag_secret: blake3::derive_key("aivpn-pool-tag-v1", sync_key),
             prng_seed: blake3::derive_key("aivpn-pool-prng-v1", sync_key),
         };
@@ -990,42 +1219,60 @@ impl SessionManager {
         }
     }
 
-    /// Refresh tag windows for all sessions (time window may have advanced)
-    /// and try to find a session matching the given tag.
+    /// Refresh stale tag windows (time window may have advanced) and try to
+    /// find a session matching the given tag.
+    ///
+    /// DoS containment: a fallback miss used to rebuild EVERY session's tag
+    /// windows (O(sessions × window) BLAKE3 per miss) and run the expensive
+    /// `validate_tag` (with its on-the-fly ±1-window search) against every
+    /// session — an attacker-influenceable CPU amplifier. Now the rebuild is
+    /// skipped for sessions whose windows are already current (amortized to
+    /// once per session per time window), and full validation only runs for
+    /// sessions belonging to the packet's source IP (mirroring
+    /// `recover_session_by_tag`'s scoping). Roamed clients whose windows were
+    /// stale are still recovered by the caller's O(1) re-probe of the
+    /// refreshed `tag_map`.
     pub fn refresh_and_find_by_tag(
         &self,
         tag: &[u8; TAG_SIZE],
+        client_ip: &std::net::IpAddr,
     ) -> Option<(Arc<Mutex<Session>>, u64, bool)> {
+        let current_tw =
+            crypto::compute_time_window(crypto::current_timestamp_ms(), DEFAULT_WINDOW_MS);
         for entry in self.sessions.iter() {
             let session = entry.value().clone();
             let session_id = *entry.key();
             let mut sess = session.lock();
 
-            // Refresh initial key tags
-            let old_tags: Vec<[u8; TAG_SIZE]> = sess.expected_tags.values().cloned().collect();
-            for old_tag in &old_tags {
-                self.tag_map.remove(old_tag);
-            }
-            sess.update_tag_window();
-            for t in sess.expected_tags.values() {
-                self.tag_map.insert(*t, session_id);
+            if sess.tag_window_tw != current_tw {
+                // Refresh initial key tags
+                let old_tags: Vec<[u8; TAG_SIZE]> = sess.expected_tags.values().cloned().collect();
+                for old_tag in &old_tags {
+                    self.tag_map.remove(old_tag);
+                }
+                sess.update_tag_window();
+                for t in sess.expected_tags.values() {
+                    self.tag_map.insert(*t, session_id);
+                }
+
+                // Refresh ratcheted key tags
+                let old_ratcheted: Vec<[u8; TAG_SIZE]> =
+                    sess.ratcheted_expected_tags.values().cloned().collect();
+                for old_tag in &old_ratcheted {
+                    self.tag_map.remove(old_tag);
+                }
+                sess.update_ratcheted_tag_window();
+                for t in sess.ratcheted_expected_tags.values() {
+                    self.tag_map.insert(*t, session_id);
+                }
             }
 
-            // Refresh ratcheted key tags
-            let old_ratcheted: Vec<[u8; TAG_SIZE]> =
-                sess.ratcheted_expected_tags.values().cloned().collect();
-            for old_tag in &old_ratcheted {
-                self.tag_map.remove(old_tag);
-            }
-            sess.update_ratcheted_tag_window();
-            for t in sess.ratcheted_expected_tags.values() {
-                self.tag_map.insert(*t, session_id);
-            }
-
-            // Try to validate the tag now
-            if let Some((counter, is_ratcheted)) = sess.validate_tag(tag) {
-                drop(sess);
-                return Some((session, counter, is_ratcheted));
+            // Try to validate the tag now (only for this source IP's sessions)
+            if sess.client_addr.ip() == *client_ip {
+                if let Some((counter, is_ratcheted)) = sess.validate_tag(tag) {
+                    drop(sess);
+                    return Some((session, counter, is_ratcheted));
+                }
             }
         }
         None
@@ -1042,32 +1289,38 @@ impl SessionManager {
     ) -> Option<(Arc<Mutex<Session>>, u64, bool)> {
         let current_tw =
             crypto::compute_time_window(crypto::current_timestamp_ms(), DEFAULT_WINDOW_MS);
-        // Search up to 65536 counters ahead from the session's last known counter
-        const RECOVERY_RANGE: u64 = 65536;
+        // Bounded ± search around the session's last known counter. The former
+        // forward-only 65536 window meant 3 × 65 536 ≈ 196k BLAKE3 per matching
+        // session — a spoofed tag from a known client IP could force the full
+        // scan (CPU-DoS). ±2048 (4097 × 3 ≈ 12k) still absorbs realistic counter
+        // drift from a client race while capping the attacker's work; the per-IP
+        // session limit (5) bounds the total.
+        const RECOVERY_RANGE: i64 = 2048;
 
         for entry in self.sessions.iter() {
             let session = entry.value().clone();
             let session_id = *entry.key();
-            let sess = session.lock();
-            if sess.client_addr.ip() != *client_ip {
-                continue;
-            }
-
-            let base = sess.counter;
-            let tag_secret = &sess.keys.tag_secret;
+            let (base, tag_secret) = {
+                let sess = session.lock();
+                if sess.client_addr.ip() != *client_ip {
+                    continue;
+                }
+                // Copy [u8;32] (Copy type) and release the mutex before the
+                // BLAKE3 iterations that would otherwise hold it.
+                (sess.counter, sess.keys.tag_secret)
+            };
 
             for tw_offset in [0i64, -1, 1] {
                 let tw = (current_tw as i64 + tw_offset) as u64;
-                for i in 0..RECOVERY_RANGE {
-                    let c = base + i;
-                    let expected = crypto::generate_resonance_tag(tag_secret, c, tw);
+                for i in -RECOVERY_RANGE..=RECOVERY_RANGE {
+                    let c = base.wrapping_add(i as u64);
+                    let expected = crypto::generate_resonance_tag(&tag_secret, c, tw);
                     if bool::from(expected.ct_eq(tag)) {
                         info!(
                             "Counter recovery: found counter {} (drift={}) for session",
                             c, i
                         );
-                        // Update tag window to the recovered counter
-                        drop(sess);
+                        // Update tag window to the recovered counter (mutex already released).
                         {
                             let mut s = session.lock();
                             // Collect old tags before updating window so we can
@@ -1101,10 +1354,44 @@ impl SessionManager {
         if let Some(entry) = self.vpn_ip_map.get(vpn_ip) {
             let session_id = *entry;
             drop(entry);
-            self.sessions.get(&session_id).map(|e| e.clone())
-        } else {
-            None
+            if let Some(sess) = self.sessions.get(&session_id).map(|e| e.clone()) {
+                return Some(sess);
+            }
+            // Map points at a session that no longer exists (removed without the
+            // map being cleaned). Fall through to the self-healing scan below.
         }
+        // Self-heal: the fast index missed, but a live session may still own this
+        // VPN IP (its map entry can be lost to a reconnect/duplicate-handshake
+        // race in create_session/rollback that overwrites vpn_ip_map before tag
+        // validation). Without this, downlink to that IP is a permanent
+        // blackhole — the client uploads fine (tag-matched) but receives nothing,
+        // trips its RX watchdog, and reconnects forever. The scan runs only on a
+        // miss (the cold path), so it costs nothing on the hot downlink path.
+        let repaired = self.sessions.iter().find_map(|entry| {
+            if entry.value().lock().vpn_ip == Some(*vpn_ip) {
+                Some((*entry.key(), entry.value().clone()))
+            } else {
+                None
+            }
+        });
+        if let Some((session_id, sess)) = repaired {
+            self.vpn_ip_map.insert(*vpn_ip, session_id);
+            debug!(
+                "Repaired lost vpn_ip_map entry for {} on downlink miss",
+                vpn_ip
+            );
+            return Some(sess);
+        }
+        None
+    }
+
+    /// Make `session_id` the authoritative owner of `vpn_ip` in the downlink
+    /// index. Called at the end of a successful handshake (after old-session
+    /// cleanup) so a concurrent duplicate/reconnect handshake that overwrote
+    /// `vpn_ip_map` while its own tag validation was still pending can never
+    /// leave the winning session without a downlink mapping.
+    pub fn bind_vpn_ip(&self, vpn_ip: &Ipv4Addr, session_id: &[u8; 16]) {
+        self.vpn_ip_map.insert(*vpn_ip, *session_id);
     }
 
     /// Remove session and return its ID if it existed.
@@ -1112,11 +1399,14 @@ impl SessionManager {
     pub fn remove_session(&self, session_id: &[u8; 16]) -> Option<[u8; 16]> {
         if let Some((_, session)) = self.sessions.remove(session_id) {
             let sess = session.lock();
-            // Remove all tags from tag map (initial + ratcheted)
+            // Remove all tags from tag map (initial + ratcheted + pre-ratchet grace)
             for tag in sess.expected_tags.values() {
                 self.tag_map.remove(tag);
             }
             for tag in sess.ratcheted_expected_tags.values() {
+                self.tag_map.remove(tag);
+            }
+            for tag in sess.pre_ratchet_tags.values() {
                 self.tag_map.remove(tag);
             }
             // Remove VPN IP mapping only if it still points to THIS session.
@@ -1144,14 +1434,34 @@ impl SessionManager {
     pub fn refresh_session_tags(&self, session_id: &[u8; 16]) {
         if let Some(session) = self.sessions.get(session_id) {
             let sess = session.lock();
-            // Remove stale tags for this session
-            self.tag_map.retain(|_, id| id != session_id);
+            // Remove only this session's tags by iterating its own expected_tags
+            // rather than scanning the entire global tag_map with retain().
+            // Collect old tags first to avoid holding lock during removal.
+            let old_tags: Vec<[u8; TAG_SIZE]> = self
+                .tag_map
+                .iter()
+                .filter(|e| e.value() == session_id)
+                .map(|e| *e.key())
+                .collect();
+            for tag in &old_tags {
+                self.tag_map.remove(tag);
+            }
             // Re-add current tags
             for tag in sess.expected_tags.values() {
                 self.tag_map.insert(*tag, *session_id);
             }
             for tag in sess.ratcheted_expected_tags.values() {
                 self.tag_map.insert(*tag, *session_id);
+            }
+            // Keep pre-ratchet grace tags resolvable O(1) while the grace
+            // window is still open (in-flight old-key packets at a rekey seam).
+            if sess
+                .pre_ratchet_expire
+                .is_some_and(|expire| Instant::now() < expire)
+            {
+                for tag in sess.pre_ratchet_tags.values() {
+                    self.tag_map.insert(*tag, *session_id);
+                }
             }
         }
     }
@@ -1160,8 +1470,16 @@ impl SessionManager {
     pub fn complete_session_ratchet(&self, session_id: &[u8; 16]) {
         if let Some(session) = self.sessions.get(session_id) {
             let mut sess = session.lock();
-            // Remove old initial key tags from tag_map
-            for tag in sess.expected_tags.values() {
+            if sess.ratcheted_keys.is_none() {
+                return; // nothing to ratchet — complete_ratchet would be a no-op
+            }
+            // Purge any PREVIOUS grace window's tags. The current initial-key
+            // tags deliberately STAY in the tag_map: complete_ratchet moves
+            // them into pre_ratchet_tags, and keeping them mapped preserves
+            // the O(1) lookup path for in-flight old-key packets during the
+            // grace window (see commit_session_rekey). Expired grace tags are
+            // purged by cleanup_expired.
+            for tag in sess.pre_ratchet_tags.values() {
                 self.tag_map.remove(tag);
             }
             // Complete the ratchet (swaps keys, moves ratcheted_expected_tags → expected_tags)
@@ -1176,11 +1494,36 @@ impl SessionManager {
     /// Cleanup expired sessions and return list of removed session IDs.
     /// The returned IDs can be used to stop active recordings.
     pub fn cleanup_expired(&self) -> Vec<[u8; 16]> {
+        // Purge pre-ratchet grace tags whose window has expired from the
+        // global tag_map (they are kept there during the grace window so
+        // in-flight old-key packets keep the O(1) lookup path).
+        let now = Instant::now();
+        for entry in self.sessions.iter() {
+            let mut sess = entry.value().lock();
+            if sess.pre_ratchet_expire.is_some_and(|expire| now >= expire) {
+                for tag in sess.pre_ratchet_tags.values() {
+                    self.tag_map.remove(tag);
+                }
+                sess.pre_ratchet_tags.clear();
+                sess.pre_ratchet_received.clear();
+                sess.pre_ratchet_expire = None;
+            }
+        }
+
         let expired: Vec<[u8; 16]> = self
             .sessions
             .iter()
             .filter(|e| {
                 let sess = e.value().lock();
+                // Synthetic pool/site peer sessions must never idle-expire:
+                // they are created once at startup and only kept alive by
+                // refresh_pool_peer_tags (every 60 s > idle_timeout) and
+                // inbound peer traffic. Evicting one silently kills pool/site
+                // sync from that peer until a full restart, because nothing
+                // ever re-creates a removed peer session.
+                if sess.is_pool_peer || sess.is_site_peer {
+                    return false;
+                }
                 sess.last_seen.elapsed() > self.idle_timeout
                     || (self.hard_timeout > Duration::ZERO
                         && sess.created_at.elapsed() > self.hard_timeout)
@@ -1338,7 +1681,7 @@ impl SessionManager {
             }
         }
 
-        let ciphertext = encrypt_payload(&sess.keys.session_key, &nonce, &padded)?;
+        let ciphertext = encrypt_payload(&sess.keys.session_key_s2c, &nonce, &padded)?; // downlink → S2C
 
         // Generate tag
         let time_window =
@@ -1376,10 +1719,17 @@ impl SessionManager {
             let session_id = *entry.key();
             let mut sess = entry.value().lock();
 
-            // Skip pool/site peers, sessions still pending ratchet, or already pending rekey.
+            // Skip pool/site peers and sessions still pending ratchet.
             if sess.is_pool_peer || sess.is_site_peer || !sess.is_ratcheted {
                 continue;
             }
+
+            // A KeyRotate for this session is already in flight but no valid
+            // rekey response has arrived. Retransmits are driven by the FAST
+            // sweep (`rekey_retransmits_due`, every ~2 s gateway tick), not
+            // this 30 s initiation tick — riding this tick was slower than
+            // the client's RX-silence watchdog (12 s floor), so a lost
+            // KeyRotate still cost a full reconnect before healing.
             if sess.pending_rekey_keypair.is_some() {
                 continue;
             }
@@ -1393,7 +1743,78 @@ impl SessionManager {
             let server_rekey_kp = crypto::KeyPair::generate();
             let new_eph_pub = server_rekey_kp.public_key_bytes();
             sess.pending_rekey_keypair = Some(server_rekey_kp);
+            sess.pending_rekey_attempts = 1;
+            sess.last_keyrotate_sent_at = now;
             due.push((session_id, new_eph_pub));
+        }
+
+        due
+    }
+
+    /// Fast retransmit sweep for pending in-flight rekeys. Called by the
+    /// gateway on a SHORT cadence (~2 s tick), decoupled from the 30 s
+    /// rekey-INITIATION tick, so a lost KeyRotate is re-sent within
+    /// ~`REKEY_RETRANSMIT_SECS` and the client re-syncs BEFORE its RX-silence
+    /// watchdog (12–45 s) gives up and reconnects.
+    ///
+    /// KeyRotate rides plain UDP with no delivery guarantee: if the KeyRotate
+    /// (or the client's response) is lost, the pending state would otherwise
+    /// stick — every initiation tick skips the session, PFS rotation silently
+    /// stops and, on a lost response, both sides desync until a reconnect.
+    /// Retransmit the SAME pending eph pub a bounded number of times.
+    /// Reusing the keypair is what makes the retransmit idempotent for the
+    /// client (identical keys whichever copy it processes; its
+    /// duplicate-suppression keys off this exact eph pub), and each
+    /// retransmitted packet is encrypted as a normal control message under a
+    /// fresh send counter — no (key, nonce) reuse, and data-plane counters
+    /// stay monotonic. In-flight old-key uplink at the eventual commit seam
+    /// stays covered by the pre_ratchet grace-tag window in
+    /// `commit_session_rekey`.
+    ///
+    /// Returns (session_id, pending_eph_pub) pairs to (re-)send KeyRotate for.
+    pub fn rekey_retransmits_due(&self) -> Vec<([u8; 16], [u8; X25519_PUBLIC_KEY_SIZE])> {
+        let now = Instant::now();
+        let mut due: Vec<([u8; 16], [u8; X25519_PUBLIC_KEY_SIZE])> = Vec::new();
+
+        for entry in self.sessions.iter() {
+            let session_id = *entry.key();
+            let mut sess = entry.value().lock();
+
+            if sess.pending_rekey_keypair.is_none() {
+                continue;
+            }
+            if now.duration_since(sess.last_keyrotate_sent_at).as_secs() < REKEY_RETRANSMIT_SECS {
+                continue; // last send is recent — give the response time to arrive
+            }
+
+            if sess.pending_rekey_attempts < MAX_REKEY_SEND_ATTEMPTS {
+                sess.pending_rekey_attempts += 1;
+                sess.last_keyrotate_sent_at = now;
+                let new_eph_pub = sess
+                    .pending_rekey_keypair
+                    .as_ref()
+                    .expect("checked is_some above")
+                    .public_key_bytes();
+                debug!(
+                    "Inline rekey: no response yet — retransmitting KeyRotate \
+                     (attempt {}/{})",
+                    sess.pending_rekey_attempts, MAX_REKEY_SEND_ATTEMPTS
+                );
+                due.push((session_id, new_eph_pub));
+            } else {
+                // All attempts exhausted: clear the stuck pending state so a
+                // FRESH rekey (new keypair) can re-initiate after the normal
+                // interval, instead of blocking rekeying forever. Bounded so
+                // a truly dead client eventually stops being retransmitted to.
+                warn!(
+                    "Inline rekey: no rekey response after {} KeyRotate sends — \
+                     clearing stuck pending rekey (fresh rekey will re-initiate)",
+                    MAX_REKEY_SEND_ATTEMPTS
+                );
+                sess.pending_rekey_keypair = None;
+                sess.pending_rekey_attempts = 0;
+                sess.last_rekey_at = now;
+            }
         }
 
         due
@@ -1420,6 +1841,7 @@ impl SessionManager {
                 return;
             }
         };
+        sess.pending_rekey_attempts = 0;
 
         let dh_rekey = match server_rekey_kp.compute_shared(client_rekey_eph_pub) {
             Ok(dh) => dh,
@@ -1438,25 +1860,53 @@ impl SessionManager {
             client_rekey_eph_pub,
         );
 
-        // Remove old tags from global tag_map.
-        for tag in sess.expected_tags.values() {
+        // Purge any PREVIOUS grace window's tags, then drop stale ratcheted
+        // tags. The CURRENT expected_tags deliberately STAY in the global
+        // tag_map: they become pre_ratchet_tags below, and keeping them mapped
+        // preserves the O(1) lookup path for in-flight old-key packets during
+        // the grace window — the fallback scan is globally rate-limited
+        // (20/s), so relying on it drops legitimate packets at the rekey seam
+        // under load. Expired grace tags are purged by cleanup_expired.
+        for tag in sess.pre_ratchet_tags.values() {
             self.tag_map.remove(tag);
         }
         for tag in sess.ratcheted_expected_tags.values() {
             self.tag_map.remove(tag);
         }
 
-        // Preserve old keys for 2-second grace window (in-flight packets from client).
+        // Preserve old keys for an RTT-scaled grace window (in-flight packets from client).
+        let grace = sess.rekey_grace();
         sess.pre_ratchet_tags = std::mem::take(&mut sess.expected_tags);
-        sess.pre_ratchet_expire = Some(Instant::now() + std::time::Duration::from_secs(2));
-        sess.pre_ratchet_bitmap.clear();
+        sess.pre_ratchet_expire = Some(Instant::now() + grace);
+        sess.pre_ratchet_received.clear();
 
         // Install new keys.
         sess.keys = new_keys;
-        sess.counter = 0;
-        sess.send_counter = 0;
-        sess.tag_window_base = 0;
-        sess.received_bitmap.clear();
+        // BOTH counters stay MONOTONIC across the inline rekey. The AEAD key
+        // changes here (new tag_secret / session_key_s2c / session_key_c2s), so
+        // continuing the counters never reuses a (key, nonce) pair.
+        //
+        // Resetting to 0 stranded the tunnel under load:
+        //  * Downlink (s2c, `send_counter`): the client resets its recv-window to
+        //    the unsynced state, whose forward tag search is a fixed
+        //    [0, RECV_FUTURE_SEARCH_WINDOW) span that cannot advance until it
+        //    decodes one packet — so if the 16 sharded downlink workers race past
+        //    that span, or its first packets are lost, the client never resyncs
+        //    and every downlink packet fails "Invalid resonance tag".
+        //  * Uplink (c2s, `counter` + `tag_window_base`): `update_tag_window`
+        //    precomputes expected inbound tags in a ±TAG_WINDOW_SIZE band around
+        //    `counter`. Reset to 0 that band is [0, 511]; under a simultaneous
+        //    heavy upload the client races past 511 while its first c2s packets
+        //    are lost, so the server can never match its tags — uplink dies, the
+        //    download's inner-TCP ACKs stop, downlink dries up and the client
+        //    hits RX-silence and reconnects.
+        //
+        // Keeping both counters monotonic keeps each side's window synced so it
+        // slides with the stream. `update_tag_window()` below rebuilds the c2s
+        // expected-tag band around the preserved `counter` with the new
+        // tag_secret; the anti-replay bitmap is preserved (monotonic counters
+        // never revisit a consumed slot, and the old tags were already dropped
+        // from the global map above).
         sess.bytes_since_rekey = 0;
         sess.last_rekey_at = Instant::now();
         sess.ratcheted_expected_tags.clear();
@@ -1480,6 +1930,7 @@ mod tests {
     fn make_keys(seed: u8) -> SessionKeys {
         SessionKeys {
             session_key: [seed; CHACHA20_KEY_SIZE],
+            session_key_s2c: [seed; CHACHA20_KEY_SIZE],
             tag_secret: [seed + 1; 32],
             prng_seed: [seed + 2; 32],
         }
@@ -1496,38 +1947,93 @@ mod tests {
         )
     }
 
-    // ── u256 bitmap ──────────────────────────────────────────────────────────
+    // ── RTT-scaled rekey grace (A5) ───────────────────────────────────────────
 
     #[test]
-    fn u256_set_and_get_bit_low_range() {
-        let mut b = u256 { lo: 0, hi: 0 };
+    fn rekey_grace_floors_at_2s_when_rtt_unknown() {
+        let s = make_session();
+        assert_eq!(s.client_srtt_ms, 0);
+        assert_eq!(s.rekey_grace(), Duration::from_secs(2));
+    }
+
+    #[test]
+    fn rekey_grace_floors_at_2s_for_low_rtt() {
+        let mut s = make_session();
+        s.observe_client_rtt(50); // 4×50ms = 200ms < 2s floor
+        assert_eq!(s.rekey_grace(), Duration::from_secs(2));
+    }
+
+    #[test]
+    fn rekey_grace_scales_with_high_rtt() {
+        let mut s = make_session();
+        // First sample seeds EWMA directly: srtt = 1500ms → 4× = 6s.
+        s.observe_client_rtt(1500);
+        assert_eq!(s.client_srtt_ms, 1500);
+        assert_eq!(s.rekey_grace(), Duration::from_secs(6));
+    }
+
+    #[test]
+    fn rekey_grace_caps_at_30s() {
+        let mut s = make_session();
+        s.observe_client_rtt(20_000); // 4×20s = 80s, capped to 30s
+        assert_eq!(s.rekey_grace(), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn observe_client_rtt_is_ewma_after_first_sample() {
+        let mut s = make_session();
+        s.observe_client_rtt(800);
+        assert_eq!(s.client_srtt_ms, 800);
+        // (800*7 + 80) / 8 = 710
+        s.observe_client_rtt(80);
+        assert_eq!(s.client_srtt_ms, 710);
+    }
+
+    // ── ReplayWindow bitmap ───────────────────────────────────────────────────
+
+    #[test]
+    fn replay_set_and_get_bit_low_range() {
+        let mut b = ReplayWindow::default();
         b.set_bit(0);
         assert!(b.get_bit(0));
         assert!(!b.get_bit(1));
     }
 
     #[test]
-    fn u256_set_and_get_bit_boundary_127() {
-        let mut b = u256 { lo: 0, hi: 0 };
-        b.set_bit(127);
-        assert!(b.get_bit(127));
-        assert!(!b.get_bit(126));
-        assert!(!b.get_bit(128));
+    fn replay_set_and_get_bit_word_boundary_63_64() {
+        let mut b = ReplayWindow::default();
+        b.set_bit(63);
+        assert!(b.get_bit(63));
+        assert!(!b.get_bit(62));
+        assert!(!b.get_bit(64));
+        b.set_bit(64);
+        assert!(b.get_bit(64));
+        assert!(b.get_bit(63));
     }
 
     #[test]
-    fn u256_set_and_get_bit_high_range() {
-        let mut b = u256 { lo: 0, hi: 0 };
+    fn replay_set_and_get_bit_high_range() {
+        let mut b = ReplayWindow::default();
         b.set_bit(128);
         assert!(b.get_bit(128));
         assert!(!b.get_bit(127));
-        b.set_bit(255);
-        assert!(b.get_bit(255));
+        b.set_bit(TAG_WINDOW_SIZE - 1);
+        assert!(b.get_bit(TAG_WINDOW_SIZE - 1));
     }
 
     #[test]
-    fn u256_shift_left_moves_bits() {
-        let mut b = u256 { lo: 0, hi: 0 };
+    fn replay_get_bit_out_of_range_is_false() {
+        let mut b = ReplayWindow::default();
+        // Setting an out-of-range bit is a no-op, and reading one is false.
+        b.set_bit(TAG_WINDOW_SIZE);
+        b.set_bit(TAG_WINDOW_SIZE + 1000);
+        assert!(!b.get_bit(TAG_WINDOW_SIZE));
+        assert!(!b.get_bit(TAG_WINDOW_SIZE + 1000));
+    }
+
+    #[test]
+    fn replay_shift_left_moves_bits() {
+        let mut b = ReplayWindow::default();
         b.set_bit(0);
         b.shift_left(1);
         assert!(!b.get_bit(0));
@@ -1535,45 +2041,71 @@ mod tests {
     }
 
     #[test]
-    fn u256_shift_left_by_256_clears_all() {
-        let mut b = u256 {
-            lo: u128::MAX,
-            hi: u128::MAX,
-        };
-        b.shift_left(256);
+    fn replay_shift_left_by_window_clears_all() {
+        let mut b = ReplayWindow::default();
+        b.set_bit(0);
+        b.set_bit(TAG_WINDOW_SIZE - 1);
+        b.shift_left(TAG_WINDOW_SIZE);
         assert!(!b.get_bit(0));
-        assert!(!b.get_bit(255));
+        assert!(!b.get_bit(TAG_WINDOW_SIZE - 1));
     }
 
     #[test]
-    fn u256_shift_left_across_128_boundary() {
-        let mut b = u256 { lo: 0, hi: 0 };
-        b.set_bit(127);
+    fn replay_shift_left_across_word_boundary() {
+        let mut b = ReplayWindow::default();
+        b.set_bit(63);
         b.shift_left(1);
-        assert!(!b.get_bit(127));
-        assert!(b.get_bit(128));
+        assert!(!b.get_bit(63));
+        assert!(b.get_bit(64));
     }
 
     #[test]
-    fn u256_clear_zeroes_all_bits() {
-        let mut b = u256 {
-            lo: u128::MAX,
-            hi: u128::MAX,
-        };
+    fn replay_shift_left_whole_word() {
+        let mut b = ReplayWindow::default();
+        b.set_bit(3);
+        b.set_bit(70);
+        b.shift_left(64);
+        assert!(!b.get_bit(3));
+        assert!(b.get_bit(67));
+        assert!(b.get_bit(134));
+    }
+
+    #[test]
+    fn replay_shift_left_drops_bits_off_the_end() {
+        let mut b = ReplayWindow::default();
+        b.set_bit(TAG_WINDOW_SIZE - 1);
+        b.shift_left(1);
+        // Bit shifted past the top of the window must be gone.
+        assert!(!b.get_bit(TAG_WINDOW_SIZE - 1));
+        for i in 0..TAG_WINDOW_SIZE {
+            assert!(!b.get_bit(i), "bit {i} unexpectedly set");
+        }
+    }
+
+    #[test]
+    fn replay_clear_zeroes_all_bits() {
+        let mut b = ReplayWindow::default();
+        b.set_bit(0);
+        b.set_bit(200);
+        b.set_bit(TAG_WINDOW_SIZE - 1);
         b.clear();
         assert!(!b.get_bit(0));
-        assert!(!b.get_bit(255));
+        assert!(!b.get_bit(200));
+        assert!(!b.get_bit(TAG_WINDOW_SIZE - 1));
     }
 
     #[test]
-    fn u256_multiple_bits_independent() {
-        let mut b = u256 { lo: 0, hi: 0 };
+    fn replay_multiple_bits_independent() {
+        let mut b = ReplayWindow::default();
         b.set_bit(5);
         b.set_bit(130);
+        b.set_bit(300);
         assert!(b.get_bit(5));
         assert!(b.get_bit(130));
+        assert!(b.get_bit(300));
         assert!(!b.get_bit(6));
         assert!(!b.get_bit(129));
+        assert!(!b.get_bit(299));
     }
 
     // ── Session state & anti-replay ───────────────────────────────────────────
@@ -1629,5 +2161,208 @@ mod tests {
         // Re-generate the window so the tag stays in the lookup table.
         s.update_tag_window();
         assert!(s.validate_tag(&tag).is_none(), "replay must be rejected");
+    }
+
+    // ── Inline-rekey robustness (lost KeyRotate / lost response) ────────────
+
+    fn make_manager() -> SessionManager {
+        SessionManager::new(
+            crypto::KeyPair::generate(),
+            ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]),
+            aivpn_common::mask::preset_masks::bootstrap_default(),
+        )
+    }
+
+    /// Insert a ratcheted session whose last rekey is overdue, so
+    /// `start_rekeying_sessions` considers it due on the next tick.
+    fn insert_overdue_session(sm: &SessionManager, sid: [u8; 16]) -> Instant {
+        let mut s = Session::new(
+            sid,
+            "127.0.0.1:5555".parse().unwrap(),
+            make_keys(1),
+            [0u8; X25519_PUBLIC_KEY_SIZE],
+        );
+        s.is_ratcheted = true;
+        let overdue = Instant::now()
+            .checked_sub(Duration::from_secs(REKEY_INTERVAL_SECS + 5))
+            .expect("host uptime exceeds the rekey interval");
+        s.last_rekey_at = overdue;
+        sm.sessions.insert(sid, Arc::new(Mutex::new(s)));
+        overdue
+    }
+
+    /// Backdate the pending rekey's last-send stamp so the fast retransmit
+    /// sweep sees it as due (tests can't wait REKEY_RETRANSMIT_SECS of wall
+    /// clock).
+    fn backdate_last_keyrotate(sm: &SessionManager, sid: &[u8; 16]) {
+        let entry = sm.sessions.get(sid).unwrap();
+        let mut s = entry.value().lock();
+        s.last_keyrotate_sent_at = Instant::now()
+            .checked_sub(Duration::from_secs(REKEY_RETRANSMIT_SECS + 1))
+            .expect("host uptime exceeds the retransmit interval");
+    }
+
+    /// Regression for the inline-rekey deadlock: `start_rekeying_sessions`
+    /// used to skip any session with `pending_rekey_keypair.is_some()`, so a
+    /// single lost KeyRotate (one-shot UDP, no retransmit) left the pending
+    /// state stuck forever — PFS rotation silently stopped for the session.
+    /// The fix must (1) RETRANSMIT the SAME pending eph pub for a bounded
+    /// number of attempts on the FAST sweep (`rekey_retransmits_due`, ~3 s
+    /// cadence — under the client's 12 s RX-silence watchdog floor, so the
+    /// tunnel self-heals with ZERO reconnects; same keypair — a fresh one
+    /// would permanently desync a client that already committed against the
+    /// first one), then (2) clear the stuck state so a fresh rekey can
+    /// re-initiate.
+    #[test]
+    fn stuck_pending_rekey_is_retransmitted_then_cleared() {
+        let sm = make_manager();
+        let sid = [7u8; 16];
+        let overdue = insert_overdue_session(&sm, sid);
+
+        // Initiation tick: rekey due → initial KeyRotate, fresh pending keypair.
+        let due1 = sm.start_rekeying_sessions();
+        assert_eq!(due1.len(), 1, "overdue session must start rekeying");
+        let eph1 = due1[0].1;
+
+        // Immediately after the initial send nothing is due for retransmit
+        // (last send is recent) and the initiation tick must SKIP the
+        // pending session rather than start a second rekey.
+        assert!(
+            sm.rekey_retransmits_due().is_empty(),
+            "retransmit must wait REKEY_RETRANSMIT_SECS after the last send"
+        );
+        assert!(
+            sm.start_rekeying_sessions().is_empty(),
+            "initiation tick must skip a session with a rekey in flight"
+        );
+
+        // Fast-sweep ticks with no client response: retransmit the SAME eph.
+        for attempt in 2..=MAX_REKEY_SEND_ATTEMPTS {
+            backdate_last_keyrotate(&sm, &sid);
+            let due = sm.rekey_retransmits_due();
+            assert_eq!(
+                due.len(),
+                1,
+                "attempt {attempt}: pending rekey must be retransmitted, not skipped"
+            );
+            assert_eq!(
+                due[0].1, eph1,
+                "attempt {attempt}: retransmit must reuse the pending keypair, \
+                 never generate a fresh one"
+            );
+        }
+
+        // Attempts exhausted: stuck pending state is cleared, nothing sent.
+        backdate_last_keyrotate(&sm, &sid);
+        let after = sm.rekey_retransmits_due();
+        assert!(
+            after.is_empty(),
+            "after {MAX_REKEY_SEND_ATTEMPTS} sends the stuck rekey must be dropped"
+        );
+        {
+            let entry = sm.sessions.get(&sid).unwrap();
+            let mut s = entry.value().lock();
+            assert!(
+                s.pending_rekey_keypair.is_none(),
+                "stuck pending rekey must be cleared so rekeying can re-initiate"
+            );
+            assert_eq!(s.pending_rekey_attempts, 0);
+            // The clear reset last_rekey_at (full-interval backoff); make the
+            // session due again to prove a FRESH rekey re-initiates.
+            s.last_rekey_at = overdue;
+        }
+        let fresh = sm.start_rekeying_sessions();
+        assert_eq!(
+            fresh.len(),
+            1,
+            "cleared session must be able to rekey again"
+        );
+        assert_ne!(
+            fresh[0].1, eph1,
+            "re-initiated rekey must use a brand-new keypair"
+        );
+    }
+
+    /// Regression for the downlink blackhole: a live session owns a VPN IP but
+    /// its `vpn_ip_map` entry was lost (a reconnect/duplicate-handshake race can
+    /// overwrite it before tag validation, and the loser's rollback does not
+    /// restore the winner). `get_session_by_vpn_ip` must self-heal by scanning
+    /// live sessions and repairing the map, so downlink never permanently
+    /// blackholes while uplink (tag-matched) keeps working.
+    #[test]
+    fn get_session_by_vpn_ip_self_heals_lost_mapping() {
+        let sm = make_manager();
+        let sid = [3u8; 16];
+        let vpn_ip = Ipv4Addr::new(10, 0, 0, 8);
+        let mut s = Session::new(
+            sid,
+            "127.0.0.1:6000".parse().unwrap(),
+            make_keys(2),
+            [0u8; X25519_PUBLIC_KEY_SIZE],
+        );
+        s.vpn_ip = Some(vpn_ip);
+        sm.sessions.insert(sid, Arc::new(Mutex::new(s)));
+
+        // Simulate the lost mapping: the session is live but absent from the index.
+        assert!(sm.vpn_ip_map.get(&vpn_ip).is_none());
+
+        // Lookup must still find it AND repair the map.
+        let found = sm
+            .get_session_by_vpn_ip(&vpn_ip)
+            .expect("live session must be found via self-healing scan");
+        assert_eq!(found.lock().session_id, sid);
+        assert_eq!(
+            sm.vpn_ip_map.get(&vpn_ip).map(|e| *e),
+            Some(sid),
+            "map must be repaired after the self-healing scan"
+        );
+
+        // bind_vpn_ip makes a given session authoritative for the IP.
+        let sid2 = [4u8; 16];
+        let mut s2 = Session::new(
+            sid2,
+            "127.0.0.1:6001".parse().unwrap(),
+            make_keys(5),
+            [0u8; X25519_PUBLIC_KEY_SIZE],
+        );
+        s2.vpn_ip = Some(vpn_ip);
+        sm.sessions.insert(sid2, Arc::new(Mutex::new(s2)));
+        sm.bind_vpn_ip(&vpn_ip, &sid2);
+        assert_eq!(
+            sm.get_session_by_vpn_ip(&vpn_ip).unwrap().lock().session_id,
+            sid2,
+            "bind_vpn_ip must make the named session the downlink owner"
+        );
+    }
+
+    /// The happy path must be unaffected: a client response between ticks
+    /// commits the rekey, resets the attempt counter, and stops retransmits.
+    #[test]
+    fn rekey_response_between_ticks_commits_and_stops_retransmits() {
+        let sm = make_manager();
+        let sid = [8u8; 16];
+        insert_overdue_session(&sm, sid);
+
+        let due = sm.start_rekeying_sessions();
+        assert_eq!(due.len(), 1);
+
+        // Client responds with its rekey eph pub → server commits.
+        let client_kp = crypto::KeyPair::generate();
+        sm.commit_session_rekey(&sid, &client_kp.public_key_bytes());
+
+        {
+            let entry = sm.sessions.get(&sid).unwrap();
+            let s = entry.value().lock();
+            assert!(s.pending_rekey_keypair.is_none());
+            assert_eq!(s.pending_rekey_attempts, 0);
+        }
+        // Next ticks: nothing pending, nothing due (last_rekey_at was reset)
+        // — the commit must also stop the fast retransmit sweep.
+        assert!(sm.start_rekeying_sessions().is_empty());
+        backdate_last_keyrotate(&sm, &sid);
+        assert!(
+            sm.rekey_retransmits_due().is_empty(),
+            "a committed rekey must never be retransmitted"
+        );
     }
 }

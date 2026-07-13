@@ -3,7 +3,9 @@ package com.aivpn.client
 import android.app.Activity
 import android.app.AlertDialog
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.VpnService
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -19,7 +21,9 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.appcompat.app.AppCompatDelegate
 import androidx.core.os.LocaleListCompat
+import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.lifecycleScope
+import androidx.recyclerview.widget.LinearLayoutManager
 import com.aivpn.client.databinding.ActivityMainBinding
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -27,7 +31,6 @@ import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.net.DatagramPacket
 import java.net.DatagramSocket
-import java.net.Inet4Address
 import java.net.InetAddress
 import java.net.SocketTimeoutException
 import java.util.UUID
@@ -40,17 +43,9 @@ import java.util.UUID
  */
 class MainActivity : AppCompatActivity() {
 
-    private data class ParsedConnectionKey(
-        val server: String,
-        val serverKey: String,
-        val psk: String?,
-        val vpnIp: String,
-        val serverVpnIp: String,
-        val prefixLen: Int,
-        val mtu: Int,
-    )
-
     private lateinit var binding: ActivityMainBinding
+    private lateinit var profilesAdapter: ProfilesAdapter
+    private lateinit var viewModel: MainViewModel
     private var isConnected = false
     private var currentQualityScore: Int = 0
     private var currentRecordingService: String = ""
@@ -68,6 +63,23 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    // Android 13+ requires a runtime grant for POST_NOTIFICATIONS; without it the
+    // tunnel foreground notification and connect/disconnect events are silently
+    // suppressed on fresh installs. The VPN itself works either way, so a denial
+    // needs no handling — we simply stay without notifications.
+    private val notificationPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { /* no-op: VPN functionality does not depend on the grant */ }
+
+    private fun requestNotificationPermissionIfNeeded() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) !=
+                PackageManager.PERMISSION_GRANTED
+        ) {
+            notificationPermissionLauncher.launch(android.Manifest.permission.POST_NOTIFICATIONS)
+        }
+    }
+
     // Connection timer
     private val timerHandler = Handler(Looper.getMainLooper())
     private var connectionStartTime = 0L
@@ -79,7 +91,8 @@ class MainActivity : AppCompatActivity() {
                 val m = (elapsed % 3600) / 60
                 val s = elapsed % 60
                 binding.textTimer.text = String.format("%02d:%02d:%02d", h, m, s)
-                binding.textDuration.text = String.format("%02d:%02d", h * 60 + m, s)
+                // textDuration shows the fixed session START time (see the connected
+                // branch), NOT a second elapsed counter — so it no longer ticks here.
                 timerHandler.postDelayed(this, 1000)
             }
         }
@@ -89,13 +102,53 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
+
+        viewModel = ViewModelProvider(this).get(MainViewModel::class.java)
+        // Restore isConnected and connectionStartTime from ViewModel so they survive rotation.
+        viewModel.connectionState.observe(this) { state ->
+            isConnected = state == ConnectionState.CONNECTED
+        }
+        viewModel.connectionStartTime.observe(this) { startTime ->
+            connectionStartTime = startTime
+        }
+
+        // One-time migration of boot-critical prefs (auto-connect, last profile ID)
+        // from plain CE SharedPreferences into device-protected storage, where
+        // BootReceiver can read them during Direct Boot without crashing.
+        BootPrefs.migrateFromCredentialStorage(this)
+
+        // Android 13+: ask for notification permission up front so the user sees
+        // the tunnel status notification and connect/disconnect events.
+        requestNotificationPermissionIfNeeded()
+
         binding.versionFooter.text = "v${BuildConfig.VERSION_NAME} · ${getString(R.string.version_tagline)}"
+
+        profilesAdapter = ProfilesAdapter(
+            onProfileClick = { profile ->
+                if (!isConnected) {
+                    activeProfileId = profile.id
+                    SecureStorage.saveActiveProfileId(this, profile.id)
+                    binding.editConnectionKey.setText(profile.key)
+                    renderProfiles()
+                    // Sync button label to the newly selected profile
+                    val name = profiles.find { it.id == activeProfileId }?.name
+                    binding.btnConnect.text = if (name != null)
+                        "${getString(R.string.btn_connect)} · $name"
+                    else
+                        getString(R.string.btn_connect)
+                }
+            },
+            onEditClick   = { showProfileDialog(it) },
+            onDeleteClick = { confirmDeleteProfile(it) },
+        )
+        binding.profileList.layoutManager = LinearLayoutManager(this)
+        binding.profileList.adapter = profilesAdapter
 
         // Migrate legacy single connection key to profiles
         migrateLegacyKey()
 
         // Load profiles
-        profiles = SecureStorage.loadProfiles(this)
+        profiles = SecureStorage.loadProfiles(this).toMutableList()
         activeProfileId = SecureStorage.loadActiveProfileId(this)
 
         // If we have an active profile, load its key into the field
@@ -132,17 +185,44 @@ class MainActivity : AppCompatActivity() {
             startActivity(Intent(this, SplitTunnelActivity::class.java))
         }
 
+        // Background reliability & permissions health check — the button and its
+        // status hint both open the checklist (the hint says "tap to fix").
+        val openBgHealth = View.OnClickListener {
+            startActivity(Intent(this, BackgroundHealthActivity::class.java))
+        }
+        binding.btnBgHealth.setOnClickListener(openBgHealth)
+        binding.textBgHealthHint.setOnClickListener(openBgHealth)
+
         binding.btnOptions.setOnClickListener { showOptionsMenu(it) }
 
         updateSplitTunnelHint()
 
-        // Restore connection state if service is already running
-        if (AivpnService.isRunning) {
-            isConnected = true
-            updateUI(true, AivpnService.lastStatusText)
-        } else if (AivpnService.isServiceActive) {
-            isConnected = false
-            updateUI(false, AivpnService.lastStatusText)
+        // Restore connection state from the service's tri-state (single source of
+        // truth). The terminal DISCONNECTED branch is essential: if the service died
+        // while this Activity was not visible, the old two-branch isRunning/
+        // isServiceActive check matched nothing and left the UI frozen at
+        // "Connected" with a running timer and stale traffic counters.
+        resyncFromService()
+    }
+
+    /** Renders the current AivpnService.uiState. Used by onCreate and onResume. */
+    private fun resyncFromService() {
+        when (AivpnService.uiState) {
+            AivpnService.UiState.CONNECTED -> {
+                isConnected = true
+                updateUI(true, AivpnService.lastStatusText)
+            }
+            AivpnService.UiState.CONNECTING -> {
+                isConnected = false
+                updateUI(false, AivpnService.lastStatusText, connecting = true)
+            }
+            AivpnService.UiState.DISCONNECTED -> {
+                isConnected = false
+                updateUI(
+                    false,
+                    AivpnService.lastStatusText.ifEmpty { getString(R.string.status_disconnected) }
+                )
+            }
         }
     }
 
@@ -170,82 +250,20 @@ class MainActivity : AppCompatActivity() {
     private fun extractServerName(connectionKey: String): String {
         val parsed = parseConnectionKey(connectionKey) ?: return "Server"
         val server = parsed.server
-        val host = server.substringBefore(":")
-        return host
+        // IPv6 bracketed notation: [::1]:443 -> ::1
+        if (server.startsWith("[")) {
+            val end = server.indexOf(']')
+            return if (end > 1) server.substring(1, end) else server
+        }
+        return server.substringBeforeLast(':').ifEmpty { server }
     }
 
     private fun renderProfiles() {
-        val container = binding.profileList
-        container.removeAllViews()
-
-        if (profiles.isEmpty()) {
-            val empty = TextView(this).apply {
-                text = getString(R.string.no_profiles)
-                setTextColor(getColor(R.color.text_secondary))
-                textSize = 13f
-                setPadding(0, 8.dp, 0, 8.dp)
-            }
-            container.addView(empty)
-            return
-        }
-
-        for (profile in profiles) {
-            val row = LinearLayout(this).apply {
-                orientation = LinearLayout.HORIZONTAL
-                gravity = android.view.Gravity.CENTER_VERTICAL
-                setPadding(0, 6.dp, 0, 6.dp)
-                layoutParams = LinearLayout.LayoutParams(
-                    LinearLayout.LayoutParams.MATCH_PARENT,
-                    LinearLayout.LayoutParams.WRAP_CONTENT
-                )
-            }
-
-            val isActive = profile.id == activeProfileId
-
-            // Profile name + server info
-            val nameView = TextView(this).apply {
-                text = profile.name
-                textSize = 14f
-                setTextColor(getColor(if (isActive) R.color.accent else R.color.text_primary))
-                if (isActive) setTypeface(null, android.graphics.Typeface.BOLD)
-                layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
-            }
-
-            val editBtn = ImageButton(this).apply {
-                setImageResource(android.R.drawable.ic_menu_edit)
-                setBackgroundColor(android.graphics.Color.TRANSPARENT)
-                setPadding(8.dp, 4.dp, 8.dp, 4.dp)
-                contentDescription = getString(R.string.btn_edit)
-                setOnClickListener { showProfileDialog(profile) }
-            }
-
-            val deleteBtn = ImageButton(this).apply {
-                setImageResource(android.R.drawable.ic_menu_delete)
-                setBackgroundColor(android.graphics.Color.TRANSPARENT)
-                setPadding(8.dp, 4.dp, 8.dp, 4.dp)
-                contentDescription = getString(R.string.btn_delete)
-                setOnClickListener { confirmDeleteProfile(profile) }
-            }
-
-            // Tap the row to select
-            row.setOnClickListener {
-                if (isConnected) return@setOnClickListener
-                activeProfileId = profile.id
-                SecureStorage.saveActiveProfileId(this, profile.id)
-                binding.editConnectionKey.setText(profile.key)
-                renderProfiles()
-            }
-
-            row.addView(nameView)
-            if (!isConnected) {
-                row.addView(editBtn)
-                row.addView(deleteBtn)
-            }
-            container.addView(row)
-        }
-        
-        // Sync the main connect button with the newly active profile
-        updateUI(isConnected, binding.textStatus.text.toString())
+        profilesAdapter.activeProfileId = activeProfileId
+        profilesAdapter.editingEnabled = !isConnected
+        profilesAdapter.submitList(profiles.toList())
+        binding.textProfilesEmpty.visibility =
+            if (profiles.isEmpty()) View.VISIBLE else View.GONE
     }
 
     private fun showProfileDialog(existing: SecureStorage.ConnectionProfile?) {
@@ -284,10 +302,69 @@ class MainActivity : AppCompatActivity() {
             setPadding(0, 8.dp, 0, 2.dp)
         }
 
+        val dnsLabel = TextView(dialogCtx).apply {
+            text = getString(R.string.label_dns_servers)
+            textSize = 12f
+            setTextColor(getColor(R.color.text_secondary))
+            setPadding(0, 8.dp, 0, 2.dp)
+        }
+        val dnsInput = EditText(dialogCtx).apply {
+            hint = getString(R.string.hint_dns_servers)
+            setText(existing?.dnsServers?.joinToString(", ") ?: "")
+            setSingleLine(true)
+            textSize = 13f
+        }
+
+        val maskLabel = TextView(dialogCtx).apply {
+            text = getString(R.string.mask_profile_label)
+            textSize = 12f
+            setTextColor(getColor(R.color.text_secondary))
+            setPadding(0, 8.dp, 0, 2.dp)
+        }
+        // Build the mask list from the server-pushed catalog when available
+        // (marks auto-generated masks "(авто)"); otherwise fall back to presets.
+        val catalogJson = try { AivpnJni.getMaskCatalogJson() } catch (_: Throwable) { "" }
+        val maskIds = mutableListOf("auto")
+        val maskDisplayList = mutableListOf(getString(R.string.mask_auto))
+        if (catalogJson.isNotEmpty()) {
+            try {
+                val arr = org.json.JSONArray(catalogJson)
+                for (i in 0 until arr.length()) {
+                    val o = arr.getJSONObject(i)
+                    val id = o.optString("mask_id")
+                    if (id.isEmpty() || id == "auto") continue
+                    val label = o.optString("label", id)
+                    val gen = o.optBoolean("generated", false)
+                    maskIds.add(id)
+                    maskDisplayList.add(if (gen) label + getString(R.string.mask_auto_marker) else label)
+                }
+            } catch (_: Throwable) {}
+        }
+        if (maskIds.size == 1) {
+            for (id in MASK_OPTIONS.drop(1)) {
+                maskIds.add(id)
+                maskDisplayList.add(id)
+            }
+        }
+        val maskDisplayNames = maskDisplayList.toTypedArray()
+        val maskSpinner = android.widget.Spinner(dialogCtx)
+        val maskAdapter = android.widget.ArrayAdapter(
+            dialogCtx, android.R.layout.simple_spinner_item, maskDisplayNames
+        ).also { it.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item) }
+        maskSpinner.adapter = maskAdapter
+        val currentMask = existing?.maskProfile
+        val maskIdx = if (currentMask.isNullOrEmpty() || currentMask == "auto") 0
+                      else maskIds.indexOf(currentMask).let { if (it > 0) it else 0 }
+        maskSpinner.setSelection(maskIdx)
+
         layout.addView(nameInput)
         layout.addView(keyInput)
         layout.addView(certLabel)
         layout.addView(certInput)
+        layout.addView(dnsLabel)
+        layout.addView(dnsInput)
+        layout.addView(maskLabel)
+        layout.addView(maskSpinner)
 
         val title = if (existing != null)
             getString(R.string.dialog_edit_profile)
@@ -326,17 +403,37 @@ class MainActivity : AppCompatActivity() {
                     certRaw
                 }
 
+                val dnsRaw = dnsInput.text.toString().trim()
+                val dnsServers: List<String>? = if (dnsRaw.isEmpty()) null else
+                    dnsRaw.split(",").map { it.trim() }.filter { it.isNotBlank() }
+                        .takeIf { it.isNotEmpty() }
+
+                val selectedMaskIdx = maskSpinner.selectedItemPosition
+                val maskProfileValue: String? =
+                    if (selectedMaskIdx <= 0) null
+                    else maskIds.getOrNull(selectedMaskIdx)
+
                 if (existing != null) {
                     val idx = profiles.indexOfFirst { it.id == existing.id }
                     if (idx >= 0) {
-                        profiles[idx] = existing.copy(name = name, key = key, mtlsCertBase64 = mtlsCert)
+                        profiles[idx] = existing.copy(
+                            name = name, key = key,
+                            mtlsCertBase64 = mtlsCert, dnsServers = dnsServers,
+                            maskProfile = maskProfileValue,
+                        )
+                        // Keep the connection key field in sync when editing the active profile
+                        if (existing.id == activeProfileId) {
+                            binding.editConnectionKey.setText(key)
+                        }
                     }
                 } else {
                     val newProfile = SecureStorage.ConnectionProfile(
                         id = UUID.randomUUID().toString(),
                         name = name,
                         key = key,
-                        mtlsCertBase64 = mtlsCert
+                        mtlsCertBase64 = mtlsCert,
+                        dnsServers = dnsServers,
+                        maskProfile = maskProfileValue,
                     )
                     profiles.add(newProfile)
                     activeProfileId = newProfile.id
@@ -356,6 +453,13 @@ class MainActivity : AppCompatActivity() {
             .setMessage(getString(R.string.confirm_delete_profile, profile.name))
             .setPositiveButton(getString(R.string.btn_delete)) { _, _ ->
                 profiles.removeAll { it.id == profile.id }
+                // Drop the boot-time "last connected profile" mirror if it pointed at the
+                // deleted profile, so BootReceiver / always-on restore can't resurrect a
+                // stale ID and silently connect to a different (first-in-list) server.
+                val bootPrefs = BootPrefs.prefs(this)
+                if (bootPrefs.getString(PrefsKeys.PREF_LAST_PROFILE_ID, null) == profile.id) {
+                    bootPrefs.edit().remove(PrefsKeys.PREF_LAST_PROFILE_ID).apply()
+                }
                 if (activeProfileId == profile.id) {
                     activeProfileId = profiles.firstOrNull()?.id
                     activeProfileId?.let { SecureStorage.saveActiveProfileId(this, it) }
@@ -406,69 +510,50 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        // Restore UI state if service is already running (e.g. after returning from
-        // VPN permission dialog or screen rotation)
-        if (AivpnService.isRunning) {
-            isConnected = true
-            updateUI(true, AivpnService.lastStatusText)
-        } else if (AivpnService.isServiceActive) {
-            isConnected = false
-            updateUI(false, AivpnService.lastStatusText)
+        AivpnService.recordingCallback = { feedbackJson ->
+            runOnUiThread { handleRecordingFeedback(feedbackJson) }
         }
 
+        // Restore UI state from the service tri-state (e.g. after returning from
+        // the VPN permission dialog, screen rotation — or after the service DIED
+        // while this Activity was paused, which the old two-branch check missed,
+        // freezing the UI at "Connected").
+        resyncFromService()
+
         updateSplitTunnelHint()
+        updateBackgroundHealthHint()
+    }
+
+    /**
+     * One-line "Background: protected / at risk" status under the Background
+     * Health button. Re-evaluated on every resume so returning from a system
+     * settings screen refreshes it immediately.
+     */
+    private fun updateBackgroundHealthHint() {
+        val atRisk = BackgroundHealth.atRisk(this)
+        binding.textBgHealthHint.text = getString(
+            if (atRisk) R.string.bg_health_hint_risk else R.string.bg_health_hint_ok
+        )
+        binding.textBgHealthHint.setTextColor(
+            getColor(if (atRisk) R.color.accent_lemon else R.color.text_secondary)
+        )
     }
 
     override fun onPause() {
         super.onPause()
-        // Unregister callbacks when activity is no longer in foreground.
-        // Only nullify if activity is actually finishing (not just pausing for
-        // VPN permission dialog, multi-window, etc.)
-        if (isFinishing) {
-            AivpnService.statusCallback = null
-            AivpnService.trafficCallback = null
-        }
+        // Always unregister callbacks when leaving the foreground. onResume()
+        // re-registers them and resyncs from AivpnService.uiState (including the
+        // dead-service case), so no updates are missed. Clearing unconditionally prevents a stale
+        // lambda from holding a reference to a destroyed Activity (e.g. on rotation
+        // where isFinishing == false), which would cause NPE when the service fires
+        // a status/traffic callback between the old onDestroy and the new onResume.
+        AivpnService.statusCallback = null
+        AivpnService.trafficCallback = null
+        AivpnService.recordingCallback = null
     }
 
-    /**
-     * Parse connection key: aivpn://BASE64URL({"s":"host:port","k":"...","p":"...","i":"...","n":{...}})
-     */
-    private fun parseConnectionKey(key: String): ParsedConnectionKey? {
-        val raw = key.trim()
-        val payload = if (raw.startsWith("aivpn://")) raw.removePrefix("aivpn://") else raw
-        return try {
-            // Decode URL-safe base64 (no padding)
-            val jsonBytes = android.util.Base64.decode(payload,
-                android.util.Base64.URL_SAFE or android.util.Base64.NO_PADDING or android.util.Base64.NO_WRAP)
-            val json = JSONObject(String(jsonBytes))
-            val server = json.getString("s")
-            val serverKey = json.getString("k")
-            val psk = json.optString("p").takeUnless { it.isNullOrBlank() }
-            val networkConfig = json.optJSONObject("n")
-            val vpnIp = networkConfig?.optString("client_ip")?.takeUnless { it.isNullOrBlank() }
-                ?: json.optString("i").takeUnless { it.isNullOrBlank() } ?: return null
-            val serverVpnIp = networkConfig?.optString("server_vpn_ip")?.takeUnless { it.isNullOrBlank() }
-                ?: "10.0.0.1"
-            val prefixLen = networkConfig?.optInt("prefix_len", 24) ?: 24
-            val mtu = networkConfig?.optInt("mtu", 1346) ?: 1346
-
-            if (!isValidIpv4(vpnIp) || !isValidIpv4(serverVpnIp) || prefixLen !in 1..30 || mtu <= 0) {
-                return null
-            }
-
-            ParsedConnectionKey(server, serverKey, psk, vpnIp, serverVpnIp, prefixLen, mtu)
-        } catch (_: Exception) {
-            null
-        }
-    }
-
-    private fun isValidIpv4(value: String): Boolean {
-        return try {
-            InetAddress.getByName(value) is Inet4Address
-        } catch (_: Exception) {
-            false
-        }
-    }
+    /** Delegates to the shared parser in ConnectionKeyParser. */
+    private fun parseConnectionKey(key: String): ParsedConnectionKey? = ConnectionKeyParser.parse(key)
 
     private fun connect() {
         val connectionKey = binding.editConnectionKey.text.toString().trim()
@@ -525,17 +610,26 @@ class MainActivity : AppCompatActivity() {
         // read from EncryptedSharedPreferences inside AivpnService rather than
         // travelling through IPC as plaintext Intent extras.
         val profileId = activeProfileId ?: return
+        // Mirror the active profile ID in device-protected SharedPreferences so
+        // BootReceiver can read it during Direct Boot (CE storage is locked there —
+        // plain CE prefs would throw IllegalStateException, not help).
+        BootPrefs.prefs(this)
+            .edit().putString(PrefsKeys.PREF_LAST_PROFILE_ID, profileId).apply()
         val intent = Intent(this, AivpnService::class.java).apply {
             action = AivpnService.ACTION_CONNECT
             putExtra("profile_id", profileId)
         }
         startForegroundService(intent)
-        updateUI(true, getString(R.string.status_connecting))
+        // Show a "connecting" state (Disconnect button, grey dot, no timer) — NOT the
+        // green connected state. The real connected UI arrives via statusCallback when
+        // Rust fires onTunnelReady after the handshake, which is also the moment
+        // connectionStartTime gets stamped.
+        updateUI(false, getString(R.string.status_connecting), connecting = true)
     }
 
-    private fun updateUI(connected: Boolean, statusText: String) {
+    private fun updateUI(connected: Boolean, statusText: String, connecting: Boolean = false) {
         isConnected = connected
-        val serviceActive = connected || AivpnService.isServiceActive
+        val serviceActive = connected || connecting || AivpnService.isServiceActive
         // When not connected, append the active profile name so the user can see
         // which profile will be used without having to look at the profile list.
         binding.btnConnect.text = if (serviceActive) {
@@ -558,22 +652,42 @@ class MainActivity : AppCompatActivity() {
         binding.textTimer.visibility = statsVisibility
         binding.statsRow.visibility = statsVisibility
 
+        // FEC badge: visible when connected with adaptive level >= 2
+        binding.textFecBadge.visibility =
+            if (connected && adaptiveLevel() >= 2) View.VISIBLE else View.GONE
+
         // Lock/unlock input fields while connected
         binding.editConnectionKey.isEnabled = !serviceActive
         binding.btnAddProfile.isEnabled = !serviceActive
         renderProfiles()
 
-        // Timer management
-        if (connected && connectionStartTime == 0L) {
-            connectionStartTime = System.currentTimeMillis()
-            binding.textUpload.text = "0 B"
-            binding.textDownload.text = "0 B"
+        // Timer management — connectionStartTime is persisted in ViewModel and survives rotation.
+        if (connected) {
+            val isFreshConnect = connectionStartTime == 0L
+            viewModel.setConnected(statusText)  // idempotent: only stamps startTime when it is 0
+            // connectionStartTime is synced synchronously from ViewModel via observer above
+            if (isFreshConnect) {
+                binding.textUpload.text = "0 B"
+                binding.textDownload.text = "0 B"
+            }
+            // Stats-card third field: the wall-clock time the tunnel connected
+            // (fixed), complementing the big elapsed counter above. connectionStartTime
+            // is already synced from the ViewModel at this point.
+            if (connectionStartTime > 0) {
+                binding.textDuration.text = java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault())
+                    .format(java.util.Date(connectionStartTime))
+            }
+            timerHandler.removeCallbacks(timerRunnable)
             timerHandler.post(timerRunnable)
-        } else if (!connected) {
-            connectionStartTime = 0L
+        } else {
+            if (connecting) {
+                viewModel.setConnecting(statusText)
+            } else {
+                viewModel.setDisconnected(statusText)  // resets connectionStartTime in ViewModel
+            }
             timerHandler.removeCallbacks(timerRunnable)
             binding.textTimer.text = "00:00:00"
-            binding.textDuration.text = "00:00"
+            binding.textDuration.text = "--:--"
             // RX/TX counters intentionally kept — show last known values during reconnect
         }
     }
@@ -620,14 +734,23 @@ class MainActivity : AppCompatActivity() {
             getString(R.string.adaptive_satellite)
         )
 
+        val autoConnect = BootPrefs.prefs(this)
+            .getBoolean(PrefsKeys.PREF_AUTO_CONNECT, false)
+        val autoConnectLabel = getString(R.string.auto_connect_on_startup) +
+            ": " + if (autoConnect) getString(R.string.auto_connect_state_on)
+                   else getString(R.string.auto_connect_state_off)
+
         data class Item(val title: String, val desc: String, val id: Int)
         val items = listOf(
             Item(getString(R.string.adaptive_mode) + ": " + levelNames[currentLevel],
                  getString(R.string.desc_adaptive_mode), MENU_ADAPTIVE),
+            Item(autoConnectLabel,                   getString(R.string.desc_auto_connect),  MENU_AUTO_CONNECT),
             Item(getString(R.string.diagnostics),    getString(R.string.desc_diagnostics),   MENU_DIAGNOSTICS),
             Item(getString(R.string.recording),      getString(R.string.desc_recording),     MENU_RECORDING),
             Item(getString(R.string.export_logs),    getString(R.string.desc_export_logs),   MENU_EXPORT_LOGS),
             Item(getString(R.string.os_kill_switch), getString(R.string.desc_kill_switch),   MENU_OS_KILL_SWITCH),
+            Item(getString(R.string.bootstrap_discovery), getString(R.string.desc_bootstrap_discovery), MENU_BOOTSTRAP_DISCOVERY),
+            Item(getString(R.string.mask_privacy), getString(R.string.desc_mask_privacy), MENU_MASK_PRIVACY),
         )
 
         val dialogCtx = android.view.ContextThemeWrapper(this, R.style.Theme_AIVPN_Dialog)
@@ -694,22 +817,124 @@ class MainActivity : AppCompatActivity() {
                         selectedLevel = which
                     }
                     .setPositiveButton(android.R.string.ok) { _, _ ->
-                        getSharedPreferences("aivpn_prefs", MODE_PRIVATE)
-                            .edit().putInt("adaptive_level", selectedLevel).apply()
+                        getSharedPreferences(PrefsKeys.PREFS_NAME, MODE_PRIVATE)
+                            .edit().putInt(PrefsKeys.ADAPTIVE_LEVEL, selectedLevel).apply()
                     }
                     .setNegativeButton(getString(R.string.btn_cancel), null)
                     .show()
+            }
+            MENU_AUTO_CONNECT -> {
+                // Device-protected storage: BootReceiver must be able to read this
+                // during Direct Boot, where plain (CE) SharedPreferences throw.
+                val prefs = BootPrefs.prefs(this)
+                val current = prefs.getBoolean(PrefsKeys.PREF_AUTO_CONNECT, false)
+                prefs.edit().putBoolean(PrefsKeys.PREF_AUTO_CONNECT, !current).apply()
+                val msg = if (!current) getString(R.string.auto_connect_enabled)
+                          else getString(R.string.auto_connect_disabled)
+                android.widget.Toast.makeText(this, msg, android.widget.Toast.LENGTH_SHORT).show()
             }
             MENU_DIAGNOSTICS   -> showDiagnosticsDialog()
             MENU_RECORDING     -> showRecordingDialog()
             MENU_EXPORT_LOGS   -> exportLogs()
             MENU_OS_KILL_SWITCH -> startActivity(Intent(android.provider.Settings.ACTION_VPN_SETTINGS))
+            MENU_BOOTSTRAP_DISCOVERY -> showBootstrapDiscoveryDialog()
+            MENU_MASK_PRIVACY -> showMaskPrivacyDialog()
         }
     }
 
+    /**
+     * §3 Polymorphic masks + §2 crowdsourced blocking feedback settings. Both are
+     * opt-in and OFF by default, persisted in plain SharedPreferences (not tied to
+     * any single connection profile), and forwarded to the Rust core via
+     * [AivpnJni.runTunnel] on the next connect.
+     */
+    private fun showMaskPrivacyDialog() {
+        val dialogCtx = android.view.ContextThemeWrapper(this, R.style.Theme_AIVPN_Dialog)
+        val prefs = getSharedPreferences(PrefsKeys.PREFS_NAME, MODE_PRIVATE)
+
+        val layout = LinearLayout(dialogCtx).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(24.dp, 16.dp, 24.dp, 0)
+        }
+
+        val polymorphicCheck = android.widget.CheckBox(dialogCtx).apply {
+            text = getString(R.string.mask_polymorphic)
+            isChecked = prefs.getBoolean(PrefsKeys.PREF_POLYMORPHIC_ENABLED, false)
+        }
+        val polymorphicDesc = TextView(dialogCtx).apply {
+            text = getString(R.string.desc_mask_polymorphic)
+            textSize = 12f
+            setTextColor(getColor(R.color.text_secondary))
+            setPadding(0, 0, 0, 8.dp)
+        }
+
+        val shareFeedbackCheck = android.widget.CheckBox(dialogCtx).apply {
+            text = getString(R.string.mask_share_feedback)
+            isChecked = prefs.getBoolean(PrefsKeys.PREF_SHARE_MASK_FEEDBACK, false)
+        }
+        val receiveHintsCheck = android.widget.CheckBox(dialogCtx).apply {
+            text = getString(R.string.mask_receive_hints)
+            isChecked = prefs.getBoolean(PrefsKeys.PREF_RECEIVE_MASK_HINTS, false)
+        }
+
+        val countryLabel = TextView(dialogCtx).apply {
+            text = getString(R.string.mask_country_code_label)
+            textSize = 12f
+            setTextColor(getColor(R.color.text_secondary))
+            setPadding(0, 8.dp, 0, 2.dp)
+        }
+        val countryInput = EditText(dialogCtx).apply {
+            hint = getString(R.string.mask_country_code_hint)
+            setText(prefs.getString(PrefsKeys.PREF_COUNTRY_CODE, "") ?: "")
+            setSingleLine(true)
+            filters = arrayOf(android.text.InputFilter.LengthFilter(2))
+        }
+
+        layout.addView(polymorphicCheck)
+        layout.addView(polymorphicDesc)
+        layout.addView(shareFeedbackCheck)
+        layout.addView(receiveHintsCheck)
+        layout.addView(countryLabel)
+        layout.addView(countryInput)
+
+        val dialog = AlertDialog.Builder(this, R.style.Theme_AIVPN_Dialog)
+            .setTitle(getString(R.string.mask_privacy))
+            .setView(layout)
+            // Set with a null listener here and override the button's onClickListener
+            // AFTER show() below (standard Android pattern) so an invalid country code
+            // can Toast and keep the dialog open — with the DialogInterface positive-
+            // button listener, returning from the lambda without calling dismiss()
+            // still lets AlertDialog auto-dismiss afterwards, silently discarding the
+            // checkbox choices the user already made in this dialog.
+            .setPositiveButton(getString(R.string.btn_save), null)
+            .setNegativeButton(getString(R.string.btn_cancel), null)
+            .create()
+        dialog.setOnShowListener {
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                val country = countryInput.text.toString().trim()
+                val validCountry = country.length == 2 && country.all(Char::isLetter)
+                if (country.isNotEmpty() && !validCountry) {
+                    Toast.makeText(this, getString(R.string.mask_country_code_invalid), Toast.LENGTH_SHORT).show()
+                    return@setOnClickListener
+                }
+                prefs.edit()
+                    .putBoolean(PrefsKeys.PREF_POLYMORPHIC_ENABLED, polymorphicCheck.isChecked)
+                    .putBoolean(PrefsKeys.PREF_SHARE_MASK_FEEDBACK, shareFeedbackCheck.isChecked)
+                    .putBoolean(PrefsKeys.PREF_RECEIVE_MASK_HINTS, receiveHintsCheck.isChecked)
+                    .putString(PrefsKeys.PREF_COUNTRY_CODE, if (validCountry) country.uppercase() else null)
+                    .apply()
+                dialog.dismiss()
+            }
+        }
+        dialog.show()
+    }
+
+    // Clamped to the 4 defined levels: a server adaptive hint (or a corrupted pref)
+    // outside 0..3 would otherwise crash levelNames[currentLevel] lookups.
     private fun adaptiveLevel(): Int =
-        getSharedPreferences("aivpn_prefs", MODE_PRIVATE)
-            .getInt("adaptive_level", 0)
+        getSharedPreferences(PrefsKeys.PREFS_NAME, MODE_PRIVATE)
+            .getInt(PrefsKeys.ADAPTIVE_LEVEL, 0)
+            .coerceIn(0, 3)
 
     private fun exportLogs() {
         val toast = Toast.makeText(this, getString(R.string.export_logs_collecting), Toast.LENGTH_SHORT)
@@ -755,6 +980,191 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /**
+     * Advanced/operator-only flow: lets the user paste a server address/public key
+     * (handed to them out-of-band) plus one or more signed bootstrap descriptor
+     * channels, then fetches and verifies fresh mask material for that server. This
+     * does not "discover a server from nothing" — see BootstrapDiscovery.kt for why.
+     */
+    private fun showBootstrapDiscoveryDialog() {
+        val dialogCtx = android.view.ContextThemeWrapper(this, R.style.Theme_AIVPN_Dialog)
+        val container = LinearLayout(dialogCtx).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(24.dp, 16.dp, 24.dp, 0)
+        }
+
+        fun labeledInput(hint: String): EditText {
+            container.addView(TextView(dialogCtx).apply {
+                text = hint
+                textSize = 12f
+                setPadding(0, 12.dp, 0, 4.dp)
+            })
+            val input = EditText(dialogCtx).apply {
+                setSingleLine(true)
+                layoutParams = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+                )
+            }
+            container.addView(input)
+            return input
+        }
+
+        container.addView(TextView(dialogCtx).apply {
+            text = getString(R.string.bootstrap_discovery_hint)
+            textSize = 12f
+            setPadding(0, 0, 0, 4.dp)
+        })
+
+        val serverAddrInput = labeledInput(getString(R.string.bootstrap_server_address))
+        val serverKeyInput = labeledInput(getString(R.string.bootstrap_server_pubkey))
+        val pskInput = labeledInput(getString(R.string.bootstrap_server_psk))
+        val signingKeyInput = labeledInput(getString(R.string.bootstrap_signing_key))
+        val cdnInput = labeledInput(getString(R.string.bootstrap_cdn_url))
+        val githubInput = labeledInput(getString(R.string.bootstrap_github_repo))
+        val telegramBotInput = labeledInput(getString(R.string.bootstrap_telegram_bot))
+        val telegramChatInput = labeledInput(getString(R.string.bootstrap_telegram_chat))
+
+        val scrollView = android.widget.ScrollView(dialogCtx).also { it.addView(container) }
+
+        AlertDialog.Builder(this, R.style.Theme_AIVPN_Dialog)
+            .setTitle(getString(R.string.bootstrap_discovery))
+            .setView(scrollView)
+            .setPositiveButton(getString(R.string.bootstrap_discover_button)) { _, _ ->
+                runBootstrapDiscovery(
+                    serverAddr = serverAddrInput.text.toString().trim(),
+                    serverKeyHex = serverKeyInput.text.toString().trim(),
+                    pskHex = pskInput.text.toString().trim(),
+                    signingKeyB64 = signingKeyInput.text.toString().trim(),
+                    cdnUrl = cdnInput.text.toString().trim(),
+                    githubRepo = githubInput.text.toString().trim(),
+                    telegramBot = telegramBotInput.text.toString().trim(),
+                    telegramChat = telegramChatInput.text.toString().trim(),
+                )
+            }
+            .setNegativeButton(getString(R.string.btn_cancel), null)
+            .show()
+    }
+
+    private fun hexToBytes(hex: String): ByteArray? {
+        val clean = hex.trim()
+        if (clean.isEmpty() || clean.length % 2 != 0) return null
+        return try {
+            ByteArray(clean.length / 2) { i ->
+                clean.substring(i * 2, i * 2 + 2).toInt(16).toByte()
+            }
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private fun runBootstrapDiscovery(
+        serverAddr: String,
+        serverKeyHex: String,
+        pskHex: String,
+        signingKeyB64: String,
+        cdnUrl: String,
+        githubRepo: String,
+        telegramBot: String,
+        telegramChat: String,
+    ) {
+        if (serverAddr.isEmpty()) {
+            Toast.makeText(this, getString(R.string.bootstrap_missing_fields), Toast.LENGTH_SHORT).show()
+            return
+        }
+        val serverKeyBytes = hexToBytes(serverKeyHex)
+        if (serverKeyBytes == null || serverKeyBytes.size != 32) {
+            Toast.makeText(this, getString(R.string.bootstrap_invalid_server_key), Toast.LENGTH_SHORT).show()
+            return
+        }
+        val pskBytes = if (pskHex.isEmpty()) null else hexToBytes(pskHex)
+        if (pskHex.isNotEmpty() && (pskBytes == null || pskBytes.size != 32)) {
+            Toast.makeText(this, getString(R.string.bootstrap_invalid_server_key), Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        val toast = Toast.makeText(this, getString(R.string.bootstrap_discovering), Toast.LENGTH_SHORT)
+        toast.show()
+        lifecycleScope.launch(Dispatchers.IO) {
+            val settings = BootstrapDiscovery.ChannelSettings(
+                cdnUrl = cdnUrl,
+                githubRepo = githubRepo,
+                telegramBotToken = telegramBot,
+                telegramChatId = telegramChat,
+                signingPublicKeyBase64 = signingKeyB64,
+            )
+            val outcome = BootstrapDiscovery.discover(settings, System.currentTimeMillis() / 1000)
+
+            withContext(Dispatchers.Main) {
+                toast.cancel()
+                if (outcome.validDescriptorJsons.isEmpty()) {
+                    val errors = outcome.channelResults.joinToString("\n") { "${it.channel}: ${it.error ?: "no descriptors"}" }
+                    Toast.makeText(
+                        this@MainActivity,
+                        getString(R.string.bootstrap_result_failure) + "\n" + errors,
+                        Toast.LENGTH_LONG,
+                    ).show()
+                    return@withContext
+                }
+
+                val keyBase64 = android.util.Base64.encodeToString(serverKeyBytes, android.util.Base64.DEFAULT).trim()
+                val pskBase64 = pskBytes?.let { android.util.Base64.encodeToString(it, android.util.Base64.DEFAULT).trim() }
+                val json = JSONObject().apply {
+                    put("s", serverAddr)
+                    put("k", keyBase64)
+                    if (pskBase64 != null) put("p", pskBase64)
+                    // Placeholder client VPN IP — required by ConnectionKeyParser, but the
+                    // server overrides it via the ServerHello network config at connect time.
+                    put("i", "10.0.0.2")
+                }
+                val encoded = android.util.Base64.encodeToString(
+                    json.toString().toByteArray(Charsets.UTF_8),
+                    android.util.Base64.URL_SAFE or android.util.Base64.NO_PADDING or android.util.Base64.NO_WRAP,
+                )
+                val connectionKey = "aivpn://$encoded"
+                val name = getString(R.string.bootstrap_default_key_name) + " ($serverAddr)"
+                // Add via the Activity's own `profiles` list — the single source of truth
+                // used everywhere else in this Activity. viewModel.saveProfile must NOT be
+                // used here: the ViewModel's LiveData list is never loaded in this Activity
+                // (always empty), so SecureStorage.saveProfiles would overwrite ALL stored
+                // profiles with just this one — losing every existing key.
+                val profile = SecureStorage.ConnectionProfile(
+                    id = UUID.randomUUID().toString(),
+                    name = name,
+                    key = connectionKey,
+                )
+                profiles.add(profile)
+                activeProfileId = profile.id
+                SecureStorage.saveProfiles(this@MainActivity, profiles)
+                SecureStorage.saveActiveProfileId(this@MainActivity, profile.id)
+                // MEDIUM-3: persist the descriptors we just fetched + verified, keyed
+                // PER SERVER (M1), so the VERY FIRST connect to this server is covert —
+                // the one path that could shape a truly-first-ever handshake with a
+                // signed rotated descriptor mask instead of a public preset. Format
+                // matches accept_persisted_descriptors: a JSON array of descriptors.
+                try {
+                    val descArr = org.json.JSONArray()
+                    for (d in outcome.validDescriptorJsons) {
+                        descArr.put(org.json.JSONObject(d))
+                    }
+                    SecureStorage.saveBootstrapDescriptors(
+                        this@MainActivity, descArr.toString(), keyBase64)
+                } catch (e: Exception) {
+                    android.util.Log.w("MainActivity", "Persisting discovered descriptors failed: ${e.message}")
+                }
+                binding.editConnectionKey.setText(connectionKey)
+                renderProfiles()
+
+                Toast.makeText(
+                    this@MainActivity,
+                    getString(R.string.bootstrap_result_success)
+                        .replace("{n}", outcome.validDescriptorJsons.size.toString())
+                        .replace("{name}", name),
+                    Toast.LENGTH_LONG,
+                ).show()
+            }
+        }
+    }
+
     private fun showDiagnosticsDialog() {
         if (!isConnected) {
             Toast.makeText(this, getString(R.string.status_disconnected), Toast.LENGTH_SHORT).show()
@@ -762,7 +1172,13 @@ class MainActivity : AppCompatActivity() {
         }
         val serverAddr = profiles.find { it.id == activeProfileId }
             ?.key?.let { parseConnectionKey(it)?.server } ?: ""
-        val liveScore = currentQualityScore
+        // Read the LIVE score straight from the native core, not the cached
+        // currentQualityScore — that cache is only refreshed by the traffic
+        // callback, so it can be a stale 0 captured right after connect (before
+        // the first KeepaliveAck updated the score) if no traffic has flowed
+        // since. Fall back to the cache only if the live read has no data yet.
+        val liveScore = AivpnJni.getQualityScore().takeIf { it > 0 } ?: currentQualityScore
+        if (liveScore > 0) currentQualityScore = liveScore
         val qualityLine = if (liveScore > 0)
             getString(R.string.quality_score_live, liveScore)
         else
@@ -791,22 +1207,46 @@ class MainActivity : AppCompatActivity() {
 
     private data class BenchStats(val p50: Int, val p95: Int, val lossPct: Double, val quality: Int)
 
+    /** Parse host:port or [IPv6]:port. Returns null on invalid input. */
+    private fun parseHostPort(addr: String): Pair<String, Int>? {
+        if (addr.startsWith("[")) {
+            val bracket = addr.indexOf(']')
+            if (bracket < 1) return null
+            val host = addr.substring(1, bracket)
+            val port = if (bracket + 1 < addr.length && addr[bracket + 1] == ':')
+                addr.substring(bracket + 2).toIntOrNull()?.takeIf { it in 1..65535 }
+            else null
+            return Pair(host, port ?: 443)
+        }
+        val lastColon = addr.lastIndexOf(':')
+        if (lastColon < 0) return null
+        val port = addr.substring(lastColon + 1).toIntOrNull()?.takeIf { it in 1..65535 } ?: return null
+        return Pair(addr.substring(0, lastColon), port)
+    }
+
     private fun runUDPBench(serverAddr: String): BenchStats {
         if (serverAddr.isEmpty()) return BenchStats(0, 0, 100.0, 0)
-        val colonIdx = serverAddr.lastIndexOf(':')
-        if (colonIdx < 0) return BenchStats(0, 0, 100.0, 0)
-        val host = serverAddr.substring(0, colonIdx)
-        val port = serverAddr.substring(colonIdx + 1).toIntOrNull() ?: return BenchStats(0, 0, 100.0, 0)
+        val (host, port) = parseHostPort(serverAddr) ?: return BenchStats(0, 0, 100.0, 0)
 
         return try {
             val socket = DatagramSocket()
             // Protect the socket so bench probes bypass the VPN tunnel and reach the
-            // server directly, avoiding a routing loop when the VPN is active.
-            AivpnService.instance?.protect(socket) ?: run {
-                android.util.Log.w("MainActivity", "bench: VPN service not running, socket not protected")
+            // server directly. If protection FAILS (service gone, fd limit), abort:
+            // an unprotected probe would loop through the tunnel (bogus RTTs) and,
+            // worse, leak a direct-to-server datagram association outside the mask.
+            val protectOk = AivpnService.instance?.protect(socket) == true
+            if (!protectOk) {
+                android.util.Log.w("MainActivity", "bench: socket not protected — aborting benchmark")
+                socket.close()
+                return BenchStats(0, 0, 100.0, 0)
             }
             socket.soTimeout = 500
-            val probe = "aivpn-bench-probe-v1".toByteArray()
+            // Random payload, NOT a plaintext marker: a fixed "aivpn-bench-probe-v1"
+            // string is a trivial DPI signature that links this client to the VPN
+            // server address. Random bytes are indistinguishable from the encrypted/
+            // masked traffic already flowing to the same endpoint. The server never
+            // parses the probe anyway (RTT is estimated via the timeout fallback).
+            val probe = ByteArray(20).also { java.security.SecureRandom().nextBytes(it) }
             val addr = InetAddress.getByName(host)
             val deadline = System.currentTimeMillis() + 5_000L
             val rtts = mutableListOf<Double>()
@@ -855,6 +1295,50 @@ class MainActivity : AppCompatActivity() {
         super.onDestroy()
     }
 
+    /**
+     * Parses a JSON feedback blob from [AivpnJni.getRecordingFeedback] (polled
+     * once per second by [AivpnService] and forwarded via [AivpnService.recordingCallback])
+     * and surfaces the server's recording ack/complete/failed outcome to the user.
+     * Must be called on the main thread.
+     */
+    private fun handleRecordingFeedback(feedbackJson: String) {
+        val json = try {
+            JSONObject(feedbackJson)
+        } catch (e: org.json.JSONException) {
+            return
+        }
+        when (json.optString("type")) {
+            "ack" -> {
+                val message = if (json.optString("status") == "analyzing") {
+                    getString(R.string.recording_analyzing)
+                } else {
+                    getString(R.string.recording_started)
+                }
+                Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
+            }
+            "complete" -> {
+                val maskId = json.optString("mask_id")
+                val confidencePct = (json.optDouble("confidence", 0.0) * 100).toInt()
+                Toast.makeText(
+                    this,
+                    getString(R.string.recording_complete, maskId, confidencePct),
+                    Toast.LENGTH_LONG
+                ).show()
+            }
+            "failed" -> {
+                Toast.makeText(
+                    this,
+                    getString(R.string.recording_failed, json.optString("reason")),
+                    Toast.LENGTH_LONG
+                ).show()
+            }
+            else -> {
+                // "status" (capability query response) — Android never sends
+                // RecordingStatusRequest today, so nothing to update here yet.
+            }
+        }
+    }
+
     private fun showRecordingDialog() {
         if (!isConnected) {
             Toast.makeText(this, getString(R.string.recording_no_session), Toast.LENGTH_SHORT).show()
@@ -890,5 +1374,17 @@ class MainActivity : AppCompatActivity() {
         private const val MENU_EXPORT_LOGS = 1003
         private const val MENU_RECORDING = 1004
         private const val MENU_OS_KILL_SWITCH = 1005
+        private const val MENU_AUTO_CONNECT = 1006
+        private const val MENU_BOOTSTRAP_DISCOVERY = 1007
+        private const val MENU_MASK_PRIVACY = 1008
+
+        val MASK_OPTIONS = arrayOf(
+            "auto",
+            "webrtc_zoom_v3",
+            "quic_https_v2",
+            "webrtc_yandex_telemost_v1",
+            "webrtc_vk_teams_v1",
+            "webrtc_sberjazz_v1",
+        )
     }
 }

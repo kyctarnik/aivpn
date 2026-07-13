@@ -19,7 +19,10 @@ jobs:
       uses: dtolnay/rust-toolchain@stable
       with:
         components: rustfmt, clippy
-    
+
+    - name: Cache Rust
+      uses: Swatinem/rust-cache@v2
+
     - name: Check formatting
       run: cargo fmt --all -- --check
 
@@ -31,3 +34,51 @@ jobs:
 
     - name: Clippy
       run: cargo clippy
+
+    # R2 Phase A — offline nDPI provenance gate over assets/masks/*.json.
+    # The DPI toolchain (nDPI + maskpcap) lives under the gitignored research/
+    # tree, so on a plain checkout this step SKIPS gracefully (exit 0) and never
+    # blocks the build. To ENFORCE it, provision the toolchain first (build
+    # research/dpi-harness nDPI + research/mask-generation/eval-gate maskpcap)
+    # and set MASK_GATE_REQUIRE=1 so a skip becomes a failure. See
+    # docs/R2_PHASE_A.md → "How it plugs into CI".
+    - name: Mask DPI gate (R2 Phase A)
+      run: make mask-gate
+
+  ios-swift:
+    runs-on: macos-15
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Setup Rust (iOS target)
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: aarch64-apple-ios
+
+    - name: Cache Rust (iOS)
+      uses: Swatinem/rust-cache@v2
+      with:
+        key: ios
+
+    - name: Build iOS Rust core
+      run: |
+        cargo build --release --target aarch64-apple-ios -p aivpn-ios-core
+        mkdir -p crates/aivpn-ios-core/lib
+        cp target/aarch64-apple-ios/release/libaivpn_core.a \
+           crates/aivpn-ios-core/lib/libaivpn_core.a
+
+    - name: Install XcodeGen
+      run: brew install xcodegen
+
+    - name: Generate Xcode project
+      run: cd platforms/ios && xcodegen generate
+
+    - name: Build (Swift compilation)
+      run: |
+        cd platforms/ios
+        xcodebuild build \
+          -project Aivpn.xcodeproj \
+          -scheme Aivpn \
+          -destination 'generic/platform=iOS' \
+          CODE_SIGNING_ALLOWED=NO \
+          CODE_SIGNING_REQUIRED=NO

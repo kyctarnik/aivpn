@@ -16,8 +16,16 @@
   "bootstrap_mask_files": [],
 
   "idle_timeout_secs": 30,
+  "session_timeout_secs": null,
 
   "allow_peer_routing": false,
+
+  "neural_enabled": true,
+  "downlink_shaping": true,
+
+  "mask_verify_mode": "warn",
+  "mask_signing_key": null,
+  "mask_operator_pubkey": null,
 
   "pool": {
     "peers": [],
@@ -41,5 +49,42 @@
     "upstream_doh": "https://1.1.1.1/dns-query",
     "fallback_doh": "https://8.8.8.8/dns-query",
     "block_plain_dns": false
+  },
+
+  "bootstrap_publish": {
+    "enabled": false,
+    "channels": [
+      {
+        "type": "s3",
+        "endpoint": "https://s3.us-east-1.amazonaws.com",
+        "region": "us-east-1",
+        "bucket": "my-aivpn-bootstrap",
+        "key": "bootstrap.json",
+        "access_key": "",
+        "secret_key": ""
+      },
+      {
+        "type": "github",
+        "repo": "owner/repo",
+        "asset_name": "bootstrap-descriptors.json",
+        "tag_name": "bootstrap",
+        "token": ""
+      },
+      {
+        "type": "telegram",
+        "bot_token": "",
+        "chat_id": ""
+      }
+    ]
+  },
+
+  "feedback": {
+    "report_failure_threshold": 3,
+    "report_interval_secs": 3600
+  },
+
+  "polymorphic": {
+    "all_sessions": false,
+    "base_mask": null
   }
 }

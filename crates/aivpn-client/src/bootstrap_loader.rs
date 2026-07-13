@@ -38,11 +38,21 @@ pub struct MultiChannelLoadStats {
 /// Rejects:
 /// - Non-HTTPS schemes (prevents plaintext interception).
 /// - Private/loopback/link-local hostnames (prevents SSRF against internal services).
-fn validate_bootstrap_url(url: &str) -> Result<()> {
+pub(crate) fn validate_bootstrap_url(url: &str) -> Result<()> {
     // Must start with https:// — no HTTP, no custom schemes.
     if !url.starts_with("https://") {
         return Err(Error::Session(format!(
             "Bootstrap URL '{}' rejected: only HTTPS is allowed",
+            url
+        )));
+    }
+
+    // Reject any URL that contains userinfo credentials (user:pass@ or user@).
+    // A crafted URL like https://user@169.254.169.254/path would otherwise bypass
+    // the private-range checks below because host_and_port becomes "user@169.254.169.254".
+    if url["https://".len()..].contains('@') {
+        return Err(Error::Session(format!(
+            "Bootstrap URL '{}' rejected: userinfo credentials are not allowed",
             url
         )));
     }
@@ -97,6 +107,37 @@ fn validate_bootstrap_url(url: &str) -> Result<()> {
     Ok(())
 }
 
+/// Hard cap on any bootstrap channel response body. Descriptor payloads are a
+/// few KB; anything beyond this is either misconfiguration or an attempt to
+/// exhaust memory via an attacker-influenced URL.
+const MAX_RESPONSE_BODY_BYTES: usize = 4 * 1024 * 1024;
+
+/// Read a response body with a size cap — `response.text()` would buffer an
+/// unbounded body in memory. Error strings are static so they can never leak
+/// the request URL (which for Telegram embeds the bot token).
+pub(crate) async fn read_body_capped(
+    mut response: reqwest::Response,
+) -> std::result::Result<String, &'static str> {
+    if response
+        .content_length()
+        .is_some_and(|len| len > MAX_RESPONSE_BODY_BYTES as u64)
+    {
+        return Err("response body too large");
+    }
+    let mut body: Vec<u8> = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| "failed to read response body")?
+    {
+        if body.len() + chunk.len() > MAX_RESPONSE_BODY_BYTES {
+            return Err("response body too large");
+        }
+        body.extend_from_slice(&chunk);
+    }
+    String::from_utf8(body).map_err(|_| "response body is not valid UTF-8")
+}
+
 /// Load descriptors from a CDN channel
 async fn load_from_cdn(url: &str) -> Result<Vec<BootstrapDescriptor>> {
     validate_bootstrap_url(url)?;
@@ -118,51 +159,161 @@ async fn load_from_cdn(url: &str) -> Result<Vec<BootstrapDescriptor>> {
         )));
     }
 
-    let body = response
-        .text()
+    let body = read_body_capped(response)
         .await
         .map_err(|e| Error::Session(format!("Failed to read CDN response: {}", e)))?;
 
-    parse_descriptors_from_json(&body)
+    parse_descriptors_from_json(&body, None)
 }
 
-/// Load descriptors from a Telegram bot channel
-async fn load_from_telegram(
-    bot_username: &str,
-    token: Option<&str>,
-) -> Result<Vec<BootstrapDescriptor>> {
-    // Telegram bot API endpoint
-    let api_url = match token {
-        Some(t) => format!("https://api.telegram.org/bot{}/getUpdates", t),
-        None => format!("https://t.me/{}?format=json", bot_username),
-    };
+/// Describe a `reqwest::Error` without ever including its `Display` output,
+/// which embeds the request URL — for Telegram Bot API calls, that URL
+/// contains the bot token, and this text ends up in `ChannelLoadResult.error`,
+/// which callers log.
+fn describe_reqwest_error(e: &reqwest::Error) -> &'static str {
+    if e.is_timeout() {
+        "request timed out"
+    } else if e.is_connect() {
+        "connection failed"
+    } else if e.is_decode() {
+        "failed to decode response body"
+    } else {
+        "network error"
+    }
+}
 
+/// Load descriptors from a Telegram bot channel via the authenticated Bot
+/// API: getUpdates -> find a message/channel_post carrying a document ->
+/// getFile -> download. Mirrors the Android/iOS implementations — the
+/// server's actual publish path (`bootstrap_publish.rs`'s `sendDocument`)
+/// can only be retrieved this way; an unauthenticated `t.me/...?format=json`
+/// scrape cannot see bot-posted documents at all.
+async fn load_from_telegram(
+    bot_token: &str,
+    chat_id: Option<&str>,
+) -> Result<Vec<BootstrapDescriptor>> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(15))
         .build()
         .map_err(|e| Error::Session(format!("Failed to create HTTP client: {}", e)))?;
 
-    let response = client
-        .get(&api_url)
-        .send()
-        .await
-        .map_err(|e| Error::Session(format!("Telegram request failed: {}", e)))?;
+    let updates_url = format!(
+        "https://api.telegram.org/bot{}/getUpdates?limit=50",
+        bot_token
+    );
+    // Note: deliberately not formatting the reqwest::Error itself into these
+    // messages — its Display output includes the request URL, which embeds
+    // the bot token, and this error text flows into ChannelLoadResult.error
+    // which gets logged.
+    let response = client.get(&updates_url).send().await.map_err(|e| {
+        Error::Session(format!(
+            "Telegram getUpdates failed: {}",
+            describe_reqwest_error(&e)
+        ))
+    })?;
 
     if !response.status().is_success() {
         return Err(Error::Session(format!(
-            "Telegram returned status: {}",
+            "Telegram getUpdates returned status: {}",
             response.status()
         )));
     }
 
-    let body = response
-        .text()
-        .await
-        .map_err(|e| Error::Session(format!("Failed to read Telegram response: {}", e)))?;
+    let body = read_body_capped(response).await.map_err(|e| {
+        Error::Session(format!(
+            "Failed to read Telegram getUpdates response: {}",
+            e
+        ))
+    })?;
 
-    // Telegram may wrap descriptors in a message structure
-    // Try to extract JSON from the response
-    parse_descriptors_from_json(&body)
+    let json: serde_json::Value = serde_json::from_str(&body).map_err(|e| {
+        Error::Session(format!(
+            "Failed to parse Telegram getUpdates response: {}",
+            e
+        ))
+    })?;
+
+    let updates = json
+        .get("result")
+        .and_then(|r| r.as_array())
+        .ok_or_else(|| Error::Session("Telegram getUpdates response missing 'result'".into()))?;
+
+    // Walk newest-first, same order the Android client scans in.
+    for update in updates.iter().rev() {
+        let message = update.get("message").or_else(|| update.get("channel_post"));
+        let Some(message) = message else { continue };
+
+        if let Some(want_chat) = chat_id {
+            let chat = message.get("chat");
+            let id_matches = chat
+                .and_then(|c| c.get("id"))
+                .map(|id| match id {
+                    serde_json::Value::String(s) => s == want_chat,
+                    other => other.to_string() == want_chat,
+                })
+                .unwrap_or(false);
+            let username_matches = chat
+                .and_then(|c| c.get("username"))
+                .and_then(|u| u.as_str())
+                .map(|u| format!("@{u}") == want_chat)
+                .unwrap_or(false);
+            if !id_matches && !username_matches {
+                continue;
+            }
+        }
+
+        let Some(file_id) = message
+            .get("document")
+            .and_then(|d| d.get("file_id"))
+            .and_then(|f| f.as_str())
+        else {
+            continue;
+        };
+
+        let get_file_url = format!(
+            "https://api.telegram.org/bot{}/getFile?file_id={}",
+            bot_token, file_id
+        );
+        let Ok(meta_resp) = client.get(&get_file_url).send().await else {
+            continue;
+        };
+        let Ok(meta_body) = read_body_capped(meta_resp).await else {
+            continue;
+        };
+        let Ok(meta_json) = serde_json::from_str::<serde_json::Value>(&meta_body) else {
+            continue;
+        };
+        let Some(file_path) = meta_json
+            .get("result")
+            .and_then(|r| r.get("file_path"))
+            .and_then(|p| p.as_str())
+        else {
+            continue;
+        };
+
+        let download_url = format!(
+            "https://api.telegram.org/file/bot{}/{}",
+            bot_token, file_path
+        );
+        let Ok(file_resp) = client.get(&download_url).send().await else {
+            continue;
+        };
+        let Ok(file_body) = read_body_capped(file_resp).await else {
+            continue;
+        };
+
+        if let Ok(descriptors) = parse_descriptors_from_json(&file_body, None) {
+            if !descriptors.is_empty() {
+                return Ok(descriptors);
+            }
+        }
+    }
+
+    Err(Error::Session(
+        "No verifiable bootstrap document found in recent Telegram updates \
+         (getUpdates only sees messages since the bot's last poll)"
+            .into(),
+    ))
 }
 
 /// Load descriptors from a GitHub releases channel
@@ -198,8 +349,7 @@ async fn load_from_github(repo: &str, asset_name: &str) -> Result<Vec<BootstrapD
         )));
     }
 
-    let body = response
-        .text()
+    let body = read_body_capped(response)
         .await
         .map_err(|e| Error::Session(format!("Failed to read GitHub response: {}", e)))?;
 
@@ -228,12 +378,11 @@ async fn load_from_github(repo: &str, asset_name: &str) -> Result<Vec<BootstrapD
                                 Error::Session(format!("Failed to download asset: {}", e))
                             })?;
 
-                        let asset_body = asset_response
-                            .text()
+                        let asset_body = read_body_capped(asset_response)
                             .await
                             .map_err(|e| Error::Session(format!("Failed to read asset: {}", e)))?;
 
-                        return parse_descriptors_from_json(&asset_body);
+                        return parse_descriptors_from_json(&asset_body, None);
                     }
                 }
             }
@@ -244,41 +393,6 @@ async fn load_from_github(repo: &str, asset_name: &str) -> Result<Vec<BootstrapD
         "Asset '{}' not found in GitHub release",
         asset_name
     )))
-}
-
-/// Load descriptors from an IPFS channel
-async fn load_from_ipfs(hash: &str, gateway: Option<&str>) -> Result<Vec<BootstrapDescriptor>> {
-    let url = match gateway {
-        Some(g) => format!("{}/ipfs/{}", g, hash),
-        None => format!("https://ipfs.io/ipfs/{}", hash),
-    };
-
-    validate_bootstrap_url(&url)?;
-
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(15))
-        .build()
-        .map_err(|e| Error::Session(format!("Failed to create HTTP client: {}", e)))?;
-
-    let response = client
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| Error::Session(format!("IPFS request failed: {}", e)))?;
-
-    if !response.status().is_success() {
-        return Err(Error::Session(format!(
-            "IPFS returned status: {}",
-            response.status()
-        )));
-    }
-
-    let body = response
-        .text()
-        .await
-        .map_err(|e| Error::Session(format!("Failed to read IPFS response: {}", e)))?;
-
-    parse_descriptors_from_json(&body)
 }
 
 /// Load descriptors from an Email channel (simulated - actual implementation would use SMTP/IMAP)
@@ -292,7 +406,10 @@ async fn load_from_email(
 }
 
 /// Parse descriptors from JSON body
-fn parse_descriptors_from_json(body: &str) -> Result<Vec<BootstrapDescriptor>> {
+fn parse_descriptors_from_json(
+    body: &str,
+    signing_key: Option<&[u8; 32]>,
+) -> Result<Vec<BootstrapDescriptor>> {
     // Try parsing as array first
     let descriptors: Vec<BootstrapDescriptor> = serde_json::from_str(body)
         .or_else(|_| {
@@ -307,7 +424,7 @@ fn parse_descriptors_from_json(body: &str) -> Result<Vec<BootstrapDescriptor>> {
     // Verify each descriptor
     let mut valid_descriptors = Vec::new();
     for descriptor in descriptors {
-        if store_verified_descriptor(descriptor.clone(), None).is_ok() {
+        if store_verified_descriptor(descriptor.clone(), signing_key).is_ok() {
             valid_descriptors.push(descriptor);
         }
     }
@@ -321,12 +438,10 @@ async fn load_from_channel(channel: &BootstrapChannel) -> ChannelLoadResult {
 
     let result = match channel {
         BootstrapChannel::CDN { url, provider: _ } => load_from_cdn(url).await,
-        BootstrapChannel::Telegram {
-            bot_username,
-            token,
-        } => load_from_telegram(bot_username, token.as_deref()).await,
+        BootstrapChannel::Telegram { bot_token, chat_id } => {
+            load_from_telegram(bot_token, chat_id.as_deref()).await
+        }
         BootstrapChannel::GitHub { repo, asset_name } => load_from_github(repo, asset_name).await,
-        BootstrapChannel::IPFS { hash, gateway } => load_from_ipfs(hash, gateway.as_deref()).await,
         BootstrapChannel::Email {
             address,
             subject_pattern,
@@ -436,13 +551,24 @@ impl BackgroundRefresher {
 
         let mut interval = tokio::time::interval(Duration::from_secs(self.config.refresh_interval));
 
+        let mut last_refresh = std::time::Instant::now()
+            .checked_sub(Duration::from_secs(self.config.refresh_interval))
+            .unwrap_or_else(std::time::Instant::now);
+
         loop {
             interval.tick().await;
 
-            // Skip if we already have valid descriptors and min channels succeeded
-            if has_valid_descriptors() {
+            // Always refresh when interval has elapsed, even if descriptors are valid.
+            // This ensures descriptors are rotated before expiry (24h grace window
+            // means has_valid_descriptors() stays true long after actual expiry).
+            let elapsed = last_refresh.elapsed();
+            if has_valid_descriptors()
+                && elapsed < Duration::from_secs(self.config.refresh_interval)
+            {
                 continue;
             }
+
+            last_refresh = std::time::Instant::now();
 
             // Load from multiple channels
             let stats = load_multi_channel(&self.config).await;
@@ -472,8 +598,8 @@ mod tests {
         assert_eq!(cdn.channel_type(), "CDN");
 
         let telegram = BootstrapChannel::Telegram {
-            bot_username: "@aivpn_bot".to_string(),
-            token: None,
+            bot_token: "123456:ABC-DEF".to_string(),
+            chat_id: Some("@aivpn_bot".to_string()),
         };
         assert_eq!(telegram.name(), "@aivpn_bot");
         assert_eq!(telegram.channel_type(), "Telegram");
@@ -483,15 +609,13 @@ mod tests {
     fn test_bootstrap_config_builder() {
         let config = BootstrapConfig::default()
             .with_cdn("https://cdn.example.com", "Cloudflare")
-            .with_telegram("@aivpn_bot")
-            .with_github("infosave2007/aivpn", "bootstrap-")
-            .with_ipfs("QmTest123");
+            .with_telegram("123456:ABC-DEF", Some("@aivpn_bot".to_string()))
+            .with_github("infosave2007/aivpn", "bootstrap-");
 
-        assert_eq!(config.channels.len(), 4);
+        assert_eq!(config.channels.len(), 3);
         assert_eq!(config.channels[0].channel_type(), "CDN");
         assert_eq!(config.channels[1].channel_type(), "Telegram");
         assert_eq!(config.channels[2].channel_type(), "GitHub");
-        assert_eq!(config.channels[3].channel_type(), "IPFS");
     }
 
     #[test]
@@ -541,6 +665,12 @@ mod tests {
         // parse_descriptors_from_json accepts a single JSON object as well as an array.
         // A well-formed but unsigned descriptor with zero signature should round-trip through
         // the parser (store_verified_descriptor with None key accepts zero-sig descriptors).
+        // HOME is process-wide and cargo test runs tests in parallel threads
+        // within the same process — without this mutex, another test
+        // mutating/reading HOME concurrently races with this one.
+        let _guard = crate::TEST_HOME_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let temp = std::env::temp_dir().join("aivpn_parse_test");
         let _ = std::fs::create_dir_all(&temp);
         let old_home = std::env::var("HOME").ok();
@@ -558,7 +688,7 @@ mod tests {
             "signature": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
         }"#;
 
-        let result = parse_descriptors_from_json(desc_json);
+        let result = parse_descriptors_from_json(desc_json, None);
         assert!(result.is_ok());
         let descs = result.unwrap();
         assert_eq!(descs.len(), 1);
@@ -574,7 +704,7 @@ mod tests {
 
     #[test]
     fn test_parse_descriptors_from_json_invalid() {
-        let result = parse_descriptors_from_json("not valid json at all !!!!");
+        let result = parse_descriptors_from_json("not valid json at all !!!!", None);
         assert!(result.is_err());
     }
 }

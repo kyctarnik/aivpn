@@ -13,6 +13,15 @@ use crate::network_config::ClientNetworkConfig;
 /// Maximum UDP packet size (optimized for VPN MTU 1420 + overhead)
 pub const MAX_PACKET_SIZE: usize = 1500;
 
+/// UDP receive-buffer size for the client downlink loop. Control packets — most
+/// notably `MaskUpdate`, which carries a full serialized `MaskProfile` (several
+/// KB) — are far larger than a DATA packet's `MAX_PACKET_SIZE` MTU. Receiving
+/// them into a 1500-byte buffer TRUNCATED the datagram, so the AEAD tag never
+/// authenticated and the client silently dropped every mask switch (it could
+/// never adopt a server-pushed mask). Size the recv buffer for the largest
+/// plausible control datagram instead.
+pub const UDP_RECV_BUF_SIZE: usize = 65536;
+
 /// Minimum header overhead (tag + pad_len + inner_header + poly1305)
 pub const MIN_HEADER_OVERHEAD: usize = TAG_SIZE + 2 + 4 + POLY1305_TAG_SIZE;
 
@@ -82,6 +91,22 @@ pub enum ControlSubtype {
     QualityReport = 0x19,
     /// Server hints client to change adaptive mode level (0x1A)
     AdaptiveHint = 0x1A,
+    /// Client signals which base mask it wants a polymorphic variant of (0x1B)
+    MaskPreference = 0x1B,
+    /// Client reports aggregated per-mask success/fail outcomes for its region,
+    /// privacy-preserving (k-anonymity gated server-side) — §2 crowdsourced blocking feedback (0x1C)
+    MaskFeedback = 0x1C,
+    /// Server pushes top-performing masks for the client's region, derived from
+    /// k-anonymity-gated crowdsourced feedback (0x1D)
+    RegionalMaskHints = 0x1D,
+    /// Server pushes §2 feedback tuning parameters to an opted-in client (0x1E):
+    /// how many consecutive failures warrant recording, and the minimum spacing
+    /// between feedback sends. Lets operators tune reporting load without a
+    /// client update.
+    FeedbackConfig = 0x1E,
+    /// Server pushes the catalog of masks the client may select, each tagged
+    /// with an auto-generated flag so pickers can mark generated masks (0x1F)
+    MaskCatalog = 0x1F,
 }
 
 impl ControlSubtype {
@@ -113,6 +138,11 @@ impl ControlSubtype {
             0x18 => Some(Self::KeepaliveAck),
             0x19 => Some(Self::QualityReport),
             0x1A => Some(Self::AdaptiveHint),
+            0x1B => Some(Self::MaskPreference),
+            0x1C => Some(Self::MaskFeedback),
+            0x1D => Some(Self::RegionalMaskHints),
+            0x1E => Some(Self::FeedbackConfig),
+            0x1F => Some(Self::MaskCatalog),
             _ => None,
         }
     }
@@ -383,6 +413,57 @@ pub enum ControlPayload {
         /// 0=Off, 1=Light, 2=Aggressive, 3=Satellite
         level: u8,
     },
+    /// Client asks the server to derive and push a per-session polymorphic
+    /// variant of the named base mask (§3 Polymorphic masks).
+    MaskPreference {
+        /// Preset mask id to use as the polymorphic base (e.g. "webrtc_zoom_v3")
+        base_mask_id: String,
+    },
+    /// Client → server: aggregated per-mask success/fail counters for the
+    /// client's region, batched client-side (§2 crowdsourced blocking feedback).
+    /// Opt-in only; carries no raw identity — the server derives a hashed
+    /// reporter token from the authenticated session for k-anonymity counting.
+    MaskFeedback {
+        /// Capped at 64 entries on encode.
+        entries: Vec<MaskOutcome>,
+        /// ISO-3166-1 alpha-2 country code the client believes it is in.
+        country_code: [u8; 2],
+    },
+    /// Server → client: top masks for the client's region by recent success
+    /// rate, only ever computed from k-anonymity-gated aggregates (§2).
+    RegionalMaskHints {
+        country_code: [u8; 2],
+        /// (mask_id, success_rate 0.0..=1.0), capped at 32 entries on encode.
+        masks: Vec<(String, f32)>,
+    },
+    /// Server → client: §2 feedback tuning, pushed to an opted-in client
+    /// (i.e. one that already sent a `MaskFeedback`). Sourced from the server's
+    /// optional `"feedback"` config block.
+    FeedbackConfig {
+        /// Minimum consecutive failed connection attempts with the same mask
+        /// family before the client records a failure outcome (noise gate).
+        report_failure_threshold: u8,
+        /// Minimum spacing, in seconds, between successive feedback sends.
+        report_interval_secs: u32,
+    },
+    /// Server → client: the catalog of masks this client may select. Pushed on
+    /// connect and whenever the server's mask store changes, so client pickers
+    /// render a live list instead of a hardcoded preset. Each entry is
+    /// `(mask_id, label, generated)`; `generated` is true for masks the server
+    /// auto-built from a recording (mask_gen), letting the UI mark them
+    /// "(авто)". Capped at 64 entries on encode.
+    MaskCatalog {
+        masks: Vec<(String, String, bool)>,
+    },
+}
+
+/// Aggregated success/fail outcome counters for a single mask, as reported by
+/// a client in a `MaskFeedback` message. Carries no reporter identity.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MaskOutcome {
+    pub mask_id: String,
+    pub success: u16,
+    pub fail: u16,
 }
 
 impl ControlPayload {
@@ -569,6 +650,65 @@ impl ControlPayload {
             Self::AdaptiveHint { level } => {
                 buf.push(ControlSubtype::AdaptiveHint as u8);
                 buf.push(*level);
+            }
+            Self::MaskPreference { base_mask_id } => {
+                buf.push(ControlSubtype::MaskPreference as u8);
+                let id_bytes = base_mask_id.as_bytes();
+                buf.extend_from_slice(&(id_bytes.len() as u16).to_le_bytes());
+                buf.extend_from_slice(id_bytes);
+            }
+            Self::MaskFeedback {
+                entries,
+                country_code,
+            } => {
+                buf.push(ControlSubtype::MaskFeedback as u8);
+                let count = entries.len().min(64);
+                buf.push(count as u8);
+                for entry in entries.iter().take(count) {
+                    let id_bytes = entry.mask_id.as_bytes();
+                    buf.extend_from_slice(&(id_bytes.len() as u16).to_le_bytes());
+                    buf.extend_from_slice(id_bytes);
+                    buf.extend_from_slice(&entry.success.to_le_bytes());
+                    buf.extend_from_slice(&entry.fail.to_le_bytes());
+                }
+                buf.extend_from_slice(country_code);
+            }
+            Self::RegionalMaskHints {
+                country_code,
+                masks,
+            } => {
+                buf.push(ControlSubtype::RegionalMaskHints as u8);
+                buf.extend_from_slice(country_code);
+                let count = masks.len().min(32);
+                buf.push(count as u8);
+                for (mask_id, score) in masks.iter().take(count) {
+                    let id_bytes = mask_id.as_bytes();
+                    buf.extend_from_slice(&(id_bytes.len() as u16).to_le_bytes());
+                    buf.extend_from_slice(id_bytes);
+                    buf.extend_from_slice(&score.to_le_bytes());
+                }
+            }
+            Self::FeedbackConfig {
+                report_failure_threshold,
+                report_interval_secs,
+            } => {
+                buf.push(ControlSubtype::FeedbackConfig as u8);
+                buf.push(*report_failure_threshold);
+                buf.extend_from_slice(&report_interval_secs.to_le_bytes());
+            }
+            Self::MaskCatalog { masks } => {
+                buf.push(ControlSubtype::MaskCatalog as u8);
+                let count = masks.len().min(64);
+                buf.push(count as u8);
+                for (mask_id, label, generated) in masks.iter().take(count) {
+                    let id_bytes = mask_id.as_bytes();
+                    buf.extend_from_slice(&(id_bytes.len() as u16).to_le_bytes());
+                    buf.extend_from_slice(id_bytes);
+                    let label_bytes = label.as_bytes();
+                    buf.extend_from_slice(&(label_bytes.len() as u16).to_le_bytes());
+                    buf.extend_from_slice(label_bytes);
+                    buf.push(if *generated { 1 } else { 0 });
+                }
             }
         }
 
@@ -809,7 +949,10 @@ impl ControlPayload {
                     return Err(Error::InvalidPacket("PoolSync too short"));
                 }
                 let payload_len = u32::from_le_bytes([data[1], data[2], data[3], data[4]]) as usize;
-                if data.len() < 5 + payload_len {
+                // NB: `data.len() < 5 + payload_len` would wrap on 32-bit
+                // targets (armv7/mipsel musl builds) for a wire-controlled len
+                // near u32::MAX — the check passes and the slice below panics.
+                if data.len().saturating_sub(5) < payload_len {
                     return Err(Error::InvalidPacket("PoolSync invalid length"));
                 }
                 Ok(Self::PoolSync {
@@ -821,7 +964,8 @@ impl ControlPayload {
                     return Err(Error::InvalidPacket("RouteSync too short"));
                 }
                 let len = u32::from_le_bytes([data[1], data[2], data[3], data[4]]) as usize;
-                if data.len() < 5 + len {
+                // Overflow-safe on 32-bit targets (see PoolSync above).
+                if data.len().saturating_sub(5) < len {
                     return Err(Error::InvalidPacket("RouteSync invalid length"));
                 }
                 Ok(Self::RouteSync {
@@ -833,7 +977,8 @@ impl ControlPayload {
                     return Err(Error::InvalidPacket("ChainForward too short"));
                 }
                 let len = u32::from_le_bytes([data[1], data[2], data[3], data[4]]) as usize;
-                if data.len() < 5 + len {
+                // Overflow-safe on 32-bit targets (see PoolSync above).
+                if data.len().saturating_sub(5) < len {
                     return Err(Error::InvalidPacket("ChainForward invalid length"));
                 }
                 Ok(Self::ChainForward {
@@ -845,7 +990,8 @@ impl ControlPayload {
                     return Err(Error::InvalidPacket("ClientCert too short"));
                 }
                 let len = u32::from_le_bytes([data[1], data[2], data[3], data[4]]) as usize;
-                if data.len() < 5 + len {
+                // Overflow-safe on 32-bit targets (see PoolSync above).
+                if data.len().saturating_sub(5) < len {
                     return Err(Error::InvalidPacket("ClientCert invalid length"));
                 }
                 Ok(Self::ClientCert {
@@ -889,6 +1035,152 @@ impl ControlPayload {
                     return Err(Error::InvalidPacket("AdaptiveHint too short"));
                 }
                 Ok(Self::AdaptiveHint { level: data[1] })
+            }
+            ControlSubtype::MaskPreference => {
+                if data.len() < 3 {
+                    return Err(Error::InvalidPacket("MaskPreference too short"));
+                }
+                let id_len = u16::from_le_bytes([data[1], data[2]]) as usize;
+                if data.len() < 3 + id_len {
+                    return Err(Error::InvalidPacket("MaskPreference invalid length"));
+                }
+                let base_mask_id = String::from_utf8_lossy(&data[3..3 + id_len]).to_string();
+                Ok(Self::MaskPreference { base_mask_id })
+            }
+            ControlSubtype::MaskFeedback => {
+                if data.len() < 2 {
+                    return Err(Error::InvalidPacket("MaskFeedback too short"));
+                }
+                // Reject (don't silently truncate) an over-cap count: clamping
+                // the loop bound would leave trailing entry bytes to be misread
+                // as the country code.
+                let entry_count = data[1] as usize;
+                if entry_count > 64 {
+                    return Err(Error::InvalidPacket("MaskFeedback entry_count exceeds cap"));
+                }
+                let mut offset = 2usize;
+                let mut entries = Vec::with_capacity(entry_count);
+                for _ in 0..entry_count {
+                    if data.len() < offset + 2 {
+                        return Err(Error::InvalidPacket("MaskFeedback entry truncated"));
+                    }
+                    let id_len = u16::from_le_bytes([data[offset], data[offset + 1]]) as usize;
+                    offset += 2;
+                    if data.len() < offset + id_len + 4 {
+                        return Err(Error::InvalidPacket("MaskFeedback entry truncated"));
+                    }
+                    let mask_id =
+                        String::from_utf8_lossy(&data[offset..offset + id_len]).to_string();
+                    offset += id_len;
+                    let success = u16::from_le_bytes([data[offset], data[offset + 1]]);
+                    offset += 2;
+                    let fail = u16::from_le_bytes([data[offset], data[offset + 1]]);
+                    offset += 2;
+                    entries.push(MaskOutcome {
+                        mask_id,
+                        success,
+                        fail,
+                    });
+                }
+                if data.len() < offset + 2 {
+                    return Err(Error::InvalidPacket("MaskFeedback missing country code"));
+                }
+                let country_code = [data[offset], data[offset + 1]];
+                Ok(Self::MaskFeedback {
+                    entries,
+                    country_code,
+                })
+            }
+            ControlSubtype::RegionalMaskHints => {
+                if data.len() < 4 {
+                    return Err(Error::InvalidPacket("RegionalMaskHints too short"));
+                }
+                let country_code = [data[1], data[2]];
+                let count = data[3] as usize;
+                if count > 32 {
+                    return Err(Error::InvalidPacket("RegionalMaskHints count exceeds cap"));
+                }
+                let mut offset = 4usize;
+                let mut masks = Vec::with_capacity(count);
+                for _ in 0..count {
+                    if data.len() < offset + 2 {
+                        return Err(Error::InvalidPacket("RegionalMaskHints entry truncated"));
+                    }
+                    let id_len = u16::from_le_bytes([data[offset], data[offset + 1]]) as usize;
+                    offset += 2;
+                    if data.len() < offset + id_len + 4 {
+                        return Err(Error::InvalidPacket("RegionalMaskHints entry truncated"));
+                    }
+                    let mask_id =
+                        String::from_utf8_lossy(&data[offset..offset + id_len]).to_string();
+                    offset += id_len;
+                    let score = f32::from_le_bytes([
+                        data[offset],
+                        data[offset + 1],
+                        data[offset + 2],
+                        data[offset + 3],
+                    ]);
+                    offset += 4;
+                    // Reject a non-finite or out-of-range score: it is a
+                    // success rate in [0,1] and feeds a mask-ranking sort, where
+                    // a NaN comparator would panic.
+                    if !score.is_finite() || !(0.0..=1.0).contains(&score) {
+                        return Err(Error::InvalidPacket("RegionalMaskHints score out of range"));
+                    }
+                    masks.push((mask_id, score));
+                }
+                Ok(Self::RegionalMaskHints {
+                    country_code,
+                    masks,
+                })
+            }
+            ControlSubtype::FeedbackConfig => {
+                // subtype(1) + threshold(1) + interval(4) = 6 bytes
+                if data.len() < 6 {
+                    return Err(Error::InvalidPacket("FeedbackConfig too short"));
+                }
+                let report_failure_threshold = data[1];
+                let report_interval_secs = u32::from_le_bytes([data[2], data[3], data[4], data[5]]);
+                Ok(Self::FeedbackConfig {
+                    report_failure_threshold,
+                    report_interval_secs,
+                })
+            }
+            ControlSubtype::MaskCatalog => {
+                if data.len() < 2 {
+                    return Err(Error::InvalidPacket("MaskCatalog too short"));
+                }
+                let count = data[1] as usize;
+                if count > 64 {
+                    return Err(Error::InvalidPacket("MaskCatalog count exceeds cap"));
+                }
+                let mut offset = 2usize;
+                let mut masks = Vec::with_capacity(count);
+                for _ in 0..count {
+                    if data.len() < offset + 2 {
+                        return Err(Error::InvalidPacket("MaskCatalog entry truncated"));
+                    }
+                    let id_len = u16::from_le_bytes([data[offset], data[offset + 1]]) as usize;
+                    offset += 2;
+                    if data.len() < offset + id_len + 2 {
+                        return Err(Error::InvalidPacket("MaskCatalog entry truncated"));
+                    }
+                    let mask_id =
+                        String::from_utf8_lossy(&data[offset..offset + id_len]).to_string();
+                    offset += id_len;
+                    let label_len = u16::from_le_bytes([data[offset], data[offset + 1]]) as usize;
+                    offset += 2;
+                    if data.len() < offset + label_len + 1 {
+                        return Err(Error::InvalidPacket("MaskCatalog entry truncated"));
+                    }
+                    let label =
+                        String::from_utf8_lossy(&data[offset..offset + label_len]).to_string();
+                    offset += label_len;
+                    let generated = data[offset] != 0;
+                    offset += 1;
+                    masks.push((mask_id, label, generated));
+                }
+                Ok(Self::MaskCatalog { masks })
             }
         }
     }
@@ -997,6 +1289,11 @@ mod tests {
             (0x18, ControlSubtype::KeepaliveAck),
             (0x19, ControlSubtype::QualityReport),
             (0x1A, ControlSubtype::AdaptiveHint),
+            (0x1B, ControlSubtype::MaskPreference),
+            (0x1C, ControlSubtype::MaskFeedback),
+            (0x1D, ControlSubtype::RegionalMaskHints),
+            (0x1E, ControlSubtype::FeedbackConfig),
+            (0x1F, ControlSubtype::MaskCatalog),
         ];
         for (byte, expected) in pairs {
             assert_eq!(
@@ -1007,7 +1304,7 @@ mod tests {
             );
         }
         assert_eq!(ControlSubtype::from_u8(0x00), None);
-        assert_eq!(ControlSubtype::from_u8(0x1B), None);
+        assert_eq!(ControlSubtype::from_u8(0x20), None);
     }
 
     // -----------------------------------------------------------------------
@@ -1612,6 +1909,19 @@ mod tests {
         }
     }
 
+    #[test]
+    fn control_payload_mask_preference_roundtrip() {
+        let p = ControlPayload::MaskPreference {
+            base_mask_id: "webrtc_zoom_v3".to_string(),
+        };
+        let decoded = roundtrip(&p);
+        if let ControlPayload::MaskPreference { base_mask_id } = decoded {
+            assert_eq!(base_mask_id, "webrtc_zoom_v3");
+        } else {
+            panic!("wrong variant");
+        }
+    }
+
     // -----------------------------------------------------------------------
     // ControlPayload::decode — malformed / too short inputs
     // -----------------------------------------------------------------------
@@ -1652,6 +1962,273 @@ mod tests {
     }
 
     #[test]
+    fn control_payload_mask_preference_too_short_returns_error() {
+        // just the subtype byte — needs 3 for the u16 length prefix
+        assert!(ControlPayload::decode(&[0x1B]).is_err());
+    }
+
+    #[test]
+    fn control_payload_mask_preference_length_exceeds_data_returns_error() {
+        // subtype + length=9999 but no payload bytes
+        let mut data = vec![0x1Bu8];
+        data.extend_from_slice(&9999u16.to_le_bytes());
+        assert!(ControlPayload::decode(&data).is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // ControlPayload::MaskFeedback / RegionalMaskHints (§2 crowdsourced
+    // blocking feedback — privacy-preserving)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn control_payload_mask_feedback_roundtrip() {
+        let p = ControlPayload::MaskFeedback {
+            entries: vec![
+                MaskOutcome {
+                    mask_id: "webrtc_zoom_v3".to_string(),
+                    success: 12,
+                    fail: 3,
+                },
+                MaskOutcome {
+                    mask_id: "quic_https".to_string(),
+                    success: 40,
+                    fail: 0,
+                },
+            ],
+            country_code: *b"DE",
+        };
+        let decoded = roundtrip(&p);
+        if let ControlPayload::MaskFeedback {
+            entries,
+            country_code,
+        } = decoded
+        {
+            assert_eq!(entries.len(), 2);
+            assert_eq!(entries[0].mask_id, "webrtc_zoom_v3");
+            assert_eq!(entries[0].success, 12);
+            assert_eq!(entries[0].fail, 3);
+            assert_eq!(entries[1].mask_id, "quic_https");
+            assert_eq!(entries[1].success, 40);
+            assert_eq!(entries[1].fail, 0);
+            assert_eq!(&country_code, b"DE");
+        } else {
+            panic!("wrong variant");
+        }
+    }
+
+    #[test]
+    fn control_payload_mask_feedback_empty_entries_roundtrip() {
+        let p = ControlPayload::MaskFeedback {
+            entries: vec![],
+            country_code: *b"US",
+        };
+        let decoded = roundtrip(&p);
+        if let ControlPayload::MaskFeedback {
+            entries,
+            country_code,
+        } = decoded
+        {
+            assert!(entries.is_empty());
+            assert_eq!(&country_code, b"US");
+        } else {
+            panic!("wrong variant");
+        }
+    }
+
+    #[test]
+    fn control_payload_mask_feedback_caps_at_64_entries() {
+        let entries: Vec<MaskOutcome> = (0..100)
+            .map(|i| MaskOutcome {
+                mask_id: format!("mask_{i}"),
+                success: 1,
+                fail: 0,
+            })
+            .collect();
+        let p = ControlPayload::MaskFeedback {
+            entries,
+            country_code: *b"FR",
+        };
+        let decoded = roundtrip(&p);
+        if let ControlPayload::MaskFeedback { entries, .. } = decoded {
+            assert_eq!(entries.len(), 64);
+        } else {
+            panic!("wrong variant");
+        }
+    }
+
+    #[test]
+    fn control_payload_mask_feedback_too_short_returns_error() {
+        // just the subtype byte — needs at least 2 (subtype + entry_count)
+        assert!(ControlPayload::decode(&[0x1C]).is_err());
+    }
+
+    #[test]
+    fn control_payload_mask_feedback_truncated_entry_returns_error() {
+        // subtype + entry_count=1, but no entry bytes at all
+        assert!(ControlPayload::decode(&[0x1C, 0x01]).is_err());
+    }
+
+    #[test]
+    fn control_payload_mask_feedback_missing_country_code_returns_error() {
+        // subtype + entry_count=0, but no country code bytes
+        assert!(ControlPayload::decode(&[0x1C, 0x00]).is_err());
+    }
+
+    #[test]
+    fn control_payload_mask_feedback_entry_length_exceeds_data_returns_error() {
+        // subtype + entry_count=1 + mask_id_len=9999 but no payload bytes
+        let mut data = vec![0x1Cu8, 0x01];
+        data.extend_from_slice(&9999u16.to_le_bytes());
+        assert!(ControlPayload::decode(&data).is_err());
+    }
+
+    #[test]
+    fn control_payload_regional_mask_hints_roundtrip() {
+        let p = ControlPayload::RegionalMaskHints {
+            country_code: *b"JP",
+            masks: vec![
+                ("webrtc_zoom_v3".to_string(), 0.95),
+                ("quic_https".to_string(), 0.80),
+            ],
+        };
+        let decoded = roundtrip(&p);
+        if let ControlPayload::RegionalMaskHints {
+            country_code,
+            masks,
+        } = decoded
+        {
+            assert_eq!(&country_code, b"JP");
+            assert_eq!(masks.len(), 2);
+            assert_eq!(masks[0].0, "webrtc_zoom_v3");
+            assert!((masks[0].1 - 0.95).abs() < f32::EPSILON);
+            assert_eq!(masks[1].0, "quic_https");
+            assert!((masks[1].1 - 0.80).abs() < f32::EPSILON);
+        } else {
+            panic!("wrong variant");
+        }
+    }
+
+    #[test]
+    fn control_payload_feedback_config_roundtrip() {
+        let p = ControlPayload::FeedbackConfig {
+            report_failure_threshold: 3,
+            report_interval_secs: 3600,
+        };
+        let decoded = roundtrip(&p);
+        if let ControlPayload::FeedbackConfig {
+            report_failure_threshold,
+            report_interval_secs,
+        } = decoded
+        {
+            assert_eq!(report_failure_threshold, 3);
+            assert_eq!(report_interval_secs, 3600);
+        } else {
+            panic!("wrong variant");
+        }
+    }
+
+    #[test]
+    fn control_payload_mask_catalog_roundtrip() {
+        let p = ControlPayload::MaskCatalog {
+            masks: vec![
+                ("webrtc_zoom_v3".to_string(), "Zoom".to_string(), false),
+                ("auto_quic_v1".to_string(), "QUIC (auto)".to_string(), true),
+            ],
+        };
+        let decoded = roundtrip(&p);
+        if let ControlPayload::MaskCatalog { masks } = decoded {
+            assert_eq!(masks.len(), 2);
+            assert_eq!(
+                masks[0],
+                ("webrtc_zoom_v3".to_string(), "Zoom".to_string(), false)
+            );
+            assert_eq!(masks[1].0, "auto_quic_v1");
+            assert!(masks[1].2, "generated flag must survive roundtrip");
+        } else {
+            panic!("wrong variant");
+        }
+    }
+
+    #[test]
+    fn control_payload_feedback_config_extremes_roundtrip() {
+        let p = ControlPayload::FeedbackConfig {
+            report_failure_threshold: 255,
+            report_interval_secs: u32::MAX,
+        };
+        let decoded = roundtrip(&p);
+        if let ControlPayload::FeedbackConfig {
+            report_failure_threshold,
+            report_interval_secs,
+        } = decoded
+        {
+            assert_eq!(report_failure_threshold, 255);
+            assert_eq!(report_interval_secs, u32::MAX);
+        } else {
+            panic!("wrong variant");
+        }
+    }
+
+    #[test]
+    fn control_payload_feedback_config_too_short_returns_error() {
+        // subtype + threshold but truncated interval
+        assert!(ControlPayload::decode(&[0x1E, 0x03, 0x00]).is_err());
+    }
+
+    #[test]
+    fn control_payload_regional_mask_hints_empty_roundtrip() {
+        let p = ControlPayload::RegionalMaskHints {
+            country_code: *b"BR",
+            masks: vec![],
+        };
+        let decoded = roundtrip(&p);
+        if let ControlPayload::RegionalMaskHints {
+            country_code,
+            masks,
+        } = decoded
+        {
+            assert_eq!(&country_code, b"BR");
+            assert!(masks.is_empty());
+        } else {
+            panic!("wrong variant");
+        }
+    }
+
+    #[test]
+    fn control_payload_regional_mask_hints_caps_at_32_entries() {
+        let masks: Vec<(String, f32)> = (0..50).map(|i| (format!("mask_{i}"), 0.5)).collect();
+        let p = ControlPayload::RegionalMaskHints {
+            country_code: *b"CA",
+            masks,
+        };
+        let decoded = roundtrip(&p);
+        if let ControlPayload::RegionalMaskHints { masks, .. } = decoded {
+            assert_eq!(masks.len(), 32);
+        } else {
+            panic!("wrong variant");
+        }
+    }
+
+    #[test]
+    fn control_payload_regional_mask_hints_too_short_returns_error() {
+        // subtype + country_code but no count byte
+        assert!(ControlPayload::decode(&[0x1D, b'U', b'S']).is_err());
+    }
+
+    #[test]
+    fn control_payload_regional_mask_hints_truncated_entry_returns_error() {
+        // subtype + country_code + count=1, but no entry bytes
+        assert!(ControlPayload::decode(&[0x1D, b'U', b'S', 0x01]).is_err());
+    }
+
+    #[test]
+    fn control_payload_regional_mask_hints_entry_length_exceeds_data_returns_error() {
+        // subtype + country_code + count=1 + mask_id_len=9999 but no payload
+        let mut data = vec![0x1Du8, b'U', b'S', 0x01];
+        data.extend_from_slice(&9999u16.to_le_bytes());
+        assert!(ControlPayload::decode(&data).is_err());
+    }
+
+    #[test]
     fn control_payload_pool_sync_too_short_returns_error() {
         // only 3 bytes — needs 5 for length prefix
         assert!(ControlPayload::decode(&[0x12, 0x00, 0x00]).is_err());
@@ -1663,5 +2240,26 @@ mod tests {
         let mut data = vec![0x12u8];
         data.extend_from_slice(&9999u32.to_le_bytes());
         assert!(ControlPayload::decode(&data).is_err());
+    }
+
+    #[test]
+    fn control_payload_u32_len_near_max_returns_error_on_all_targets() {
+        // Regression for the 32-bit usize overflow: with `len` near u32::MAX,
+        // the old `data.len() < 5 + len` check wrapped on armv7/mipsel
+        // (usize == u32), passed, and the `data[5..5+len]` slice panicked —
+        // a one-datagram DoS from any authenticated peer. The check must
+        // reject with Err on every target width.
+        for subtype in [0x12u8, 0x13, 0x14, 0x15] {
+            // PoolSync, RouteSync, ChainForward, ClientCert
+            for len in [u32::MAX, u32::MAX - 4, u32::MAX - 5] {
+                let mut data = vec![subtype];
+                data.extend_from_slice(&len.to_le_bytes());
+                data.extend_from_slice(&[0u8; 16]);
+                assert!(
+                    ControlPayload::decode(&data).is_err(),
+                    "subtype {subtype:#x} len {len} must be rejected"
+                );
+            }
+        }
     }
 }

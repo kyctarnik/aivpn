@@ -20,6 +20,7 @@ Key technical properties:
 - **O(1) session lookup** — no session ID is transmitted in the clear. Every packet carries an 8-byte *resonance tag* derived from a timestamp and a per-session secret. The server resolves the session in constant time via a `DashMap`.
 - **Perfect Forward Secrecy** — in-flight session key rotation via X25519 ratchet. Compromising the server key does not expose past traffic.
 - **Neural Resonance module** — per-mask micro-MLP (~66 KB) monitors live traffic statistics; high reconstruction error triggers automatic mask rotation without disconnecting clients.
+- **Generative mask distributions** — masks auto-recorded from real traffic model multimodal packet-size / inter-arrival behaviour with a BIC-selected Gaussian mixture (design-doc §4 "neural-generated masks"), reproducing real DNS/QUIC/WebRTC distributions far more faithfully than a single Gaussian. It is an internal representation sampled transparently by every client, not a separate mask type.
 - **Written in Rust** — memory-safe, no GC pauses. Client binary ≈ 2.5 MB. Runs on a $5 VPS.
 
 ---
@@ -29,16 +30,18 @@ Key technical properties:
 ### Workspace layout
 
 ```
-crates/aivpn-common/  — shared crypto, protocol, mask profiles (no I/O)
-crates/aivpn-server/  — Linux-only VPN gateway and management CLI
-crates/aivpn-client/  — cross-platform VPN client (Linux / macOS / Windows)
-crates/aivpn-android-core/ — JNI bridge for Android
-crates/aivpn-windows/ — Windows GUI (egui/eframe)
-platforms/android/    — Android Kotlin app
-platforms/macos/      — macOS SwiftUI menu bar app
-crates/aivpn-ios-core/ — iOS Rust staticlib (C FFI)
-platforms/ios/        — iOS SwiftUI app + NEPacketTunnelProvider
-assets/masks/         — bundled traffic mimicry JSON profiles
+crates/aivpn-common/     — shared crypto, protocol, mask profiles (no I/O)
+crates/aivpn-server/     — Linux-only VPN gateway and management CLI
+crates/aivpn-client/     — cross-platform VPN client (Linux / macOS / Windows)
+crates/aivpn-android-core/ — JNI bridge for Android (Rust → Kotlin via C FFI)
+crates/aivpn-ios-core/   — iOS Rust staticlib (C FFI), linked by PacketTunnelProvider
+crates/aivpn-windows/    — Windows GUI (egui/eframe 0.31, manages aivpn-client.exe subprocess)
+crates/aivpn-linux/      — Linux GUI (iced 0.13, wraps aivpn-client subprocess)
+platforms/android/       — Android Kotlin app (MVVM: MainViewModel + RecyclerView)
+platforms/ios/           — iOS SwiftUI app + NetworkExtension PacketTunnelProvider
+platforms/macos/         — macOS SwiftUI menu bar app + privileged helper daemon
+platforms/aivpn-web/     — Web management panel (Hono 4 + SvelteKit 2, SQLite/PostgreSQL)
+mask-assets/             — bundled traffic mimicry JSON profiles
 ```
 
 ### Key modules
@@ -65,9 +68,10 @@ Server-to-server client database synchronization uses `ControlPayload::PoolSync`
 
 | Platform | Server | Client | GUI | TUN driver |
 |----------|:------:|:------:|:---:|------------|
-| Linux | ✅ | ✅ | ✅ AppImage + tray | `/dev/net/tun` |
+| Linux CLI | ✅ | ✅ | — | `/dev/net/tun` |
+| Linux GUI | — | ✅ | ✅ iced AppImage + tray | `/dev/net/tun` |
 | macOS | — | ✅ | ✅ menu bar | `utun` |
-| Windows | — | ✅ | ✅ egui | [Wintun](https://www.wintun.net/) |
+| Windows | — | ✅ | ✅ egui GUI | [Wintun](https://www.wintun.net/) |
 | Android | — | ✅ | ✅ native Kotlin | `VpnService` API |
 | iOS | — | ✅ | ✅ SwiftUI | `NetworkExtension` |
 | MikroTik RouterOS 7.6+ | — | ✅ | — | container veth + TUN |
@@ -75,21 +79,126 @@ Server-to-server client database synchronization uses `ControlPayload::PoolSync`
 
 ### Feature Capability Matrix
 
-| Feature | CLI | Win | Mac | Android | iOS |
-|---------|:---:|:---:|:---:|:-------:|:---:|
-| Traffic Mimicry | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Adaptive Mode (4 levels) | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Live Quality Score | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Split Tunnel | ✅ | ✅ | ✅ | ✅ | ✅ |
-| DNS Proxy | ✅ | ✅ | ✅ | ❌ | ❌ |
-| Kill Switch | ✅ | ✅ | ✅ | ✅ | ✅ |
-| mTLS Certificate | ✅ | ✅ | ✅ | ✅ | ✅ |
-| FEC (forward error correction) | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Traffic Recording | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Device Key / JIT | ✅ | ✅ | ✅ | ✅ | ✅ |
-| SOCKS5 Proxy | ✅ | ✅ | ✅ | ❌ | ❌ |
-| Full Tunnel | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Diagnostics / Benchmark | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Feature | Linux CLI | Linux GUI | Win | Mac | Android | iOS |
+|---------|:---------:|:---------:|:---:|:---:|:-------:|:---:|
+| Traffic Mimicry | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Adaptive Mode (4 levels) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Live Quality Score | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Split Tunnel | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| DNS Proxy | ✅ | ✅ | ✅ | ✅ | N/A* | ❌ |
+| Kill Switch | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| mTLS Certificate | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| FEC (forward error correction) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Traffic Recording | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Device Key / JIT | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| SOCKS5 Proxy | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ |
+| Full Tunnel | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Diagnostics / Benchmark | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Bootstrap Descriptor Discovery | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Polymorphic Masks | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Crowdsourced Mask Feedback (opt-in) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Live Metrics Graphs† | — | — | — | — | — | — |
+
+\* Android's `VpnService` API routes all device traffic (including DNS) through the encrypted tunnel by design — there's no separate local DNS-proxy listener because none is needed; DNS leaks aren't possible on this platform.
+
+† Live Metrics Graphs is a server + [Web Management Panel](#web-management-panel) feature, not a client capability — it requires building the server with `--features metrics` and is viewed from the web dashboard, not from any of the clients above.
+
+---
+
+## Web Management Panel
+
+`platforms/aivpn-web/` provides a full-stack web UI for managing the aivpn server.
+
+**Stack:** Hono 4 + Bun (backend) · SvelteKit 2 + Svelte 5 + TailwindCSS 4 (frontend) · Layerchart charts · SQLite (default) or PostgreSQL
+
+**Features:**
+- JWT auth (15 min access token + 7-day refresh httpOnly cookie), argon2id passwords
+- TOTP 2FA (AES-256-GCM encrypted secrets) and WebAuthn passkeys
+- Roles: `admin` (full access) and `viewer` (read-only)
+- Pages: Dashboard (live charts), Clients, Config, Masks, Backup, Logs, Settings
+- All `/api/v1/*` proxied to the aivpn Unix socket (`/run/aivpn/api.sock`)
+- Realtime SSE event stream at `/web/events`
+- **Live metrics graphs** — the Dashboard renders live time-series charts (active sessions, bandwidth in/out, packet rate, p50/p95 packet-processing latency) plus pulsing badges for mask/key rotations and DPI-attacks-detected, all fed over the same `/web/events` SSE stream from an in-memory ~10-minute ring buffer (no new persistent storage). Requires the server to be built with `--features metrics` (see [Optional features (Cargo)](#optional-features-cargo)); the dashboard shows a hint instead of the charts if the server lacks that feature.
+
+**Quick Start:**
+
+```bash
+# 1. Generate secrets
+JWT_SECRET=$(openssl rand -base64 48)
+TOTP_KEY=$(openssl rand -base64 32)
+
+# 2. Run with Docker (simplest)
+docker run -d --name aivpn-web \
+  -v /run/aivpn:/run/aivpn \
+  -e JWT_SECRET="$JWT_SECRET" \
+  -e TOTP_ENCRYPTION_KEY="$TOTP_KEY" \
+  -e ORIGIN=https://vpn.example.com \
+  -p 8080:8080 \
+  ghcr.io/infosave2007/aivpn-web:latest
+
+# 3. Get the one-time admin password from the startup log
+docker logs aivpn-web 2>&1 | grep -A4 "FIRST-TIME SETUP"
+
+# 4. Open https://vpn.example.com and log in with username "admin"
+```
+
+Or via `docker compose up -d aivpn-web` (secrets go in `platforms/aivpn-web/.env`).
+
+**Run (Bun, from source):**
+```bash
+cd platforms/aivpn-web
+cp .env.example .env          # fill JWT_SECRET, TOTP_ENCRYPTION_KEY, ORIGIN
+bun install && bun run build
+bun run start                 # listens on PORT (default 8080)
+```
+
+**Key environment variables:**
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `DATABASE_URL` | `file:./data/aivpn-web.db` | SQLite path or `postgres://...` |
+| `JWT_SECRET` | — | Long random string for token signing |
+| `TOTP_ENCRYPTION_KEY` | — | 32-byte base64 key (`openssl rand -base64 32`) |
+| `ORIGIN` | — | Public HTTPS URL (required for WebAuthn / CSRF) |
+| `UNIX_SOCK` | `/run/aivpn/api.sock` | Path to aivpn management socket |
+| `PORT` | `8080` | HTTP listen port |
+
+**Makefile targets:**
+```bash
+make web           # install deps + build frontend
+make web-docker    # build Docker image aivpn-web:latest
+make web-dev       # start dev servers (hot reload)
+```
+
+An nginx reverse-proxy example is in `deploy/nginx/aivpn-web.conf`.
+
+**Default credentials (first run):**
+
+On first startup with an empty database, a random admin password is generated and printed once to the server console:
+
+```
+╔══════════════════════════════════════════════════╗
+║         FIRST-TIME SETUP — SAVE THESE NOW        ║
+╠══════════════════════════════════════════════════╣
+║  Username : admin                                 ║
+║  Password : <random 22-char base64url string>     ║
+╚══════════════════════════════════════════════════╝
+```
+
+Save this password immediately — it is shown **once** only. After logging in, change it in **Settings → Security** or register a passkey.
+
+**OIDC / SSO (optional):**
+
+| Variable | Description |
+|----------|-------------|
+| `OIDC_ISSUER` | IdP base URL (e.g. `https://accounts.google.com`) |
+| `OIDC_CLIENT_ID` | OAuth2 client ID |
+| `OIDC_CLIENT_SECRET` | Client secret (omit for public PKCE clients) |
+| `OIDC_MODE` | `disabled` (default) · `enabled` (adds SSO button) · `exclusive` (SSO only) |
+| `OIDC_ROLE_CLAIM` | ID token claim containing the user's role (e.g. `role`) |
+| `OIDC_ADMIN_VALUE` | Claim value that grants `admin` role (default: `admin`) |
+
+The role from OIDC is applied only on **first** SSO login; admins can override it afterwards in the web panel.
 
 ---
 
@@ -340,8 +449,9 @@ Default config path: `config/server.json` (local) or `/etc/aivpn/server.json`. C
 |---------|----------------|
 | `neural` | Neural Resonance module (MSE-based mask rotation) |
 | `management-api` | Unix socket HTTP API at `/run/aivpn/api.sock` |
-| `metrics` | Prometheus exporter |
+| `metrics` | Prometheus exporter, and live runtime metrics (active sessions, bandwidth, mask/key rotations, DPI-attacks-detected, packet-processing latency) over `/web/events` SSE for the [web panel's live graphs](#web-management-panel) |
 | `passive-distribution` | Bootstrap descriptor distribution channels |
+| `bootstrap-publish` | Auto-publish rotated bootstrap descriptors to S3/GitHub/Telegram (see [Bootstrap Descriptor Distribution](#bootstrap-descriptor-distribution)) |
 
 ---
 
@@ -384,7 +494,8 @@ make windows              # Windows GUI + zip (cross-compile from Linux)
 make windows-docker       # Windows GUI via Docker (no mingw-w64 required)
 make ios [TEAM_ID=XX]     # iOS IPA (macOS + Xcode 15+ only)
 make macos                # macOS .app + .pkg + .dmg (macOS only)
-make linux-appimage        # Linux AppImage
+make linux                 # Linux GUI binary (no extra tools)
+make linux-appimage        # Linux GUI as AppImage (requires appimagetool)
 ```
 
 ### Deploy
@@ -410,8 +521,7 @@ export ANDROID_SDK_ROOT=/opt/android-sdk
 export ANDROID_NDK_ROOT=/opt/android-ndk
 echo "sdk.dir=$ANDROID_SDK_ROOT" > platforms/android/local.properties
 
-cd aivpn-android
-./build-rust-android.sh release
+make android
 ```
 
 Signed build: create `platforms/android/keystore.properties` before running the script.
@@ -504,6 +614,41 @@ Route client traffic through two AIVPN nodes. The client connects only to the en
 { "pool": { "sync_key": "<same-key>", "exit_node_enabled": true } }
 ```
 
+### Bootstrap Descriptor Distribution
+
+Signed (ed25519) bootstrap descriptors let a brand-new client — one without a working `aivpn://` key yet — discover a usable mask configuration via the same redundant fallback channels (CDN/GitHub/Telegram) the client's `bootstrap_loader.rs` already knows how to fetch from. The server builds, signs, and rotates these every 24h automatically, pushing fresh copies to already-connected clients over the live session.
+
+**CLI export** — print or save the current previous/current/next-epoch signed descriptors as JSON, for manual upload to any hosting:
+```bash
+aivpn-server --export-bootstrap-descriptor --key-file /etc/aivpn/server.key
+aivpn-server --export-bootstrap-descriptor --key-file /etc/aivpn/server.key --bootstrap-output /path/to/bootstrap.json
+```
+Requires a real `--key-file` — an ephemeral/random server key is rejected, since no client would trust a descriptor signed by a throwaway key.
+
+**Management API export** — the same JSON array is available at `GET /api/v1/bootstrap/export` (feature `management-api`, same Unix-socket auth model as the rest of the API). Treat it as admin-only in any web-panel proxy layer, same as `/config` and `/backup/*`.
+
+**Auto-publish on rotation** — build with `--features bootstrap-publish` and add a `bootstrap_publish` section to `server.json` to push freshly-rotated descriptors automatically whenever the 24h epoch actually advances:
+```json
+{
+  "bootstrap_publish": {
+    "enabled": true,
+    "channels": [
+      { "type": "s3", "endpoint": "https://s3.us-east-1.amazonaws.com", "region": "us-east-1", "bucket": "my-aivpn-bootstrap", "key": "bootstrap.json", "access_key": "...", "secret_key": "..." },
+      { "type": "github", "repo": "owner/repo", "asset_name": "bootstrap-descriptors.json", "tag_name": "bootstrap", "token": "..." },
+      { "type": "telegram", "bot_token": "...", "chat_id": "..." }
+    ]
+  }
+}
+```
+
+- **S3** — any S3-compatible provider (AWS S3, Cloudflare R2, MinIO), path-style addressing (`{endpoint}/{bucket}/{key}`), signed with AWS SigV4.
+- **GitHub** — published as a release asset under a fixed `tag_name` (kept up to date across rotations, since clients always fetch `/releases/latest`). Use a fine-grained personal access token scoped to just that one repo.
+- **Telegram** — sent as a document via a bot (`sendDocument`). Scope the bot to a single chat/channel.
+
+Each channel is independent (one failing doesn't block the others) and retries 3× with backoff (5s / 30s / 120s) before logging a failure. Without the `bootstrap-publish` feature, `enabled: true` just logs a warning and does nothing — the config section itself is always valid JSON, so config files stay portable across builds.
+
+**Security note:** if the server's private key is compromised, an attacker can already forge valid bootstrap descriptors (the signing key is derived deterministically from it). Auto-publish credentials don't add that forgery capability, but they do let a compromised server push a forged descriptor through the operator's real, trusted distribution channels to reach brand-new users, not just already-connected ones — treat these credentials in `server.json` with the same care as any other secret (file mode `0600`, readable only by the user running `aivpn-server`).
+
 ### Local DNS Proxy
 
 Forward all DNS queries through the VPN tunnel (Linux):
@@ -525,6 +670,55 @@ aivpn-client record stop
 
 The server analyzes packet size histograms and inter-arrival times, generates a `MaskProfile`, validates it via self-test, and distributes it to active sessions.
 
+### Polymorphic Masks
+
+Each session can use a per-session, uniquely-perturbed variant of a base mask, so a single static mask profile can't be fingerprinted across users or sessions by an observer comparing traffic from many connections. The server derives the variant deterministically from the session's own key material and pushes it to the client over the existing `MaskUpdate` channel — the client only applies it, with no new client-side cryptography. Perturbation is bounded per-mask (IAT jitter scale, padding shift, header-gap bytes, FSM dwell-time scale) so the traffic still plausibly matches the mimicked protocol; the FSM state graph, spoofed protocol, and ephemeral-key length are never altered. The opening handshake always uses the bootstrap fallback mask (not the named preset), so it isn't fingerprintable before the session's variant is pushed.
+
+```bash
+aivpn-client -k "aivpn://..." --polymorphic-base webrtc_yandex_telemost_v1
+```
+
+A matching "Polymorphic" checkbox is available in the Linux, Windows, macOS, iOS, and Android GUIs next to the mask picker.
+
+Mask profiles can declare optional `perturbation_bounds` to control how far a polymorphic variant may drift from the base profile:
+
+```json
+{
+  "mask_id": "webrtc_yandex_telemost_v1",
+  "perturbation_bounds": {
+    "iat_jitter_scale": 0.15,
+    "padding_shift_bytes": 8,
+    "header_gap_bytes": 4,
+    "fsm_dwell_scale": 0.2
+  }
+}
+```
+
+### Crowdsourced Mask Feedback (opt-in)
+
+Clients can opt in (off by default) to share which masks worked for them and to receive server hints about masks that are working well in their region. Reports are aggregated by a coarse, user-set 2-letter ISO-3166 country code — no finer location ever leaves the client. The server only aggregates a report once at least K=20 distinct reporters have contributed for a given mask/region (tracked with a HyperLogLog sketch that stores no reporter identities), rolling sparse countries up to their continent once same-continent neighbors clear the k-anonymity gate; aggregate memory is bounded by a hard cap with eviction and a periodic sweep. A per-reporter vote cap also bounds how much a single reporter can skew a region's ranking.
+
+Desktop clients record both mask *successes and failures*: pre-handshake connection failures are batched and attributed to the mask that was in use, persisted across restarts at `~/.config/aivpn/mask_feedback.json`, and reported in aggregate the next time a connection succeeds. When `--receive-mask-hints` is on, the client softly biases its initial mask choice toward the highest-scored preset reported for its region — it never overrides an explicit `--preferred-mask`/`--polymorphic-base`, and it never applies when the opening mask must stay a signed bootstrap descriptor (e.g. `--no-fallback`/production-secure builds), so bootstrap security is never weakened. `--share-mask-feedback` and `--receive-mask-hints` are fully independent toggles — a client can receive regional hints without ever sharing its own feedback.
+
+The server pushes reporting cadence to opted-in clients via a `FeedbackConfig` control message, tunable through an optional `"feedback"` block in `server.json`:
+
+```json
+{
+  "feedback": {
+    "report_failure_threshold": 3,
+    "report_interval_secs": 3600
+  }
+}
+```
+
+`report_failure_threshold` is the minimum number of consecutive failures on a mask before it is marked failed; `report_interval_secs` is the minimum spacing between a client's feedback sends. Both are optional and default to `3` and `3600` respectively when the block (or a key) is omitted.
+
+```bash
+aivpn-client -k "aivpn://..." --share-mask-feedback --receive-mask-hints --country-code DE
+```
+
+Both toggles and the country-code field are also available in the Linux, Windows, macOS, iOS, and Android GUIs' settings screens.
+
 ### Benchmarking
 
 ```bash
@@ -534,6 +728,45 @@ aivpn-client bench -k "aivpn://..." --json
 ```
 
 ---
+
+### Mask Signing & Verification (provenance)
+
+A mask defines how traffic is shaped and, critically, *how packets are parsed*
+(`tag_offset`, header layout, `spoof_protocol`). A malicious or corrupted mask
+reaching a server or client is therefore a real attack surface. aivpn masks carry
+an ed25519 signature over the **whole** profile; the server can sign the masks it
+distributes with an operator key, and both server and client can verify that
+signature on load.
+
+Verification has three modes (`mask_verify_mode`, or `--mask-verify-mode`, env
+`AIVPN_MASK_VERIFY_MODE`):
+
+| Mode | Behaviour |
+|------|-----------|
+| `off` | No signature check. |
+| `warn` | **Default.** Verify and log a warning on failure, but still load the mask — nothing breaks if the corpus isn't signed yet. |
+| `enforce` | Reject any mask whose signature doesn't verify against the operator public key. Requires the entire mask corpus to be signed first. |
+
+Operator workflow to turn on `enforce`:
+
+```bash
+# 1. Generate an operator signing key (prints the public key to distribute).
+aivpn-server --gen-mask-signing-key /etc/aivpn/mask-signing.key
+
+# 2. Sign your whole mask corpus in place (run once; also re-run after adding masks).
+aivpn-server --sign-mask-dir /var/lib/aivpn/masks --mask-signing-key /etc/aivpn/mask-signing.key
+
+# 3. Server: point at the signing key (auto-signs newly generated masks) and enforce.
+#    server.json:  "mask_signing_key": "/etc/aivpn/mask-signing.key", "mask_verify_mode": "enforce"
+
+# 4. Clients: ship them the operator PUBLIC key and enforce.
+#    client:  --mask-operator-pubkey <BASE64_PUBKEY> --mask-verify-mode enforce
+```
+
+The public key is verified independently for the downlink `reverse_profile` too.
+Because `enforce` rejects unsigned masks, roll it out phased — stay on `warn`
+until every server's mask directory is signed and clients carry the public key.
+The signing key is a secret: store it `0600`, readable only by the operator.
 
 ## Security Model
 

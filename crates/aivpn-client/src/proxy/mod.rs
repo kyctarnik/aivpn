@@ -20,9 +20,8 @@ use tracing::{debug, error, info, warn};
 
 use crate::proxy::device::VpnDevice;
 use crate::proxy::socks5::{
-    build_udp_response, parse_udp_request, Socks5Command,
-    Socks5UdpTarget, Socks5Session, TargetAddr,
-    REP_GENERAL_FAILURE, REP_HOST_UNREACHABLE, REP_SUCCESS,
+    build_udp_response, parse_udp_request, Socks5Command, Socks5Session, Socks5UdpTarget,
+    TargetAddr, REP_GENERAL_FAILURE, REP_HOST_UNREACHABLE, REP_SUCCESS,
 };
 
 use smoltcp::socket::dns;
@@ -36,7 +35,7 @@ const UDP_PAYLOAD_BUF: usize = 65536;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const UDP_ASSOCIATE_TIMEOUT: Duration = Duration::from_secs(10);
 const UDP_ASSOCIATE_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
-const DNS_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
+const DNS_QUERY_TIMEOUT: Duration = Duration::from_secs(2);
 
 static SRC_PORT: AtomicU16 = AtomicU16::new(49152);
 
@@ -50,18 +49,28 @@ pub struct ProxyConfig {
 pub struct ProxyHandle {
     pub rx_queue: Arc<Mutex<VecDeque<Vec<u8>>>>,
     pub wake_tx: std::sync::mpsc::SyncSender<()>,
-    /// Accept-loop. Отменяется на Drop, чтобы реконнект мог пере-биндить порт
-    /// без WSAEADDRINUSE (Windows os error 10048) / EADDRINUSE.
+    /// Accept loop task — aborted when ProxyHandle is dropped, releasing the TcpListener port
+    /// (иначе реконнект упирается в WSAEADDRINUSE / Windows os error 10048 / EADDRINUSE).
     pub accept_task: tokio::task::JoinHandle<()>,
-    /// Сигнал smoltcp-потоку завершиться (иначе по потоку на каждый реконнект).
+    /// Per-connection `handle_socks5` tasks. Aborted on drop so an in-flight SOCKS5
+    /// connection doesn't keep the smoltcp stack's background thread (and its
+    /// command-channel senders) alive across a VPN reconnect.
+    conn_tasks: Arc<Mutex<tokio::task::JoinSet<()>>>,
+    /// Сигнал smoltcp-потоку завершиться немедленно (иначе по потоку на каждый реконнект:
+    /// abort() задач не прерывает spawn_blocking, и sender'ы дропаются лишь после таймаута).
     pub stack_shutdown: Arc<AtomicBool>,
 }
 
 impl Drop for ProxyHandle {
     fn drop(&mut self) {
+        // Сначала сигналим smoltcp-потоку завершиться и будим его, чтобы он
+        // немедленно увидел флаг (не дожидаясь дропа sender'ов через таймаут).
         self.stack_shutdown.store(true, Ordering::Relaxed);
         let _ = self.wake_tx.try_send(()); // разбудить поток, чтобы он сразу увидел флаг
-        self.accept_task.abort();           // освободить TcpListener (порт 8888)
+        self.accept_task.abort(); // освободить TcpListener (порт 8888)
+        if let Ok(mut set) = self.conn_tasks.lock() {
+            set.abort_all();
+        }
     }
 }
 
@@ -113,7 +122,7 @@ struct UdpRelayResponse {
 
 struct DnsResolve {
     name: String,
-    qtype: DnsType,                                  // A или Aaaa
+    qtype: DnsType, // A или Aaaa
     reply: std::sync::mpsc::SyncSender<Option<IpAddr>>,
 }
 
@@ -126,7 +135,7 @@ struct PendingDns {
 enum UdpStackCommand {
     CreateAssoc(NewUdpAssoc),
     SendPacket(UdpPacketCommand),
-    Resolve(DnsResolve),                             // ← добавили
+    Resolve(DnsResolve), // ← добавили
 }
 
 /// Запустить smoltcp-стек и SOCKS5-слушатель.
@@ -152,16 +161,16 @@ pub async fn spawn_proxy(
 
     std::thread::spawn(move || {
         run_stack(
-             rx_clone,
-             tx_clone,
-             tun_to_udp_tx,
-             cmd_rx,
-             udp_cmd_rx,
-             wake_rx,
-             vpn_ip,
-             gateway_ip,
-             prefix_len,
-             stack_shutdown_thread,            // ← новый аргумент
+            rx_clone,
+            tx_clone,
+            tun_to_udp_tx,
+            cmd_rx,
+            udp_cmd_rx,
+            wake_rx,
+            vpn_ip,
+            gateway_ip,
+            prefix_len,
+            stack_shutdown_thread, // ← сигнал завершения потока
         );
     });
 
@@ -170,7 +179,10 @@ pub async fn spawn_proxy(
 
     let proxy_ip = config.listen_addr.ip();
     let wake_tx_accept = wake_tx.clone();
-    let accept_task = tokio::spawn(async move {   // ← было без let
+    let conn_tasks: Arc<Mutex<tokio::task::JoinSet<()>>> =
+        Arc::new(Mutex::new(tokio::task::JoinSet::new()));
+    let conn_tasks_accept = Arc::clone(&conn_tasks);
+    let accept_task = tokio::spawn(async move {
         loop {
             match listener.accept().await {
                 Ok((stream, peer)) => {
@@ -178,7 +190,11 @@ pub async fn spawn_proxy(
                     let tx = cmd_tx.clone();
                     let udp_tx = udp_cmd_tx.clone();
                     let wtx = wake_tx_accept.clone();
-                    tokio::spawn(handle_socks5(stream, tx, udp_tx, wtx, proxy_ip));
+                    let mut set = conn_tasks_accept.lock().unwrap_or_else(|e| e.into_inner());
+                    set.spawn(handle_socks5(stream, tx, udp_tx, wtx, proxy_ip));
+                    // Opportunistically reap finished tasks so the JoinSet doesn't
+                    // grow unbounded over a long-lived proxy session.
+                    while set.try_join_next().is_some() {}
                 }
                 Err(e) => {
                     error!("Proxy accept error: {}", e);
@@ -188,7 +204,13 @@ pub async fn spawn_proxy(
         }
     });
 
-    Ok(ProxyHandle { rx_queue, wake_tx, accept_task, stack_shutdown })
+    Ok(ProxyHandle {
+        rx_queue,
+        wake_tx,
+        accept_task,
+        conn_tasks,
+        stack_shutdown,
+    })
 }
 
 fn smoltcp_now() -> SmolInstant {
@@ -239,7 +261,7 @@ fn run_stack(
     let mut udp_assocs: HashMap<u16, ManagedUdpAssoc> = HashMap::new();
 
     let dns_servers = [IpAddress::v4(1, 1, 1, 1)]; // TODO: получать адреса извне, важно: работает ток с одним адресом :(
-    // Vec даёт owned-слоты; find_free_query() сам делает push при нехватке.
+                                                   // Vec даёт owned-слоты; find_free_query() сам делает push при нехватке.
     let dns_socket = dns::Socket::new(&dns_servers, Vec::<Option<dns::DnsQuery>>::new());
     let dns_handle = sockets.add(dns_socket);
     let mut pending_dns: Vec<PendingDns> = Vec::new();
@@ -356,8 +378,8 @@ fn run_stack(
                 match tun_to_udp_tx.try_send(pkt) {
                     Ok(()) => {}
                     Err(tokio::sync::mpsc::error::TrySendError::Full(pkt)) => {
-                        q.push_front(pkt);   // транспорт занят — вернём в очередь, попробуем в след. тик
-                        break;               // но НЕ морозим весь стек
+                        q.push_front(pkt); // транспорт занят — вернём в очередь, попробуем в след. тик
+                        break; // но НЕ морозим весь стек
                     }
                     Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return,
                 }
@@ -369,7 +391,9 @@ fn run_stack(
             let dns_sock = sockets.get_mut::<dns::Socket>(dns_handle);
             pending_dns.retain_mut(|p| match dns_sock.get_query_result(p.handle) {
                 Ok(addrs) => {
-                    let _ = p.reply.send(addrs.iter().next().copied().map(smol_ip_to_std));
+                    let _ = p
+                        .reply
+                        .send(addrs.iter().next().copied().map(smol_ip_to_std));
                     false
                 }
                 Err(dns::GetQueryResultError::Pending) => {
@@ -414,11 +438,11 @@ fn run_stack(
         }
         let timeout: std::time::Duration = iface
             .poll_delay(smoltcp_now(), &sockets)
-            .map(Into::into)                                   // если From не найдётся:
+            .map(Into::into) // если From не найдётся:
             .unwrap_or(std::time::Duration::from_millis(100)); // Duration::from_micros(d.total_micros())
 
         match wake_rx.recv_timeout(timeout) {
-            Ok(()) => { while wake_rx.try_recv().is_ok() {} }  // сдренировать пачку сигналов
+            Ok(()) => while wake_rx.try_recv().is_ok() {}, // сдренировать пачку сигналов
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
         }
@@ -454,11 +478,10 @@ async fn resolve_via_tunnel(
             ));
         }
         let _ = wake_tx.try_send(()); // разбудить стек: DNS-запрос
-        let ip = tokio::task::spawn_blocking(move || {
-            rx.recv_timeout(DNS_QUERY_TIMEOUT).ok().flatten()
-        })
-        .await
-        .unwrap_or(None);
+        let ip =
+            tokio::task::spawn_blocking(move || rx.recv_timeout(DNS_QUERY_TIMEOUT).ok().flatten())
+                .await
+                .unwrap_or(None);
 
         if let Some(ip) = ip {
             return Ok(SocketAddr::new(ip, port));
@@ -497,9 +520,9 @@ fn service_tcp_conn(conn: &mut ManagedConn, sockets: &mut SocketSet) -> bool {
     }
 
     if socket.may_send() {
-        let mut q = conn.inbound.lock().unwrap();
+        let mut q = conn.inbound.lock().unwrap_or_else(|e| e.into_inner());
         while !q.is_empty() && socket.can_send() {
-            let chunk = q.pop_front().unwrap();
+            let Some(chunk) = q.pop_front() else { break };
             match socket.send_slice(&chunk) {
                 Ok(n) if n < chunk.len() => {
                     q.push_front(chunk[n..].to_vec());
@@ -609,9 +632,7 @@ fn socket_addr_to_ip_endpoint(addr: SocketAddr) -> IpEndpoint {
             let [a, b, c, d] = ip.octets();
             IpEndpoint::new(IpAddress::v4(a, b, c, d), addr.port())
         }
-        IpAddr::V6(ip) => {
-            IpEndpoint::new(IpAddress::Ipv6(Ipv6Address(ip.octets())), addr.port())
-        }
+        IpAddr::V6(ip) => IpEndpoint::new(IpAddress::Ipv6(Ipv6Address(ip.octets())), addr.port()),
     }
 }
 
@@ -655,10 +676,25 @@ async fn handle_connect(
         TargetAddr::Domain(host, port) => {
             match resolve_via_tunnel(&udp_cmd_tx, &wake_tx, &host, port, /*want_v6=*/ false).await {
                 Ok(a) => a,
-                Err(e) => {
-                    warn!("TCP CONNECT DNS error {host}:{port}: {e}");
-                    let _ = session.send_reply(REP_HOST_UNREACHABLE).await;
-                    return;
+                Err(tunnel_err) => {
+                    debug!(
+                        "DNS via tunnel failed for {host}:{port}: {tunnel_err}; trying system DNS"
+                    );
+                    match tokio::net::lookup_host(format!("{host}:{port}")).await {
+                        Ok(mut iter) => match iter.find(|a| a.ip().is_ipv4()) {
+                            Some(a) => a,
+                            None => {
+                                warn!("TCP CONNECT DNS error {host}:{port}: no IPv4 result");
+                                let _ = session.send_reply(REP_HOST_UNREACHABLE).await;
+                                return;
+                            }
+                        },
+                        Err(e) => {
+                            warn!("TCP CONNECT DNS error {host}:{port}: {e}");
+                            let _ = session.send_reply(REP_HOST_UNREACHABLE).await;
+                            return;
+                        }
+                    }
                 }
             }
         }
@@ -677,7 +713,14 @@ async fn handle_connect(
     };
 
     let [ta, tb, tc, td] = target_ipv4.octets();
-    debug!("TCP CONNECT target {}.{}.{}.{}:{}", ta, tb, tc, td, target.port());
+    debug!(
+        "TCP CONNECT target {}.{}.{}.{}:{}",
+        ta,
+        tb,
+        tc,
+        td,
+        target.port()
+    );
     let smol_target = IpEndpoint::new(IpAddress::v4(ta, tb, tc, td), target.port());
     let src_port = alloc_src_port();
 
@@ -723,13 +766,16 @@ async fn handle_connect(
     let close_flag_rd = Arc::clone(&close_flag);
     let wake_tx_rd = wake_tx.clone();
 
-    let read_half = tokio::spawn(async move {
+    let mut read_half = tokio::spawn(async move {
         let mut buf = vec![0u8; 8192];
         loop {
             match socks_rd.read(&mut buf).await {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    inbound_clone.lock().unwrap().push_back(buf[..n].to_vec());
+                    inbound_clone
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push_back(buf[..n].to_vec());
                     let _ = wake_tx_rd.send(()); // разбудить стек: данные от клиента
                 }
             }
@@ -737,7 +783,7 @@ async fn handle_connect(
         close_flag_rd.store(true, Ordering::Relaxed);
     });
 
-    let write_half = tokio::spawn(async move {
+    let mut write_half = tokio::spawn(async move {
         while let Some(data) = outbound_rx.recv().await {
             if socks_wr.write_all(&data).await.is_err() {
                 break;
@@ -746,11 +792,15 @@ async fn handle_connect(
     });
 
     tokio::select! {
-        _ = read_half => {}
-        _ = write_half => {}
+        _ = &mut read_half => {}
+        _ = &mut write_half => {}
     }
 
     close_flag.store(true, Ordering::Relaxed);
+    // Abort the sibling half so it doesn't linger detached, parked on a socket
+    // read or channel recv after the connection has already torn down.
+    read_half.abort();
+    write_half.abort();
 }
 
 fn smol_ip_to_std(ip: IpAddress) -> IpAddr {
@@ -815,7 +865,9 @@ async fn handle_udp_associate(
 
     // Ждём, пока smoltcp-поток зарегистрирует UDP-сокет.
     let ready = tokio::task::spawn_blocking(move || {
-        ready_rx.recv_timeout(UDP_ASSOCIATE_TIMEOUT).unwrap_or(false)
+        ready_rx
+            .recv_timeout(UDP_ASSOCIATE_TIMEOUT)
+            .unwrap_or(false)
     })
     .await
     .unwrap_or(false);
@@ -825,7 +877,10 @@ async fn handle_udp_associate(
         return;
     }
 
-    debug!("UDP ASSOCIATE: binding relay on {}, advertising port {}", relay_addr, relay_port);
+    debug!(
+        "UDP ASSOCIATE: binding relay on {}, advertising port {}",
+        relay_addr, relay_port
+    );
 
     // RFC 1928 §6: отправляем клиенту адрес UDP relay-сокета.
     if session
@@ -848,7 +903,7 @@ async fn handle_udp_associate(
     let wake_tx_rd = wake_tx.clone();
 
     // Задача «клиент → VPN».
-    let read_task = tokio::spawn(async move {
+    let mut read_task = tokio::spawn(async move {
         let mut buf = vec![0u8; 65535];
         let mut dns_cache: HashMap<(String, u16), SocketAddr> = HashMap::new();
         loop {
@@ -867,7 +922,7 @@ async fn handle_udp_associate(
 
             // Запоминаем адрес клиента при первом пакете; игнорируем пакеты от других.
             {
-                let mut guard = client_addr_rd.lock().unwrap();
+                let mut guard = client_addr_rd.lock().unwrap_or_else(|e| e.into_inner());
                 match &*guard {
                     None => *guard = Some(addr),
                     Some(known) if known != &addr => continue,
@@ -885,10 +940,7 @@ async fn handle_udp_associate(
 
             if request.frag != 0 {
                 // RFC 1928 §7: фрагментация опциональна; не поддерживаем.
-                warn!(
-                    "SOCKS5 UDP fragments not supported (frag={})",
-                    request.frag
-                );
+                warn!("SOCKS5 UDP fragments not supported (frag={})", request.frag);
                 continue;
             }
 
@@ -899,9 +951,38 @@ async fn handle_udp_associate(
                     if let Some(a) = dns_cache.get(&key) {
                         *a
                     } else {
-                        match resolve_via_tunnel(&udp_tx, &wake_tx_rd, host, *port, /*want_v6=*/ false).await {
-                            Ok(a) => { dns_cache.insert(key, a); a }
-                            Err(e) => { warn!("SOCKS5 UDP DNS error {host}:{port}: {e}"); continue; }
+                        match resolve_via_tunnel(
+                            &udp_tx,
+                            &wake_tx_rd,
+                            host,
+                            *port,
+                            /*want_v6=*/ false,
+                        )
+                        .await
+                        {
+                            Ok(a) => {
+                                dns_cache.insert(key, a);
+                                a
+                            }
+                            Err(tunnel_err) => {
+                                debug!("DNS via tunnel failed for {host}:{port}: {tunnel_err}; trying system DNS");
+                                match tokio::net::lookup_host(format!("{host}:{port}")).await {
+                                    Ok(mut iter) => match iter.find(|a| a.ip().is_ipv4()) {
+                                        Some(a) => {
+                                            dns_cache.insert(key, a);
+                                            a
+                                        }
+                                        None => {
+                                            warn!("SOCKS5 UDP DNS error {host}:{port}: no IPv4 result");
+                                            continue;
+                                        }
+                                    },
+                                    Err(e) => {
+                                        warn!("SOCKS5 UDP DNS error {host}:{port}: {e}");
+                                        continue;
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -912,9 +993,14 @@ async fn handle_udp_associate(
                 target: socket_addr_to_ip_endpoint(target_sock),
                 payload: request.data,
             })) {
-                Ok(_) => { let _ = wake_tx_rd.try_send(()); }
+                Ok(_) => {
+                    let _ = wake_tx_rd.try_send(());
+                }
                 Err(std::sync::mpsc::TrySendError::Full(_)) => {
-                    warn!("SOCKS5 UDP proxy queue full, dropping packet to {}", target_sock);
+                    warn!(
+                        "SOCKS5 UDP proxy queue full, dropping packet to {}",
+                        target_sock
+                    );
                     continue;
                 }
                 Err(_) => break, // канал закрыт, завершаем
@@ -927,14 +1013,14 @@ async fn handle_udp_associate(
     // Задача «VPN → клиент».
     let close_flag_wr = Arc::clone(&close_flag);
     let client_addr_wr = Arc::clone(&client_addr);
-    let write_task = tokio::spawn(async move {
+    let mut write_task = tokio::spawn(async move {
         while let Some(response) = reply_rx.recv().await {
             if close_flag_wr.load(Ordering::Relaxed) {
                 break;
             }
 
             let client = {
-                let guard = client_addr_wr.lock().unwrap();
+                let guard = client_addr_wr.lock().unwrap_or_else(|e| e.into_inner());
                 *guard
             };
             let client = match client {
@@ -964,7 +1050,7 @@ async fn handle_udp_associate(
     // Слушаем TCP-канал управления: закрытие клиентом → завершаем UDP ASSOCIATE (RFC 1928 §6).
     let mut ctrl_stream = session.stream;
     let mut ctrl_buf = [0u8; 1];
-    let ctrl_task = tokio::spawn(async move {
+    let mut ctrl_task = tokio::spawn(async move {
         loop {
             match ctrl_stream.read(&mut ctrl_buf).await {
                 Ok(0) | Err(_) => break,
@@ -974,10 +1060,80 @@ async fn handle_udp_associate(
     });
 
     tokio::select! {
-        _ = read_task => {}
-        _ = write_task => {}
-        _ = ctrl_task => {}
+        _ = &mut read_task => {}
+        _ = &mut write_task => {}
+        _ = &mut ctrl_task => {}
     }
 
     close_flag.store(true, Ordering::Relaxed);
+    // Abort the sibling tasks. read_task in particular blocks on the relay
+    // UDP socket's recv_from() and only checks close_flag at the top of its
+    // loop, so without an explicit abort it would stay parked — leaking the
+    // relay socket fd and the task — until a stray datagram happened to arrive.
+    read_task.abort();
+    write_task.abort();
+    ctrl_task.abort();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+    use tokio::net::UdpSocket;
+
+    /// Regression guard for the UDP-associate relay leak: a task parked on
+    /// `recv_from` holds a clone of the relay socket `Arc`. Dropping its
+    /// `JoinHandle` (the old detach-after-select behavior) leaves the task
+    /// running and the socket fd alive; only `abort()` frees it. This test
+    /// proves the teardown path (abort) actually releases the socket.
+    #[tokio::test]
+    async fn udp_relay_read_task_socket_freed_on_abort() {
+        let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let close_flag = Arc::new(AtomicBool::new(false));
+
+        let sock_task = Arc::clone(&sock);
+        let close_task = Arc::clone(&close_flag);
+        // Mirror the relay read loop: it only checks close_flag at the top and
+        // otherwise blocks in recv_from, so setting close_flag alone never
+        // unblocks it — an explicit abort is required.
+        let mut task = tokio::spawn(async move {
+            let mut buf = [0u8; 64];
+            loop {
+                if close_task.load(Ordering::Relaxed) {
+                    break;
+                }
+                if sock_task.recv_from(&mut buf).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        // Let the task run until it parks in recv_from (holding its clone).
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(Arc::strong_count(&sock), 2);
+
+        // Setting the flag does not wake the parked recv_from.
+        close_flag.store(true, Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            Arc::strong_count(&sock),
+            2,
+            "recv_from stays parked despite close_flag — the leak the abort fixes"
+        );
+
+        // The teardown path: abort releases the task and its socket clone.
+        task.abort();
+        let _ = (&mut task).await;
+        for _ in 0..50 {
+            if Arc::strong_count(&sock) == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            Arc::strong_count(&sock),
+            1,
+            "relay socket fd must be released after abort"
+        );
+    }
 }

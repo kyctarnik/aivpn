@@ -10,6 +10,11 @@ repository.workspace = true
 name = "aivpn-server"
 path = "src/main.rs"
 
+# Offline adversarial mask-repair operator tool (R2 Phase C).
+[[bin]]
+name = "aivpn-mask-repair"
+path = "src/bin/aivpn-mask-repair.rs"
+
 [dependencies]
 aivpn-common = { path = "../aivpn-common", version = "*" }
 
@@ -19,6 +24,7 @@ x25519-dalek.workspace = true
 blake3.workspace = true
 ed25519-dalek = "2.0"
 subtle.workspace = true
+zeroize.workspace = true
 
 # Async
 tokio.workspace = true
@@ -55,17 +61,23 @@ clap = { version = "4.4", features = ["derive", "env"] }
 # Monitoring (Phase 5)
 prometheus = { version = "0.13", optional = true }
 
-# HTTP client for passive distribution (Phase 4)
-reqwest = { version = "0.11", features = ["json", "stream"], optional = true }
+# HTTP client for passive distribution (Phase 4) and bootstrap-descriptor auto-publish
+reqwest = { version = "0.11", features = ["json", "stream", "multipart"], optional = true }
+# AWS SigV4 request signing for the S3-compatible bootstrap-publish channel
+hmac = { version = "0.12", optional = true }
+sha2 = { version = "0.10", optional = true }
 
 [features]
 default = []
-neural = []
+# The inline ML-DPI "reads-as-tunnel" gate now lives in aivpn-common (shared
+# with the client self-gate); `neural` pulls it in from there.
+neural = ["aivpn-common/dpi-gate"]
 metrics = ["prometheus"]
 passive-distribution = ["reqwest"]
 dns = ["reqwest"]
-management-api = ["axum", "tower", "hyper", "hyper-util"]
+management-api = ["axum", "tower", "hyper", "hyper-util", "tokio-stream", "anyhow"]
 production-secure = []
+bootstrap-publish = ["reqwest", "hmac", "sha2"]
 
 # Management API (Unix socket HTTP server)
 [dependencies.axum]
@@ -85,6 +97,15 @@ optional = true
 [dependencies.hyper-util]
 version = "0.1"
 features = ["tokio"]
+optional = true
+
+[dependencies.tokio-stream]
+version = "0.1"
+features = ["time"]
+optional = true
+
+[dependencies.anyhow]
+version = "1"
 optional = true
 
 [dev-dependencies]
